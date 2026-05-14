@@ -28,6 +28,10 @@ from typing import Any
 
 LOGGER = logging.getLogger("csdr_server")
 
+EXIT_OUT_OF_BAND = 1
+EXIT_BAD_SAMPLE_RATE = 2
+EXIT_REQUEST_ERROR = 3
+
 
 @dataclass(frozen=True)
 class ServerConfig:
@@ -59,6 +63,13 @@ class ServerConfig:
         )
         _validate_config(config)
         return config
+
+
+class RequestValidationError(Exception):
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 def _optional_string(value: Any) -> str | None:
@@ -278,6 +289,8 @@ class ClientSession:
     def start(self) -> None:
         self.pipeline = self._start_pipeline()
         self.capture.add_client(self)
+        
+    def activate(self) -> None:
         self.input_thread = threading.Thread(
             target=self._input_loop,
             name=f"client-input-{self.address[0]}:{self.address[1]}",
@@ -444,24 +457,27 @@ class ClientSession:
 
 def _compute_decimation(input_rate: int, output_rate: int) -> int:
     if output_rate <= 0:
-        raise ValueError("output sample rate must be positive")
+        raise RequestValidationError(EXIT_BAD_SAMPLE_RATE, "output sample rate must be positive")
     if output_rate > input_rate:
-        raise ValueError("output sample rate cannot exceed rtl sample rate")
+        raise RequestValidationError(
+            EXIT_BAD_SAMPLE_RATE,
+            "output sample rate cannot exceed rtl sample rate",
+        )
     if input_rate % output_rate != 0:
-        raise ValueError(
+        raise RequestValidationError(
+            EXIT_BAD_SAMPLE_RATE,
             f"rtl sample rate {input_rate} is not an integer multiple of requested "
-            f"sample rate {output_rate}"
+            f"sample rate {output_rate}",
         )
     return input_rate // output_rate
 
 
 def _validate_request(config: ServerConfig, frequency: int, output_rate: int) -> None:
-    half_band = config.rtl_sample_rate / 2
-    max_offset = half_band - (output_rate / 2)
-    offset = abs(frequency - config.center_frequency)
-    if offset > max_offset:
-        raise ValueError(
-            "requested frequency and bandwidth do not fit in the current RTL capture window"
+    shift_rate = (config.center_frequency - frequency) / config.rtl_sample_rate
+    if shift_rate < -0.5 or shift_rate > 0.5:
+        raise RequestValidationError(
+            EXIT_OUT_OF_BAND,
+            "requested frequency is out of band for the current RTL capture window",
         )
 
 
@@ -496,14 +512,24 @@ def parse_client_request(conn: socket.socket) -> dict[str, Any]:
     reader = conn.makefile("rb")
     line = reader.readline(16_384)
     if not line:
-        raise ValueError("client did not send a request line")
-    request = json.loads(line.decode("utf-8"))
+        raise RequestValidationError(EXIT_REQUEST_ERROR, "client did not send a request line")
+    try:
+        request = json.loads(line.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RequestValidationError(EXIT_REQUEST_ERROR, f"invalid request json: {exc}") from exc
     if "frequency" not in request:
-        raise ValueError("request must include frequency")
+        raise RequestValidationError(EXIT_REQUEST_ERROR, "request must include frequency")
     if "sample_rate" not in request and "bandwidth" not in request:
-        raise ValueError("request must include sample_rate or bandwidth")
+        raise RequestValidationError(
+            EXIT_REQUEST_ERROR,
+            "request must include sample_rate or bandwidth",
+        )
     conn.settimeout(None)
     return request
+
+
+def send_handshake(conn: socket.socket, payload: dict[str, Any]) -> None:
+    conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
 
 
 def serve(config: ServerConfig) -> int:
@@ -543,6 +569,27 @@ def serve(config: ServerConfig) -> int:
                     request = parse_client_request(conn)
                     session = ClientSession(conn, address, config, capture, request)
                     session.start()
+                    send_handshake(conn, {"status": "ok"})
+                    session.activate()
+                except RequestValidationError as exc:
+                    LOGGER.warning(
+                        "rejecting client %s:%s: %s",
+                        address[0],
+                        address[1],
+                        exc,
+                    )
+                    try:
+                        send_handshake(
+                            conn,
+                            {
+                                "status": "error",
+                                "code": exc.code,
+                                "error": exc.message,
+                            },
+                        )
+                    except OSError:
+                        pass
+                    conn.close()
                 except Exception as exc:
                     LOGGER.warning(
                         "rejecting client %s:%s: %s",
@@ -551,7 +598,14 @@ def serve(config: ServerConfig) -> int:
                         exc,
                     )
                     try:
-                        conn.sendall(f"error: {exc}\n".encode("utf-8"))
+                        send_handshake(
+                            conn,
+                            {
+                                "status": "error",
+                                "code": EXIT_REQUEST_ERROR,
+                                "error": str(exc),
+                            },
+                        )
                     except OSError:
                         pass
                     conn.close()

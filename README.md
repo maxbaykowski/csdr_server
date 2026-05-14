@@ -66,8 +66,20 @@ Each client opens a TCP connection and sends a single JSON line:
 
 `bandwidth` may be used as an alias for `sample_rate`.
 
-After that line, the server streams raw `complex float32` IQ samples back to
-the client.
+After that line, the server sends a one-line JSON handshake:
+
+```json
+{"status": "ok"}
+```
+
+or:
+
+```json
+{"status": "error", "code": 1, "error": "requested frequency is out of band for the current RTL capture window"}
+```
+
+Only after an `ok` handshake does the server stream raw `complex float32` IQ
+samples back to the client.
 
 The shift value passed to `csdr shift` is computed as:
 
@@ -80,10 +92,17 @@ The shift value passed to `csdr shift` is computed as:
 - Requested `sample_rate` must be less than or equal to `rtl_sample_rate`.
 - Decimation currently requires an integer ratio:
   - `rtl_sample_rate % sample_rate == 0`
-- Requested frequency and output bandwidth must fit inside the captured RTL
-  window around `center_frequency`.
+- Requested frequency must produce a `csdr shift` value between `-0.5` and
+  `0.5`, inclusive.
 - If a client cannot keep up and its queue fills, that client is disconnected
   instead of letting memory usage grow without bound.
+
+## Exit Codes
+
+- Client connection failure returns `255`.
+- Server-side `out of band` rejection returns `1`.
+- Server-side `bad sample rate` rejection returns `2`.
+- Other request or handshake errors return `3`.
 
 ## Device Selection
 
