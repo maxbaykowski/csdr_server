@@ -44,6 +44,18 @@ the process exits.
 python3 csdr_server.py --config config.json
 ```
 
+## Client
+
+Use [csdr_server_client.py](/home/max/git/csdr_server/csdr_server_client.py:1) to
+request a stream and write the returned IQ data to stdout:
+
+```bash
+python3 csdr_server_client.py -a 127.0.0.1 -p 7355 -f 162.475M -s 16K > iq.cf32
+```
+
+`-f` and `-s` accept plain integers or `K`, `M`, and `G` suffixes, so
+`162.475M` becomes `162475000` and `16K` becomes `16000`.
+
 ## Client Protocol
 
 Each client opens a TCP connection and sends a single JSON line:
