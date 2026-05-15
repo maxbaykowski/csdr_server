@@ -16,6 +16,7 @@ import logging
 import os
 import queue
 import re
+import selectors
 import shutil
 import signal
 import socket
@@ -45,6 +46,7 @@ class ServerConfig:
     listen_host: str = "0.0.0.0"
     listen_port: int = 7355
     read_chunk_size: int = 262_144
+    rtl_read_timeout_seconds: float = 2.0
     stream_queue_chunks: int = 64
     client_queue_chunks: int = 64
     enqueue_timeout_seconds: float = 0.25
@@ -62,6 +64,7 @@ class ServerConfig:
             listen_host=str(data.get("listen_host", "0.0.0.0")),
             listen_port=int(data.get("listen_port", 7355)),
             read_chunk_size=int(data.get("read_chunk_size", 262_144)),
+            rtl_read_timeout_seconds=float(data.get("rtl_read_timeout_seconds", 2.0)),
             stream_queue_chunks=int(data.get("stream_queue_chunks", 64)),
             client_queue_chunks=int(data.get("client_queue_chunks", 64)),
             enqueue_timeout_seconds=float(data.get("enqueue_timeout_seconds", 0.25)),
@@ -213,10 +216,26 @@ class CaptureManager:
             stderr_thread.start()
 
             got_data = False
+            data_timeout = False
+            selector: selectors.BaseSelector | None = None
             try:
                 assert process.stdout is not None
+                stdout_fd = process.stdout.fileno()
+                os.set_blocking(stdout_fd, False)
+                selector = selectors.DefaultSelector()
+                selector.register(stdout_fd, selectors.EVENT_READ)
                 while not self.stop_event.is_set():
-                    chunk = process.stdout.read(self.config.read_chunk_size)
+                    ready = selector.select(timeout=self.config.rtl_read_timeout_seconds)
+                    if not ready:
+                        if process.poll() is not None:
+                            break
+                        data_timeout = True
+                        LOGGER.warning(
+                            "rtl_sdr produced no data for %.3f seconds; restarting from device discovery",
+                            self.config.rtl_read_timeout_seconds,
+                        )
+                        break
+                    chunk = os.read(stdout_fd, self.config.read_chunk_size)
                     if not chunk:
                         break
                     got_data = True
@@ -224,6 +243,11 @@ class CaptureManager:
             except Exception:
                 LOGGER.exception("rtl_sdr reader loop failed")
             finally:
+                if selector is not None:
+                    try:
+                        selector.close()
+                    except Exception:
+                        pass
                 self._terminate_process(process, "rtl_sdr")
                 stderr_thread.join(timeout=2.0)
                 with self.process_lock:
@@ -234,10 +258,18 @@ class CaptureManager:
                 break
 
             return_code = process.poll()
-            if got_data:
-                LOGGER.warning("rtl_sdr stopped after streaming data: rc=%s; restarting", return_code)
+            if data_timeout:
+                LOGGER.info("Re-entering USB and device-index discovery after rtl_sdr data timeout.")
+            elif got_data:
+                LOGGER.warning(
+                    "rtl_sdr stopped after streaming data: rc=%s; re-entering device discovery",
+                    return_code,
+                )
             else:
-                LOGGER.warning("rtl_sdr exited before producing data: rc=%s; restarting", return_code)
+                LOGGER.warning(
+                    "rtl_sdr exited before producing data: rc=%s; re-entering device discovery",
+                    return_code,
+                )
             self.stop_event.wait(0.5)
 
     def get_output_stream(self, frequency: int, output_rate: int) -> "SharedStream":
@@ -773,6 +805,8 @@ def _validate_config(config: ServerConfig) -> None:
         raise ValueError("listen_port must be between 1 and 65535")
     if config.read_chunk_size <= 0:
         raise ValueError("read_chunk_size must be positive")
+    if config.rtl_read_timeout_seconds <= 0:
+        raise ValueError("rtl_read_timeout_seconds must be positive")
     if config.stream_queue_chunks <= 0:
         raise ValueError("stream_queue_chunks must be positive")
     if config.client_queue_chunks <= 0:

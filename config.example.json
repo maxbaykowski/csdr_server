@@ -8,6 +8,7 @@
   "listen_host": "0.0.0.0",
   "listen_port": 7355,
   "read_chunk_size": 262144,
+  "rtl_read_timeout_seconds": 2.0,
   "stream_queue_chunks": 64,
   "client_queue_chunks": 64,
   "enqueue_timeout_seconds": 0.25

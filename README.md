@@ -136,10 +136,13 @@ The shift value passed to `csdr shift` is computed as:
 
 ## Resilience
 
-- If `rtl_sdr` exits with a non-zero code or stops producing data, the server
-  waits 0.5 seconds and starts it again.
-- Device serial detection is repeated on each restart, so a replugged dongle can
-  come back on a different device index.
+- If `rtl_sdr` exits unexpectedly, the server goes back to USB probing and
+  device-index discovery before starting it again.
+- If `rtl_sdr` produces no data for `rtl_read_timeout_seconds`, the server treats
+  that as a hung or disconnected device and also goes back to USB probing and
+  device-index discovery.
+- Device serial detection is repeated on each recovery attempt, so a replugged
+  dongle can come back on a different device index.
 - `rtl_sdr` and per-client `csdr` processes are started in separate sessions so
   terminal `Ctrl+C` is handled by the Python server, which then shuts children
   down explicitly.
