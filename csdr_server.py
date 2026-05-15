@@ -470,6 +470,8 @@ class SharedStream:
         manager: "StreamGraph",
         parent: "SharedStream | None" = None,
         close_when_unused: bool = True,
+        control_fifo_value: str | None = None,
+        control_fifo_path: Path | None = None,
     ) -> None:
         self.config = config
         self.name = name
@@ -477,6 +479,8 @@ class SharedStream:
         self.manager = manager
         self.parent = parent
         self.close_when_unused = close_when_unused
+        self.control_fifo_value = control_fifo_value
+        self.control_fifo_path = control_fifo_path
         self.process: subprocess.Popen[bytes] | None = None
         self.input_queue: queue.Queue[bytes | None] = queue.Queue(
             maxsize=config.stream_queue_chunks
@@ -487,16 +491,23 @@ class SharedStream:
         self.input_thread: threading.Thread | None = None
         self.output_thread: threading.Thread | None = None
         self.stderr_thread: threading.Thread | None = None
+        self.control_fifo_fd: int | None = None
 
     def start(self) -> None:
-        self.process = subprocess.Popen(
-            self.command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-            start_new_session=True,
-        )
+        self._setup_control_fifo()
+        try:
+            self.process = subprocess.Popen(
+                self.command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                start_new_session=True,
+            )
+            self._send_initial_control_value()
+        except Exception:
+            self._cleanup_control_fifo()
+            raise
         self.input_thread = threading.Thread(
             target=self._input_loop,
             name=f"{self.name}-input",
@@ -566,6 +577,7 @@ class SharedStream:
                 subscriber.close(f"upstream stream closed: {self.name}")
         if self.process is not None:
             CaptureManager._terminate_process(self.process, self.command[0])
+        self._cleanup_control_fifo()
 
     def _input_loop(self) -> None:
         try:
@@ -617,6 +629,38 @@ class SharedStream:
                 self.name,
                 line.decode("utf-8", errors="replace").rstrip(),
             )
+
+    def _setup_control_fifo(self) -> None:
+        if self.control_fifo_value is None:
+            return
+        runtime_dir = Path("/run/user") / str(os.getuid())
+        runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fifo_path = self.control_fifo_path or (runtime_dir / f"csdr_server_{self.name}_{os.getpid()}.fifo")
+        if fifo_path.exists():
+            fifo_path.unlink()
+        os.mkfifo(fifo_path, 0o600)
+        self.control_fifo_path = fifo_path
+        self.control_fifo_fd = os.open(fifo_path, os.O_RDWR | os.O_NONBLOCK)
+
+    def _send_initial_control_value(self) -> None:
+        if self.control_fifo_value is None or self.control_fifo_fd is None:
+            return
+        payload = f"{self.control_fifo_value}\n".encode("utf-8")
+        os.write(self.control_fifo_fd, payload)
+
+    def _cleanup_control_fifo(self) -> None:
+        if self.control_fifo_fd is not None:
+            try:
+                os.close(self.control_fifo_fd)
+            except OSError:
+                pass
+            self.control_fifo_fd = None
+        if self.control_fifo_path is not None:
+            try:
+                self.control_fifo_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.control_fifo_path = None
 
 
 class StreamGraph:
@@ -671,13 +715,17 @@ class StreamGraph:
             shift_stream = self.shift_streams.get(frequency)
             if shift_stream is None:
                 shift_rate = (self.config.center_frequency - frequency) / self.config.rtl_sample_rate
+                shift_name = f"shift-{frequency}"
+                shift_fifo_path = Path("/run/user") / str(os.getuid()) / f"csdr_server_{shift_name}_{os.getpid()}.fifo"
                 shift_stream = SharedStream(
                     config=self.config,
-                    name=f"shift-{frequency}",
-                    command=["csdr", "shift", str(shift_rate)],
+                    name=shift_name,
+                    command=["csdr", "shift", "--fifo", str(shift_fifo_path)],
                     manager=self,
                     parent=root,
                     close_when_unused=True,
+                    control_fifo_value=str(shift_rate),
+                    control_fifo_path=shift_fifo_path,
                 )
                 shift_stream.start()
                 self.shift_streams[frequency] = shift_stream

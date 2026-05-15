@@ -9,8 +9,8 @@ This implementation is intentionally narrow:
 
 - One shared RTL-SDR capture path provides unsigned 8-bit IQ samples.
 - `csdr convert -i char -o float` is shared instead of run per client.
-- If multiple clients request the same frequency, one shared `csdr shift` stage
-  is reused for that frequency.
+- If multiple clients request the same frequency, one shared `csdr shift`
+  process is reused for that frequency and controlled through a FIFO.
 - If multiple clients request the same frequency and sample rate, one shared
   `csdr firdecimate` stage is reused for that `(frequency, sample_rate)` pair.
 - The only CSDR stages used are:
@@ -98,6 +98,11 @@ The shift value passed to `csdr shift` is computed as:
 ```text
 (center_frequency - requested_frequency) / rtl_sample_rate
 ```
+
+For each shared shift stage, the server creates a private FIFO under
+`/run/user/<uid>` and starts `csdr shift --fifo <path>`. The initial shift rate
+is written once by Python, and the FIFO is kept open for the life of the shift
+process so CSDR does not receive EOF and exit unexpectedly.
 
 ## Constraints
 
