@@ -119,3 +119,12 @@ The shift value passed to `csdr shift` is computed as:
   waits 0.5 seconds and starts it again.
 - Device serial detection is repeated on each restart, so a replugged dongle can
   come back on a different device index.
+- `rtl_sdr` and per-client `csdr` processes are started in separate sessions so
+  terminal `Ctrl+C` is handled by the Python server, which then shuts children
+  down explicitly.
+
+## Signals
+
+- The server and client handle `SIGINT` and `SIGTERM` gracefully.
+- `SIGKILL` cannot be caught or handled by Python or by child processes; that is
+  an operating-system limitation.

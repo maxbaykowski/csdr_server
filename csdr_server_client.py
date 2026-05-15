@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import signal
 import socket
 import sys
 from decimal import Decimal, InvalidOperation
@@ -20,6 +21,8 @@ EXIT_OUT_OF_BAND = 1
 EXIT_BAD_SAMPLE_RATE = 2
 EXIT_REQUEST_ERROR = 3
 
+SHUTDOWN_SIGNAL_EXIT = 0
+
 
 SUFFIXES = {
     "": 1,
@@ -27,6 +30,24 @@ SUFFIXES = {
     "M": 1_000_000,
     "G": 1_000_000_000,
 }
+
+_shutdown_requested = False
+_active_socket: socket.socket | None = None
+
+
+def _request_shutdown(signum: int, _frame: object) -> None:
+    global _shutdown_requested
+    _shutdown_requested = True
+    if _active_socket is not None:
+        try:
+            _active_socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+
+def _install_signal_handlers() -> None:
+    signal.signal(signal.SIGINT, _request_shutdown)
+    signal.signal(signal.SIGTERM, _request_shutdown)
 
 
 def parse_scaled_integer(value: str, label: str) -> int:
@@ -70,6 +91,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    global _active_socket
+
+    _install_signal_handlers()
     args = parse_args()
     request = {
         "frequency": args.frequency,
@@ -98,10 +122,13 @@ def main() -> int:
         return EXIT_CONNECT_FAILED
 
     with sock:
+        _active_socket = sock
         try:
             sock.sendall(json.dumps(request).encode("utf-8") + b"\n")
             sock_file = sock.makefile("rb")
             handshake_line = sock_file.readline(16_384)
+            if _shutdown_requested:
+                return SHUTDOWN_SIGNAL_EXIT
             if not handshake_line:
                 print("error: server closed connection before handshake", file=sys.stderr)
                 return EXIT_REQUEST_ERROR
@@ -117,19 +144,29 @@ def main() -> int:
                 chunk = sock_file.read1(65_536)
                 if not chunk:
                     break
+                if _shutdown_requested:
+                    return SHUTDOWN_SIGNAL_EXIT
                 stdout.write(chunk)
                 stdout.flush()
+            if _shutdown_requested:
+                return SHUTDOWN_SIGNAL_EXIT
         except BrokenPipeError:
-            return EXIT_REQUEST_ERROR
+            return SHUTDOWN_SIGNAL_EXIT if _shutdown_requested else EXIT_REQUEST_ERROR
         except json.JSONDecodeError as exc:
             print(f"error: invalid handshake from server: {exc}", file=sys.stderr)
             return EXIT_REQUEST_ERROR
         except ConnectionResetError:
+            if _shutdown_requested:
+                return SHUTDOWN_SIGNAL_EXIT
             print("error: connection reset by server", file=sys.stderr)
             return EXIT_REQUEST_ERROR
         except OSError as exc:
+            if _shutdown_requested:
+                return SHUTDOWN_SIGNAL_EXIT
             print(f"error: streaming failed: {exc}", file=sys.stderr)
             return EXIT_REQUEST_ERROR
+        finally:
+            _active_socket = None
 
     return 0
 

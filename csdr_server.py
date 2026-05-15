@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import queue
 import re
 import shutil
@@ -150,6 +151,7 @@ class CaptureManager:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     bufsize=0,
+                    start_new_session=True,
                 )
             except Exception:
                 LOGGER.exception("failed to start rtl_sdr")
@@ -233,6 +235,7 @@ class CaptureManager:
             capture_output=True,
             text=True,
             check=False,
+            start_new_session=True,
         )
         output = "\n".join(part for part in (probe.stdout, probe.stderr) if part)
         for line in output.splitlines():
@@ -245,12 +248,18 @@ class CaptureManager:
     def _terminate_process(process: subprocess.Popen[bytes], name: str) -> None:
         if process.poll() is not None:
             return
-        process.terminate()
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
         try:
             process.wait(timeout=2.0)
         except subprocess.TimeoutExpired:
             LOGGER.warning("%s did not exit after SIGTERM, killing it", name)
-            process.kill()
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
             process.wait(timeout=2.0)
 
 
@@ -350,6 +359,7 @@ class ClientSession:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            start_new_session=True,
         )
         shift = subprocess.Popen(
             ["csdr", "shift", str(self.shift_rate)],
@@ -357,6 +367,7 @@ class ClientSession:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            start_new_session=True,
         )
         assert convert.stdout is not None
         convert.stdout.close()
@@ -375,6 +386,7 @@ class ClientSession:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=0,
+                start_new_session=True,
             )
             assert shift.stdout is not None
             shift.stdout.close()
@@ -643,6 +655,8 @@ def main() -> int:
         _check_dependencies()
         config = load_config(args.config)
         return serve(config)
+    except SystemExit:
+        raise
     except FileNotFoundError:
         LOGGER.error("config file not found: %s", args.config)
         return 1
