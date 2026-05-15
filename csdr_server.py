@@ -77,6 +77,30 @@ class RequestValidationError(Exception):
         self.message = message
 
 
+class DeviceResolutionRetryableError(Exception):
+    pass
+
+
+class DeviceResolutionFatalError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class RtlDeviceInfo:
+    index: int
+    description: str
+    serial: str | None
+
+
+@dataclass(frozen=True)
+class UsbDeviceInfo:
+    path: Path
+    vendor_id: str
+    product_id: str
+    serial: str | None
+    description: str
+
+
 def _optional_string(value: Any) -> str | None:
     if value in (None, "", "null"):
         return None
@@ -89,6 +113,13 @@ def _optional_float(value: Any) -> float | None:
     return float(value)
 
 
+def _read_sysfs_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip() or None
+    except FileNotFoundError:
+        return None
+
+
 class CaptureManager:
     def __init__(self, config: ServerConfig) -> None:
         self.config = config
@@ -96,6 +127,8 @@ class CaptureManager:
         self.process_lock = threading.Lock()
         self.supervisor_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
+        self.fatal_error: Exception | None = None
+        self.device_wait_logged = False
         self.graph = StreamGraph(config)
 
     def start(self) -> None:
@@ -133,7 +166,24 @@ class CaptureManager:
 
     def _supervise_capture(self) -> None:
         while not self.stop_event.is_set():
-            device = self._resolve_device()
+            try:
+                device = self._resolve_device()
+            except DeviceResolutionRetryableError as exc:
+                if not self.device_wait_logged:
+                    LOGGER.warning("%s", exc)
+                    self.device_wait_logged = True
+                self.stop_event.wait(0.5)
+                continue
+            except DeviceResolutionFatalError as exc:
+                LOGGER.error("%s", exc)
+                self.fatal_error = exc
+                self.stop_event.set()
+                break
+
+            if self.device_wait_logged:
+                LOGGER.info("Configured device is now available.")
+                self.device_wait_logged = False
+
             command = self._build_rtl_command(device)
             LOGGER.info("starting rtl_sdr: %s", " ".join(command))
 
@@ -202,26 +252,90 @@ class CaptureManager:
 
     def _resolve_device(self) -> str:
         if not self.config.rtl_serial:
+            devices = self._probe_rtl_devices()
+            if not any(device.index == self.config.rtl_device_index for device in devices):
+                raise DeviceResolutionFatalError(
+                    f"Configured rtl_device_index {self.config.rtl_device_index} does not exist. "
+                    "Set rtl_serial to a valid device serial number, or choose an existing device index."
+                )
             return str(self.config.rtl_device_index)
 
-        serial_index = self._find_device_index_by_serial(self.config.rtl_serial)
-        if serial_index is None:
-            LOGGER.warning(
-                "serial %s not found; falling back to configured device index %s",
-                self.config.rtl_serial,
-                self.config.rtl_device_index,
+        self._wait_for_unique_usb_serial(self.config.rtl_serial)
+        devices = self._probe_rtl_devices()
+        matches = [device for device in devices if device.serial == self.config.rtl_serial]
+        if not matches:
+            raise DeviceResolutionRetryableError(
+                f"Configured serial {self.config.rtl_serial} is present on USB but was not yet visible to rtl_sdr. "
+                "Waiting for rtl_sdr to detect that device."
             )
-            return str(self.config.rtl_device_index)
+        if len(matches) > 1:
+            raise DeviceResolutionFatalError(
+                f"Multiple RTL-SDR devices were found by rtl_sdr with serial {self.config.rtl_serial}. "
+                "Set rtl_serial to null to use rtl_device_index instead, or assign unique serial numbers "
+                "to each device using rtl_eeprom."
+            )
 
         LOGGER.info(
             "resolved serial %s to rtl_sdr device index %s",
             self.config.rtl_serial,
-            serial_index,
+            matches[0].index,
         )
-        return str(serial_index)
+        return str(matches[0].index)
 
     @staticmethod
-    def _find_device_index_by_serial(serial: str) -> int | None:
+    def _wait_for_unique_usb_serial(serial: str) -> None:
+        try:
+            devices = CaptureManager._probe_usb_rtl_devices()
+        except OSError as exc:
+            LOGGER.warning(
+                "USB probe failed (%s); falling back to rtl_sdr-only serial detection",
+                exc,
+            )
+            return
+
+        matches = [device for device in devices if device.serial == serial]
+        if not matches:
+            raise DeviceResolutionRetryableError(
+                f"Configured serial {serial} was not found on USB. Waiting for that device to appear."
+            )
+        if len(matches) > 1:
+            raise DeviceResolutionFatalError(
+                f"Multiple USB RTL-SDR devices were found with serial {serial}. "
+                "Set rtl_serial to null to use rtl_device_index instead, or assign unique serial numbers "
+                "to each device using rtl_eeprom."
+            )
+
+    @staticmethod
+    def _probe_usb_rtl_devices() -> list[UsbDeviceInfo]:
+        usb_root = Path("/sys/bus/usb/devices")
+        devices: list[UsbDeviceInfo] = []
+        for entry in usb_root.iterdir():
+            vendor_id = _read_sysfs_text(entry / "idVendor")
+            product_id = _read_sysfs_text(entry / "idProduct")
+            if vendor_id is None or product_id is None:
+                continue
+            vendor_id = vendor_id.lower()
+            product_id = product_id.lower()
+            if vendor_id != "0bda" or product_id not in {"2832", "2838"}:
+                continue
+            serial = _read_sysfs_text(entry / "serial")
+            manufacturer = _read_sysfs_text(entry / "manufacturer")
+            product = _read_sysfs_text(entry / "product")
+            description_parts = [part for part in (manufacturer, product) if part]
+            description = ", ".join(description_parts) or entry.name
+            devices.append(
+                UsbDeviceInfo(
+                    path=entry,
+                    vendor_id=vendor_id,
+                    product_id=product_id,
+                    serial=serial,
+                    description=description,
+                )
+            )
+        return devices
+
+    @staticmethod
+    def _probe_rtl_devices() -> list[RtlDeviceInfo]:
         probe = subprocess.run(
             ["rtl_sdr", "-d", "9999", "-"],
             capture_output=True,
@@ -234,11 +348,19 @@ class CaptureManager:
         if probe.stderr:
             output_parts.append(probe.stderr.decode("utf-8", errors="replace"))
         output = "\n".join(output_parts)
+        devices: list[RtlDeviceInfo] = []
         for line in output.splitlines():
-            match = re.match(r"\s*(\d+):.*SN:\s*(\S+)\s*$", line)
-            if match and match.group(2) == serial:
-                return int(match.group(1))
-        return None
+            match = re.match(r"\s*(\d+):\s*(.+?)(?:,\s*SN:\s*(\S+))?\s*$", line)
+            if not match:
+                continue
+            devices.append(
+                RtlDeviceInfo(
+                    index=int(match.group(1)),
+                    description=match.group(2).strip(),
+                    serial=match.group(3),
+                )
+            )
+        return devices
 
     @staticmethod
     def _terminate_process(process: subprocess.Popen[bytes], name: str) -> None:
@@ -786,6 +908,9 @@ def serve(config: ServerConfig) -> int:
                     conn.close()
         finally:
             capture.stop()
+
+    if capture.fatal_error is not None:
+        raise capture.fatal_error
 
     return 0
 

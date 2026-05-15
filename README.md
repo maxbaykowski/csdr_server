@@ -121,11 +121,18 @@ The shift value passed to `csdr shift` is computed as:
 ## Device Selection
 
 - If `rtl_serial` is not set, the server uses `rtl_device_index` directly.
-- If `rtl_serial` is set, the server probes `rtl_sdr -d 9999 -` and parses the
-  device list to find a matching `SN: ...` entry.
-- If that serial is found, the resolved device index is used when starting
-  `rtl_sdr`.
-- If that serial is not found, the server falls back to `rtl_device_index`.
+- If `rtl_serial` is not set and `rtl_device_index` does not exist, startup
+  fails with a configuration error.
+- If `rtl_serial` is set, the server first probes `/sys/bus/usb/devices` for
+  RTL-SDR-class USB devices with VID:PID `0bda:2832` or `0bda:2838`.
+- Once exactly one USB device with the configured serial exists, the server
+  asks `rtl_sdr -d 9999 -` to resolve the current rtl_sdr index for that serial.
+- If `rtl_serial` is set and no matching USB device exists yet, the server keeps
+  waiting instead of falling back to `rtl_device_index`.
+- If multiple USB devices or multiple `rtl_sdr` devices share the configured
+  serial, startup fails. In that case, set `rtl_serial` to `null` to use
+  `rtl_device_index`, or assign unique serial numbers to the devices with
+  `rtl_eeprom`.
 
 ## Resilience
 
