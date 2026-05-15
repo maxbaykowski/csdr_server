@@ -3,6 +3,31 @@
 Minimal network RTL-SDR server in Python, using `pyrtlsdr` over `librtlsdr` as
 the IQ source and `csdr` for per-client DSP stages.
 
+## Install
+
+Python dependencies are installed with `pip`. The external DSP dependency,
+`csdr`, must already be installed on the system and available in `PATH`.
+
+Install from a local checkout:
+
+```bash
+python3 -m pip install .
+```
+
+After installation, these CLI tools are available:
+
+- `csdr_server`
+- `csdr_server_client`
+
+Installed Python dependencies:
+
+- `pyrtlsdr`
+- `pyrtlsdrlib`
+
+External dependency:
+
+- `csdr`
+
 ## Scope
 
 This implementation is intentionally narrow:
@@ -53,7 +78,7 @@ Configuration limits:
 ## Run
 
 ```bash
-python3 csdr_server.py --config config.json
+csdr_server --config config.json
 ```
 
 Reload the live settings after editing `config.json`:
@@ -92,13 +117,25 @@ Use [csdr_server_client.py](/home/max/git/csdr_server/csdr_server_client.py:1) t
 request a stream and write the returned IQ data to stdout:
 
 ```bash
-python3 csdr_server_client.py -a 127.0.0.1 -p 7355 -f 162.475M -s 16K > iq.cf32
+csdr_server_client -a 127.0.0.1 -p 7355 -f 162.475M -s 16K > iq.cf32
 ```
 
 `-f` and `-s` accept plain integers or `K`, `M`, and `G` suffixes, so
 `162.475M` becomes `162475000` and `16K` becomes `16000`.
 
 ## Client Protocol
+
+The server protocol is line-delimited JSON for the request and handshake, then
+raw binary IQ data for the stream.
+
+Transport:
+
+- TCP
+- One request per connection
+- UTF-8 JSON, terminated by `\n`
+- After a successful handshake, the stream payload is raw binary, not JSON
+
+Request:
 
 Each client opens a TCP connection and sends a single JSON line:
 
@@ -108,7 +145,29 @@ Each client opens a TCP connection and sends a single JSON line:
 
 `bandwidth` may be used as an alias for `sample_rate`.
 
-After that line, the server sends a one-line JSON handshake:
+Request fields:
+
+- `frequency`
+  - required
+  - integer
+  - requested tuned RF frequency in Hz
+- `sample_rate`
+  - required unless `bandwidth` is used
+  - integer
+  - requested output IQ sample rate in S/s
+- `bandwidth`
+  - optional alias for `sample_rate`
+  - integer
+
+Valid example:
+
+```json
+{"frequency": 162475000, "sample_rate": 16000}
+```
+
+Handshake:
+
+After the request line, the server sends a one-line JSON handshake:
 
 ```json
 {"status": "ok"}
@@ -120,8 +179,40 @@ or:
 {"status": "error", "code": 1, "error": "requested frequency is out of band for the current RTL capture window"}
 ```
 
+Handshake fields:
+
+- `status`
+  - `"ok"` or `"error"`
+- `code`
+  - present on errors
+  - numeric error code
+- `error`
+  - present on errors
+  - human-readable message
+
+Error codes:
+
+- `1`: out of band
+- `2`: bad sample rate
+- `3`: malformed request or other request/handshake error
+
+Stream payload:
+
 Only after an `ok` handshake does the server stream raw `complex float32` IQ
 samples back to the client.
+
+IQ format:
+
+- interleaved complex samples
+- 32-bit floating point
+- little-endian `float32`
+- layout per sample: `I`, `Q`
+
+That means the binary stream is:
+
+```text
+I0(float32), Q0(float32), I1(float32), Q1(float32), ...
+```
 
 The shift value passed to `csdr shift` is computed as:
 
