@@ -11,6 +11,7 @@ stream.
 from __future__ import annotations
 
 import argparse
+from ctypes import c_ubyte
 import json
 import logging
 import os
@@ -27,11 +28,13 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from pyrtlsdr_compat import LibUSBError, RtlSdr
+    import rtlsdr.librtlsdr as rtlsdr_lib
+    from rtlsdr.rtlsdr import BaseRtlSdr, LibUSBError
     PYRTLSDR_IMPORT_ERROR: Exception | None = None
 except Exception as exc:
+    rtlsdr_lib = None  # type: ignore[assignment]
+    BaseRtlSdr = None  # type: ignore[assignment]
     LibUSBError = IOError  # type: ignore[assignment]
-    RtlSdr = None  # type: ignore[assignment]
     PYRTLSDR_IMPORT_ERROR = exc
 
 
@@ -95,6 +98,14 @@ class DeviceResolutionFatalError(Exception):
     pass
 
 
+class DeviceBusyRetryableError(Exception):
+    pass
+
+
+class DeviceAccessFatalError(Exception):
+    pass
+
+
 @dataclass(frozen=True)
 class RtlDeviceInfo:
     index: int
@@ -133,12 +144,13 @@ def _read_sysfs_text(path: Path) -> str | None:
 class CaptureManager:
     def __init__(self, config: ServerConfig) -> None:
         self.config = config
-        self.sdr: RtlSdr | None = None
+        self.sdr: BaseRtlSdr | None = None
         self.sdr_lock = threading.Lock()
         self.supervisor_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
         self.fatal_error: Exception | None = None
         self.device_wait_logged = False
+        self.device_busy_logged = False
         self.graph = StreamGraph(config)
 
     def start(self) -> None:
@@ -171,13 +183,27 @@ class CaptureManager:
                 self.fatal_error = exc
                 self.stop_event.set()
                 break
+            except DeviceAccessFatalError as exc:
+                LOGGER.error("%s", exc)
+                self.fatal_error = exc
+                self.stop_event.set()
+                break
 
             if self.device_wait_logged:
                 LOGGER.info("Configured device is now available.")
                 self.device_wait_logged = False
+            if self.device_busy_logged:
+                LOGGER.info("Configured device is no longer busy.")
+                self.device_busy_logged = False
 
             try:
                 sdr = self._open_sdr(device_index)
+            except DeviceBusyRetryableError as exc:
+                if not self.device_busy_logged:
+                    LOGGER.warning("%s", exc)
+                    self.device_busy_logged = True
+                self.stop_event.wait(0.5)
+                continue
             except Exception:
                 LOGGER.exception("failed to start pyrtlsdr capture")
                 if not self.stop_event.wait(0.5):
@@ -240,14 +266,30 @@ class CaptureManager:
     def get_output_stream(self, frequency: int, output_rate: int) -> "SharedStream":
         return self.graph.get_output_stream(frequency, output_rate)
 
-    def _open_sdr(self, device_index: int) -> RtlSdr:
-        assert RtlSdr is not None
+    def _open_sdr(self, device_index: int) -> BaseRtlSdr:
+        assert BaseRtlSdr is not None
+        assert rtlsdr_lib is not None
         LOGGER.info("starting pyrtlsdr capture on device index %s", device_index)
-        sdr = RtlSdr(device_index=device_index, dithering_enabled=False)
+        try:
+            sdr = BaseRtlSdr(device_index=device_index, dithering_enabled=False)
+        except LibUSBError as exc:
+            if getattr(exc, "errno", None) == -3:
+                raise DeviceAccessFatalError(
+                    f"Access denied while opening device index {device_index}. "
+                    "Check udev permissions or run with sufficient access."
+                ) from exc
+            if getattr(exc, "errno", None) == -6:
+                raise DeviceBusyRetryableError(
+                    f"Configured device index {device_index} is busy. Waiting for it to become available."
+                ) from exc
+            raise
         sdr.sample_rate = self.config.rtl_sample_rate
         sdr.center_freq = self.config.center_frequency
         sdr.gain = "auto" if self.config.rtl_gain is None else self.config.rtl_gain
-        sdr.reset_buffer()
+        result = rtlsdr_lib.rtlsdr_reset_buffer(sdr.dev_p)
+        if result < 0:
+            sdr.close()
+            raise LibUSBError(result, "Could not reset buffer")
         with self.sdr_lock:
             self.sdr = sdr
         return sdr
@@ -264,7 +306,7 @@ class CaptureManager:
 
     def _sdr_reader_loop(
         self,
-        sdr: RtlSdr,
+        sdr: BaseRtlSdr,
         output_queue: queue.Queue[bytes | Exception | None],
         stop_event: threading.Event,
     ) -> None:
@@ -369,15 +411,33 @@ class CaptureManager:
     @staticmethod
     def _probe_rtl_devices() -> list[RtlDeviceInfo]:
         devices: list[RtlDeviceInfo] = []
-        assert RtlSdr is not None
-        for index in range(RtlSdr.get_device_count()):
-            manufacturer, product, serial = RtlSdr.get_device_usb_strings(index)
+        assert rtlsdr_lib is not None
+        device_count = int(rtlsdr_lib.rtlsdr_get_device_count())
+        for index in range(device_count):
+            manufacturer = (c_ubyte * 256)()
+            product = (c_ubyte * 256)()
+            serial = (c_ubyte * 256)()
+            result = rtlsdr_lib.rtlsdr_get_device_usb_strings(index, manufacturer, product, serial)
+            if result != 0:
+                if result == -3:
+                    raise DeviceAccessFatalError(
+                        f"Access denied while reading USB strings for device {index}. "
+                        "Check udev permissions or run with sufficient access."
+                    )
+                raise LibUSBError(result, f"while reading USB strings (device {index})")
+            manufacturer_text = "".join(chr(value) for value in manufacturer if value > 0)
+            product_text = "".join(chr(value) for value in product if value > 0)
+            serial_text = "".join(chr(value) for value in serial if value > 0)
             description_parts = [part for part in (manufacturer, product) if part]
+            name = rtlsdr_lib.rtlsdr_get_device_name(index)
+            name_text = name.decode("utf-8", errors="replace") if name else ""
             devices.append(
                 RtlDeviceInfo(
                     index=index,
-                    description=", ".join(description_parts) or RtlSdr.get_device_name(index),
-                    serial=serial or None,
+                    description=", ".join(
+                        part for part in (manufacturer_text, product_text) if part
+                    ) or name_text,
+                    serial=serial_text or None,
                 )
             )
         return devices

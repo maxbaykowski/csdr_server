@@ -1,7 +1,7 @@
 # csdr_server
 
-Minimal network RTL-SDR server in Python, using a `pyrtlsdr`-style capture path
-over `librtlsdr` as the IQ source and `csdr` for per-client DSP stages.
+Minimal network RTL-SDR server in Python, using `pyrtlsdr` over `librtlsdr` as
+the IQ source and `csdr` for per-client DSP stages.
 
 ## Scope
 
@@ -27,7 +27,8 @@ This matches the command naming used by `jketterl/csdr`, where RTL-SDR unsigned
 ## Requirements
 
 - Python 3.10+
-- `librtlsdr` available on the system
+- `pyrtlsdr` importable in Python
+- `librtlsdr` available on the system or via `pyrtlsdrlib`
 - `csdr` available in `PATH`
 
 ## Configuration
