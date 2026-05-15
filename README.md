@@ -1,13 +1,13 @@
 # csdr_server
 
-Minimal network RTL-SDR server in Python, using `rtl_sdr` as the IQ source and
-`csdr` for per-client DSP stages.
+Minimal network RTL-SDR server in Python, using a `pyrtlsdr`-style capture path
+over `librtlsdr` as the IQ source and `csdr` for per-client DSP stages.
 
 ## Scope
 
 This implementation is intentionally narrow:
 
-- One shared RTL-SDR capture process provides unsigned 8-bit IQ samples.
+- One shared RTL-SDR capture path provides unsigned 8-bit IQ samples.
 - `csdr convert -i char -o float` is shared instead of run per client.
 - If multiple clients request the same frequency, one shared `csdr shift` stage
   is reused for that frequency.
@@ -27,7 +27,7 @@ This matches the command naming used by `jketterl/csdr`, where RTL-SDR unsigned
 ## Requirements
 
 - Python 3.10+
-- `rtl_sdr` available in `PATH`
+- `librtlsdr` available on the system
 - `csdr` available in `PATH`
 
 ## Configuration
@@ -126,21 +126,21 @@ The shift value passed to `csdr shift` is computed as:
 - If `rtl_serial` is set, the server first probes `/sys/bus/usb/devices` for
   RTL-SDR-class USB devices with VID:PID `0bda:2832` or `0bda:2838`.
 - Once exactly one USB device with the configured serial exists, the server
-  asks `rtl_sdr -d 9999 -` to resolve the current rtl_sdr index for that serial.
+  asks `librtlsdr` for the current device list and resolves the matching index.
 - If `rtl_serial` is set and no matching USB device exists yet, the server keeps
   waiting instead of falling back to `rtl_device_index`.
-- If multiple USB devices or multiple `rtl_sdr` devices share the configured
+- If multiple USB devices or multiple `librtlsdr` devices share the configured
   serial, startup fails. In that case, set `rtl_serial` to `null` to use
   `rtl_device_index`, or assign unique serial numbers to the devices with
   `rtl_eeprom`.
 
 ## Resilience
 
-- If `rtl_sdr` exits unexpectedly, the server goes back to USB probing and
-  device-index discovery before starting it again.
-- If `rtl_sdr` produces no data for `rtl_read_timeout_seconds`, the server treats
-  that as a hung or disconnected device and also goes back to USB probing and
-  device-index discovery.
+- If the `pyrtlsdr` capture path stops unexpectedly, the server goes back to USB
+  probing and device-index discovery before starting it again.
+- If the capture path produces no data for `rtl_read_timeout_seconds`, the
+  server treats that as a hung or disconnected device and also goes back to USB
+  probing and device-index discovery.
 - Device serial detection is repeated on each recovery attempt, so a replugged
   dongle can come back on a different device index.
 - `rtl_sdr` and per-client `csdr` processes are started in separate sessions so

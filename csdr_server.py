@@ -2,7 +2,7 @@
 """
 Minimal RTL-SDR + CSDR network server.
 
-The server runs a single wideband RTL-SDR capture process and fans the raw IQ
+The server runs a single wideband RTL-SDR capture path and fans the raw IQ
 stream out to per-client CSDR pipelines. Each client sends one JSON line with a
 target frequency and output sample rate, then receives a raw complex float32 IQ
 stream.
@@ -16,7 +16,6 @@ import logging
 import os
 import queue
 import re
-import selectors
 import shutil
 import signal
 import socket
@@ -26,6 +25,14 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+try:
+    from pyrtlsdr_compat import LibUSBError, RtlSdr
+    PYRTLSDR_IMPORT_ERROR: Exception | None = None
+except Exception as exc:
+    LibUSBError = IOError  # type: ignore[assignment]
+    RtlSdr = None  # type: ignore[assignment]
+    PYRTLSDR_IMPORT_ERROR = exc
 
 
 LOGGER = logging.getLogger("csdr_server")
@@ -126,8 +133,8 @@ def _read_sysfs_text(path: Path) -> str | None:
 class CaptureManager:
     def __init__(self, config: ServerConfig) -> None:
         self.config = config
-        self.process: subprocess.Popen[bytes] | None = None
-        self.process_lock = threading.Lock()
+        self.sdr: RtlSdr | None = None
+        self.sdr_lock = threading.Lock()
         self.supervisor_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
         self.fatal_error: Exception | None = None
@@ -145,32 +152,14 @@ class CaptureManager:
     def stop(self) -> None:
         self.stop_event.set()
         self.graph.stop("server shutdown")
-        with self.process_lock:
-            process = self.process
-        if process is not None:
-            self._terminate_process(process, "rtl_sdr")
+        self._close_sdr()
         if self.supervisor_thread is not None:
             self.supervisor_thread.join(timeout=2.0)
-
-    def _build_rtl_command(self, device: str) -> list[str]:
-        command = [
-            "rtl_sdr",
-            "-d",
-            device,
-            "-f",
-            str(self.config.center_frequency),
-            "-s",
-            str(self.config.rtl_sample_rate),
-            "-",
-        ]
-        if self.config.rtl_gain is not None:
-            command[1:1] = ["-g", str(self.config.rtl_gain)]
-        return command
 
     def _supervise_capture(self) -> None:
         while not self.stop_event.is_set():
             try:
-                device = self._resolve_device()
+                device_index = self._resolve_device()
             except DeviceResolutionRetryableError as exc:
                 if not self.device_wait_logged:
                     LOGGER.warning("%s", exc)
@@ -187,102 +176,113 @@ class CaptureManager:
                 LOGGER.info("Configured device is now available.")
                 self.device_wait_logged = False
 
-            command = self._build_rtl_command(device)
-            LOGGER.info("starting rtl_sdr: %s", " ".join(command))
-
             try:
-                process = subprocess.Popen(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    bufsize=0,
-                    start_new_session=True,
-                )
+                sdr = self._open_sdr(device_index)
             except Exception:
-                LOGGER.exception("failed to start rtl_sdr")
+                LOGGER.exception("failed to start pyrtlsdr capture")
                 if not self.stop_event.wait(0.5):
                     continue
                 break
 
-            with self.process_lock:
-                self.process = process
-
-            stderr_thread = threading.Thread(
-                target=self._stderr_loop,
-                args=(process,),
-                name="rtl-stderr",
-                daemon=True,
-            )
-            stderr_thread.start()
-
             got_data = False
             data_timeout = False
-            selector: selectors.BaseSelector | None = None
+            capture_queue: queue.Queue[bytes | Exception | None] = queue.Queue(maxsize=4)
+            reader_stop = threading.Event()
+            reader_thread = threading.Thread(
+                target=self._sdr_reader_loop,
+                args=(sdr, capture_queue, reader_stop),
+                name="rtl-reader",
+                daemon=True,
+            )
+            reader_thread.start()
             try:
-                assert process.stdout is not None
-                stdout_fd = process.stdout.fileno()
-                os.set_blocking(stdout_fd, False)
-                selector = selectors.DefaultSelector()
-                selector.register(stdout_fd, selectors.EVENT_READ)
                 while not self.stop_event.is_set():
-                    ready = selector.select(timeout=self.config.rtl_read_timeout_seconds)
-                    if not ready:
-                        if process.poll() is not None:
-                            break
+                    try:
+                        item = capture_queue.get(timeout=self.config.rtl_read_timeout_seconds)
+                    except queue.Empty:
                         data_timeout = True
                         LOGGER.warning(
-                            "rtl_sdr produced no data for %.3f seconds; restarting from device discovery",
+                            "pyrtlsdr produced no data for %.3f seconds; restarting from device discovery",
                             self.config.rtl_read_timeout_seconds,
                         )
                         break
-                    chunk = os.read(stdout_fd, self.config.read_chunk_size)
-                    if not chunk:
+                    if item is None:
                         break
+                    if isinstance(item, Exception):
+                        raise item
+                    chunk = item
                     got_data = True
                     self.graph.feed_raw(chunk)
+            except (LibUSBError, IOError, OSError):
+                LOGGER.exception("pyrtlsdr reader loop failed")
             except Exception:
-                LOGGER.exception("rtl_sdr reader loop failed")
+                LOGGER.exception("pyrtlsdr reader loop failed")
             finally:
-                if selector is not None:
-                    try:
-                        selector.close()
-                    except Exception:
-                        pass
-                self._terminate_process(process, "rtl_sdr")
-                stderr_thread.join(timeout=2.0)
-                with self.process_lock:
-                    if self.process is process:
-                        self.process = None
+                reader_stop.set()
+                self._close_sdr()
+                reader_thread.join(timeout=2.0)
 
             if self.stop_event.is_set():
                 break
 
-            return_code = process.poll()
             if data_timeout:
-                LOGGER.info("Re-entering USB and device-index discovery after rtl_sdr data timeout.")
+                LOGGER.info("Re-entering USB and device-index discovery after pyrtlsdr data timeout.")
             elif got_data:
                 LOGGER.warning(
-                    "rtl_sdr stopped after streaming data: rc=%s; re-entering device discovery",
-                    return_code,
+                    "pyrtlsdr stopped after streaming data; re-entering device discovery"
                 )
             else:
                 LOGGER.warning(
-                    "rtl_sdr exited before producing data: rc=%s; re-entering device discovery",
-                    return_code,
+                    "pyrtlsdr stopped before producing data; re-entering device discovery"
                 )
             self.stop_event.wait(0.5)
 
     def get_output_stream(self, frequency: int, output_rate: int) -> "SharedStream":
         return self.graph.get_output_stream(frequency, output_rate)
 
-    def _stderr_loop(self, process: subprocess.Popen[bytes]) -> None:
-        assert process.stderr is not None
-        for line in iter(process.stderr.readline, b""):
-            if not line:
-                break
-            LOGGER.info("rtl_sdr: %s", line.decode("utf-8", errors="replace").rstrip())
+    def _open_sdr(self, device_index: int) -> RtlSdr:
+        assert RtlSdr is not None
+        LOGGER.info("starting pyrtlsdr capture on device index %s", device_index)
+        sdr = RtlSdr(device_index=device_index, dithering_enabled=False)
+        sdr.sample_rate = self.config.rtl_sample_rate
+        sdr.center_freq = self.config.center_frequency
+        sdr.gain = "auto" if self.config.rtl_gain is None else self.config.rtl_gain
+        sdr.reset_buffer()
+        with self.sdr_lock:
+            self.sdr = sdr
+        return sdr
 
-    def _resolve_device(self) -> str:
+    def _close_sdr(self) -> None:
+        with self.sdr_lock:
+            sdr = self.sdr
+            self.sdr = None
+        if sdr is not None:
+            try:
+                sdr.close()
+            except Exception:
+                LOGGER.exception("failed to close pyrtlsdr device")
+
+    def _sdr_reader_loop(
+        self,
+        sdr: RtlSdr,
+        output_queue: queue.Queue[bytes | Exception | None],
+        stop_event: threading.Event,
+    ) -> None:
+        try:
+            while not self.stop_event.is_set() and not stop_event.is_set():
+                output_queue.put(sdr.read_bytes(self.config.read_chunk_size))
+        except Exception as exc:
+            try:
+                output_queue.put_nowait(exc)
+            except queue.Full:
+                pass
+        finally:
+            try:
+                output_queue.put_nowait(None)
+            except queue.Full:
+                pass
+
+    def _resolve_device(self) -> int:
         if not self.config.rtl_serial:
             devices = self._probe_rtl_devices()
             if not any(device.index == self.config.rtl_device_index for device in devices):
@@ -290,19 +290,19 @@ class CaptureManager:
                     f"Configured rtl_device_index {self.config.rtl_device_index} does not exist. "
                     "Set rtl_serial to a valid device serial number, or choose an existing device index."
                 )
-            return str(self.config.rtl_device_index)
+            return self.config.rtl_device_index
 
         self._wait_for_unique_usb_serial(self.config.rtl_serial)
         devices = self._probe_rtl_devices()
         matches = [device for device in devices if device.serial == self.config.rtl_serial]
         if not matches:
             raise DeviceResolutionRetryableError(
-                f"Configured serial {self.config.rtl_serial} is present on USB but was not yet visible to rtl_sdr. "
-                "Waiting for rtl_sdr to detect that device."
+                f"Configured serial {self.config.rtl_serial} is present on USB but was not yet visible to pyrtlsdr. "
+                "Waiting for librtlsdr to detect that device."
             )
         if len(matches) > 1:
             raise DeviceResolutionFatalError(
-                f"Multiple RTL-SDR devices were found by rtl_sdr with serial {self.config.rtl_serial}. "
+                f"Multiple RTL-SDR devices were found by pyrtlsdr with serial {self.config.rtl_serial}. "
                 "Set rtl_serial to null to use rtl_device_index instead, or assign unique serial numbers "
                 "to each device using rtl_eeprom."
             )
@@ -312,7 +312,7 @@ class CaptureManager:
             self.config.rtl_serial,
             matches[0].index,
         )
-        return str(matches[0].index)
+        return matches[0].index
 
     @staticmethod
     def _wait_for_unique_usb_serial(serial: str) -> None:
@@ -320,7 +320,7 @@ class CaptureManager:
             devices = CaptureManager._probe_usb_rtl_devices()
         except OSError as exc:
             LOGGER.warning(
-                "USB probe failed (%s); falling back to rtl_sdr-only serial detection",
+                "USB probe failed (%s); falling back to librtlsdr-only serial detection",
                 exc,
             )
             return
@@ -368,28 +368,16 @@ class CaptureManager:
 
     @staticmethod
     def _probe_rtl_devices() -> list[RtlDeviceInfo]:
-        probe = subprocess.run(
-            ["rtl_sdr", "-d", "9999", "-"],
-            capture_output=True,
-            check=False,
-            start_new_session=True,
-        )
-        output_parts = []
-        if probe.stdout:
-            output_parts.append(probe.stdout.decode("utf-8", errors="replace"))
-        if probe.stderr:
-            output_parts.append(probe.stderr.decode("utf-8", errors="replace"))
-        output = "\n".join(output_parts)
         devices: list[RtlDeviceInfo] = []
-        for line in output.splitlines():
-            match = re.match(r"\s*(\d+):\s*(.+?)(?:,\s*SN:\s*(\S+))?\s*$", line)
-            if not match:
-                continue
+        assert RtlSdr is not None
+        for index in range(RtlSdr.get_device_count()):
+            manufacturer, product, serial = RtlSdr.get_device_usb_strings(index)
+            description_parts = [part for part in (manufacturer, product) if part]
             devices.append(
                 RtlDeviceInfo(
-                    index=int(match.group(1)),
-                    description=match.group(2).strip(),
-                    serial=match.group(3),
+                    index=index,
+                    description=", ".join(description_parts) or RtlSdr.get_device_name(index),
+                    serial=serial or None,
                 )
             )
         return devices
@@ -823,9 +811,10 @@ def _is_valid_rtl_sample_rate(sample_rate: int) -> bool:
 
 
 def _check_dependencies() -> None:
-    missing = [name for name in ("rtl_sdr", "csdr") if shutil.which(name) is None]
-    if missing:
-        raise FileNotFoundError(f"required command(s) not found in PATH: {', '.join(missing)}")
+    if PYRTLSDR_IMPORT_ERROR is not None:
+        raise ImportError(f"pyrtlsdr compatibility layer could not load librtlsdr: {PYRTLSDR_IMPORT_ERROR}")
+    if shutil.which("csdr") is None:
+        raise FileNotFoundError("required command(s) not found in PATH: csdr")
 
 
 def parse_client_request(conn: socket.socket) -> dict[str, Any]:
