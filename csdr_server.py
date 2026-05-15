@@ -225,11 +225,15 @@ class CaptureManager:
         probe = subprocess.run(
             ["rtl_sdr", "-d", "9999", "-"],
             capture_output=True,
-            text=True,
             check=False,
             start_new_session=True,
         )
-        output = "\n".join(part for part in (probe.stdout, probe.stderr) if part)
+        output_parts = []
+        if probe.stdout:
+            output_parts.append(probe.stdout.decode("utf-8", errors="replace"))
+        if probe.stderr:
+            output_parts.append(probe.stderr.decode("utf-8", errors="replace"))
+        output = "\n".join(output_parts)
         for line in output.splitlines():
             match = re.match(r"\s*(\d+):.*SN:\s*(\S+)\s*$", line)
             if match and match.group(2) == serial:
