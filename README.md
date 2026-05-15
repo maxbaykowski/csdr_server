@@ -40,8 +40,8 @@ Copy [config.example.json](/home/max/git/csdr_server/config.example.json) to
 list, because client frequency shifting only makes sense relative to a shared
 capture center frequency.
 
-Configuration is loaded once when the server starts and remains in memory until
-the process exits.
+Configuration is loaded when the server starts. The running server can reload
+selected settings live when it receives `SIGHUP`.
 
 Configuration limits:
 
@@ -55,6 +55,36 @@ Configuration limits:
 ```bash
 python3 csdr_server.py --config config.json
 ```
+
+Reload the live settings after editing `config.json`:
+
+```bash
+kill -HUP <server-pid>
+```
+
+Live reload applies only these settings:
+
+- `center_frequency`
+- `rtl_sample_rate`
+- `rtl_gain`
+- `transition_bandwidth`
+
+All other config changes are ignored until the server is restarted.
+
+Reload behavior:
+
+- `rtl_gain` is applied directly to the running SDR.
+- `center_frequency` retunes the SDR and updates all shared `csdr shift`
+  processes through their FIFOs so connected clients keep their requested RF
+  frequencies.
+- `rtl_sample_rate` is applied live only if every connected client still stays
+  in band and still decimates cleanly from the new RTL rate.
+- `transition_bandwidth` rebuilds all shared `csdr firdecimate` stages with the
+  new transition bandwidth.
+- If a requested live `center_frequency` or `rtl_sample_rate` would push any
+  connected client out of band, or make its requested sample rate impossible to
+  decimate cleanly, the server keeps the old center/rate and logs that a server
+  restart is required for that change.
 
 ## Client
 

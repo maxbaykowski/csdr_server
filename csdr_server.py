@@ -11,6 +11,7 @@ stream.
 from __future__ import annotations
 
 import argparse
+import ctypes
 from ctypes import c_ubyte
 import json
 import logging
@@ -23,7 +24,7 @@ import socket
 import subprocess
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,8 @@ LOGGER = logging.getLogger("csdr_server")
 EXIT_OUT_OF_BAND = 1
 EXIT_BAD_SAMPLE_RATE = 2
 EXIT_REQUEST_ERROR = 3
+
+PR_SET_NAME = 15
 
 
 @dataclass(frozen=True)
@@ -141,6 +144,13 @@ def _read_sysfs_text(path: Path) -> str | None:
         return None
 
 
+def _set_process_name(name: str) -> None:
+    try:
+        ctypes.CDLL(None).prctl(PR_SET_NAME, name.encode("utf-8")[:15], 0, 0, 0)
+    except Exception:
+        pass
+
+
 class CaptureManager:
     def __init__(self, config: ServerConfig) -> None:
         self.config = config
@@ -152,6 +162,8 @@ class CaptureManager:
         self.device_wait_logged = False
         self.device_busy_logged = False
         self.graph = StreamGraph(config)
+        self.clients: set[ClientSession] = set()
+        self.clients_lock = threading.Lock()
 
     def start(self) -> None:
         self.supervisor_thread = threading.Thread(
@@ -164,6 +176,11 @@ class CaptureManager:
     def stop(self) -> None:
         self.stop_event.set()
         self.graph.stop("server shutdown")
+        with self.clients_lock:
+            clients = list(self.clients)
+            self.clients.clear()
+        for client in clients:
+            client.close("server shutdown")
         self._close_sdr()
         if self.supervisor_thread is not None:
             self.supervisor_thread.join(timeout=2.0)
@@ -266,6 +283,126 @@ class CaptureManager:
     def get_output_stream(self, frequency: int, output_rate: int) -> "SharedStream":
         return self.graph.get_output_stream(frequency, output_rate)
 
+    def register_client(self, client: "ClientSession") -> None:
+        with self.clients_lock:
+            self.clients.add(client)
+
+    def unregister_client(self, client: "ClientSession") -> None:
+        with self.clients_lock:
+            self.clients.discard(client)
+
+    def reload_config(self, path: Path) -> bool:
+        loaded_config = load_config(path)
+        current_config = self.config
+        reloadable_fields = {
+            "rtl_gain",
+            "rtl_sample_rate",
+            "center_frequency",
+            "transition_bandwidth",
+        }
+        ignored_fields = [
+            field_name
+            for field_name in current_config.__dataclass_fields__
+            if field_name not in reloadable_fields
+            and getattr(loaded_config, field_name) != getattr(current_config, field_name)
+        ]
+        if ignored_fields:
+            LOGGER.warning(
+                "config reload ignored non-live settings that still require a restart: %s",
+                ", ".join(sorted(ignored_fields)),
+            )
+        next_config = current_config
+        for field_name in reloadable_fields:
+            next_config = replace(
+                next_config,
+                **{field_name: getattr(loaded_config, field_name)},
+            )
+
+        center_or_rate_changed = (
+            next_config.center_frequency != current_config.center_frequency
+            or next_config.rtl_sample_rate != current_config.rtl_sample_rate
+        )
+        transition_changed = (
+            next_config.transition_bandwidth != current_config.transition_bandwidth
+        )
+
+        client_requests = self._snapshot_client_requests()
+        if center_or_rate_changed:
+            incompatible_errors = self._find_incompatible_requests(next_config, client_requests)
+            if incompatible_errors:
+                LOGGER.error(
+                    "config reload requires a server restart: %s",
+                    incompatible_errors[0],
+                )
+                if len(incompatible_errors) > 1:
+                    LOGGER.error(
+                        "additional incompatible client requests: %s",
+                        "; ".join(incompatible_errors[1:]),
+                    )
+                next_config = replace(
+                    next_config,
+                    center_frequency=current_config.center_frequency,
+                    rtl_sample_rate=current_config.rtl_sample_rate,
+                )
+                center_or_rate_changed = False
+
+        self._apply_runtime_radio_config(current_config, next_config)
+        self.graph.apply_runtime_config(
+            new_config=next_config,
+            sessions=client_requests,
+            rebuild_decimators=center_or_rate_changed or transition_changed,
+        )
+        self.config = next_config
+        LOGGER.info(
+            "config reload applied: center_frequency=%s rtl_sample_rate=%s rtl_gain=%s transition_bandwidth=%s",
+            next_config.center_frequency,
+            next_config.rtl_sample_rate,
+            next_config.rtl_gain,
+            next_config.transition_bandwidth,
+        )
+        return True
+
+    def _snapshot_client_requests(self) -> list["ClientSession"]:
+        with self.clients_lock:
+            return [client for client in self.clients if not client.closed.is_set()]
+
+    def _find_incompatible_requests(
+        self,
+        config: ServerConfig,
+        sessions: list["ClientSession"],
+    ) -> list[str]:
+        errors: list[str] = []
+        for session in sessions:
+            try:
+                _validate_request(config, session.frequency, session.output_rate)
+                _compute_decimation(config.rtl_sample_rate, session.output_rate)
+            except RequestValidationError as exc:
+                errors.append(
+                    f"client {session.address[0]}:{session.address[1]} "
+                    f"freq={session.frequency} sample_rate={session.output_rate}: {exc.message}"
+                )
+        return errors
+
+    def _apply_runtime_radio_config(
+        self,
+        current_config: ServerConfig,
+        next_config: ServerConfig,
+    ) -> None:
+        with self.sdr_lock:
+            sdr = self.sdr
+            if sdr is None:
+                return
+            if next_config.rtl_gain != current_config.rtl_gain:
+                sdr.gain = "auto" if next_config.rtl_gain is None else next_config.rtl_gain
+            if next_config.center_frequency != current_config.center_frequency:
+                sdr.center_freq = next_config.center_frequency
+            if next_config.rtl_sample_rate != current_config.rtl_sample_rate:
+                assert rtlsdr_lib is not None
+                sdr.sample_rate = next_config.rtl_sample_rate
+                result = rtlsdr_lib.rtlsdr_reset_buffer(sdr.dev_p)
+                if result < 0:
+                    raise LibUSBError(result, "Could not reset buffer after sample-rate change")
+
     def _open_sdr(self, device_index: int) -> BaseRtlSdr:
         assert BaseRtlSdr is not None
         assert rtlsdr_lib is not None
@@ -312,7 +449,9 @@ class CaptureManager:
     ) -> None:
         try:
             while not self.stop_event.is_set() and not stop_event.is_set():
-                output_queue.put(sdr.read_bytes(self.config.read_chunk_size))
+                with self.sdr_lock:
+                    chunk = sdr.read_bytes(self.config.read_chunk_size)
+                output_queue.put(chunk)
         except Exception as exc:
             try:
                 output_queue.put_nowait(exc)
@@ -645,8 +784,14 @@ class SharedStream:
     def _send_initial_control_value(self) -> None:
         if self.control_fifo_value is None or self.control_fifo_fd is None:
             return
-        payload = f"{self.control_fifo_value}\n".encode("utf-8")
+        self.send_control_value(self.control_fifo_value)
+
+    def send_control_value(self, value: str) -> None:
+        if self.control_fifo_fd is None:
+            return
+        payload = f"{value}\n".encode("utf-8")
         os.write(self.control_fifo_fd, payload)
+        self.control_fifo_value = value
 
     def _cleanup_control_fifo(self) -> None:
         if self.control_fifo_fd is not None:
@@ -695,63 +840,112 @@ class StreamGraph:
             self.stop("root convert stream failed")
 
     def get_output_stream(self, frequency: int, output_rate: int) -> SharedStream:
+        with self.lock:
+            return self._get_output_stream_locked(frequency, output_rate)
+
+    def apply_runtime_config(
+        self,
+        new_config: ServerConfig,
+        sessions: list["ClientSession"],
+        rebuild_decimators: bool,
+    ) -> None:
+        old_decimation_streams: list[SharedStream] = []
+        stream_switches: list[tuple[ClientSession, SharedStream]] = []
+        with self.lock:
+            self.config = new_config
+            if self.root_stream is not None:
+                self.root_stream.config = new_config
+            for frequency, stream in self.shift_streams.items():
+                stream.config = new_config
+                stream.send_control_value(
+                    str((new_config.center_frequency - frequency) / new_config.rtl_sample_rate)
+                )
+
+            if rebuild_decimators:
+                old_decimation_streams = list(self.decimation_streams.values())
+                self.decimation_streams = {}
+
+            for session in sessions:
+                session.config = new_config
+                stream_switches.append(
+                    (
+                        session,
+                        self._get_output_stream_locked(
+                            session.frequency,
+                            session.output_rate,
+                        ),
+                    )
+                )
+
+        for session, desired_stream in stream_switches:
+            session.switch_source_stream(desired_stream)
+
+        for stream in old_decimation_streams:
+            stream.close("reconfigured decimator", propagate=False)
+
+    def _get_output_stream_locked(self, frequency: int, output_rate: int) -> SharedStream:
         decimation = _compute_decimation(self.config.rtl_sample_rate, output_rate)
         _validate_request(self.config, frequency, output_rate)
 
-        with self.lock:
-            root = self.root_stream
-            if root is None:
-                root = SharedStream(
-                    config=self.config,
-                    name="convert",
-                    command=["csdr", "convert", "-i", "char", "-o", "float"],
-                    manager=self,
-                    parent=None,
-                    close_when_unused=True,
-                )
-                root.start()
-                self.root_stream = root
+        root = self.root_stream
+        if root is None:
+            root = SharedStream(
+                config=self.config,
+                name="convert",
+                command=["csdr", "convert", "-i", "char", "-o", "float"],
+                manager=self,
+                parent=None,
+                close_when_unused=True,
+            )
+            root.start()
+            self.root_stream = root
+        else:
+            root.config = self.config
 
-            shift_stream = self.shift_streams.get(frequency)
-            if shift_stream is None:
-                shift_rate = (self.config.center_frequency - frequency) / self.config.rtl_sample_rate
-                shift_name = f"shift-{frequency}"
-                shift_fifo_path = Path("/run/user") / str(os.getuid()) / f"csdr_server_{shift_name}_{os.getpid()}.fifo"
-                shift_stream = SharedStream(
-                    config=self.config,
-                    name=shift_name,
-                    command=["csdr", "shift", "--fifo", str(shift_fifo_path)],
-                    manager=self,
-                    parent=root,
-                    close_when_unused=True,
-                    control_fifo_value=str(shift_rate),
-                    control_fifo_path=shift_fifo_path,
-                )
-                shift_stream.start()
-                self.shift_streams[frequency] = shift_stream
+        shift_stream = self.shift_streams.get(frequency)
+        if shift_stream is None:
+            shift_rate = (self.config.center_frequency - frequency) / self.config.rtl_sample_rate
+            shift_name = f"shift-{frequency}"
+            shift_fifo_path = Path("/run/user") / str(os.getuid()) / f"csdr_server_{shift_name}_{os.getpid()}.fifo"
+            shift_stream = SharedStream(
+                config=self.config,
+                name=shift_name,
+                command=["csdr", "shift", "--fifo", str(shift_fifo_path)],
+                manager=self,
+                parent=root,
+                close_when_unused=True,
+                control_fifo_value=str(shift_rate),
+                control_fifo_path=shift_fifo_path,
+            )
+            shift_stream.start()
+            self.shift_streams[frequency] = shift_stream
+        else:
+            shift_stream.config = self.config
 
-            if decimation == 1:
-                return shift_stream
+        if decimation == 1:
+            return shift_stream
 
-            key = (frequency, output_rate)
-            decimation_stream = self.decimation_streams.get(key)
-            if decimation_stream is None:
-                decimation_stream = SharedStream(
-                    config=self.config,
-                    name=f"firdecimate-{frequency}-{output_rate}",
-                    command=[
-                        "csdr",
-                        "firdecimate",
-                        str(decimation),
-                        str(self.config.transition_bandwidth),
-                    ],
-                    manager=self,
-                    parent=shift_stream,
-                    close_when_unused=True,
-                )
-                decimation_stream.start()
-                self.decimation_streams[key] = decimation_stream
-            return decimation_stream
+        key = (frequency, output_rate)
+        decimation_stream = self.decimation_streams.get(key)
+        if decimation_stream is None:
+            decimation_stream = SharedStream(
+                config=self.config,
+                name=f"firdecimate-{frequency}-{output_rate}",
+                command=[
+                    "csdr",
+                    "firdecimate",
+                    str(decimation),
+                    str(self.config.transition_bandwidth),
+                ],
+                manager=self,
+                parent=shift_stream,
+                close_when_unused=True,
+            )
+            decimation_stream.start()
+            self.decimation_streams[key] = decimation_stream
+        else:
+            decimation_stream.config = self.config
+        return decimation_stream
 
     def on_stream_closed(self, stream: SharedStream) -> None:
         with self.lock:
@@ -770,6 +964,7 @@ class ClientSession:
         self,
         conn: socket.socket,
         address: tuple[str, int],
+        manager: CaptureManager,
         config: ServerConfig,
         source_stream: SharedStream,
         frequency: int,
@@ -777,6 +972,7 @@ class ClientSession:
     ) -> None:
         self.conn = conn
         self.address = address
+        self.manager = manager
         self.config = config
         self.source_stream = source_stream
         self.frequency = frequency
@@ -823,6 +1019,7 @@ class ClientSession:
             return
         LOGGER.info("closing client %s:%s: %s", self.address[0], self.address[1], reason)
         self.closed.set()
+        self.manager.unregister_client(self)
         self.source_stream.remove_subscriber(self)
         try:
             self.chunk_queue.put_nowait(None)
@@ -851,6 +1048,20 @@ class ClientSession:
             LOGGER.exception("client output loop failed for %s:%s", *self.address)
         finally:
             self.close("output loop ended")
+
+    def switch_source_stream(self, new_stream: SharedStream) -> None:
+        if self.closed.is_set() or new_stream is self.source_stream:
+            return
+        old_stream = self.source_stream
+        new_stream.add_subscriber(self)
+        self.source_stream = new_stream
+        old_stream.remove_subscriber(self)
+        LOGGER.info(
+            "client %s:%s switched to stream %s",
+            self.address[0],
+            self.address[1],
+            new_stream.name,
+        )
 
 
 def _compute_decimation(input_rate: int, output_rate: int) -> int:
@@ -950,18 +1161,24 @@ def send_handshake(conn: socket.socket, payload: dict[str, Any]) -> None:
     conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
 
 
-def serve(config: ServerConfig) -> int:
+def serve(config_path: Path, config: ServerConfig) -> int:
     capture = CaptureManager(config)
     capture.start()
 
     shutdown_event = threading.Event()
+    reload_event = threading.Event()
 
     def _handle_signal(signum: int, _frame: Any) -> None:
         LOGGER.info("received signal %s, shutting down", signum)
         shutdown_event.set()
 
+    def _handle_reload(_signum: int, _frame: Any) -> None:
+        LOGGER.info("received SIGHUP, reloading config from %s", config_path)
+        reload_event.set()
+
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGHUP, _handle_reload)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -978,6 +1195,12 @@ def serve(config: ServerConfig) -> int:
 
         try:
             while not shutdown_event.is_set() and not capture.stop_event.is_set():
+                if reload_event.is_set():
+                    reload_event.clear()
+                    try:
+                        capture.reload_config(config_path)
+                    except Exception:
+                        LOGGER.exception("config reload failed")
                 try:
                     conn, address = server.accept()
                 except socket.timeout:
@@ -991,11 +1214,13 @@ def serve(config: ServerConfig) -> int:
                     session = ClientSession(
                         conn=conn,
                         address=address,
-                        config=config,
+                        manager=capture,
+                        config=capture.config,
                         source_stream=source_stream,
                         frequency=frequency,
                         output_rate=output_rate,
                     )
+                    capture.register_client(session)
                     session.start()
                     send_handshake(conn, {"status": "ok"})
                     session.activate()
@@ -1065,6 +1290,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    _set_process_name("csdr_server")
     args = parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level),
@@ -1073,7 +1299,7 @@ def main() -> int:
     try:
         _check_dependencies()
         config = load_config(args.config)
-        return serve(config)
+        return serve(args.config, config)
     except SystemExit:
         raise
     except FileNotFoundError:

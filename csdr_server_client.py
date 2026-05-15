@@ -9,6 +9,7 @@ complex float32 IQ stream to stdout.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import re
 import signal
@@ -22,6 +23,7 @@ EXIT_BAD_SAMPLE_RATE = 2
 EXIT_REQUEST_ERROR = 3
 
 SHUTDOWN_SIGNAL_EXIT = 0
+PR_SET_NAME = 15
 
 
 SUFFIXES = {
@@ -33,6 +35,13 @@ SUFFIXES = {
 
 _shutdown_requested = False
 _active_socket: socket.socket | None = None
+
+
+def _set_process_name(name: str) -> None:
+    try:
+        ctypes.CDLL(None).prctl(PR_SET_NAME, name.encode("utf-8")[:15], 0, 0, 0)
+    except Exception:
+        pass
 
 
 def _request_shutdown(signum: int, _frame: object) -> None:
@@ -93,6 +102,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     global _active_socket
 
+    _set_process_name("csdr_client")
     _install_signal_handlers()
     args = parse_args()
     request = {
