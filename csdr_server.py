@@ -633,10 +633,16 @@ def load_config(path: Path) -> ServerConfig:
 def _validate_config(config: ServerConfig) -> None:
     if config.center_frequency <= 0:
         raise ValueError("center_frequency must be positive")
-    if config.rtl_sample_rate <= 0:
-        raise ValueError("rtl_sample_rate must be positive")
-    if config.transition_bandwidth <= 0:
-        raise ValueError("transition_bandwidth must be positive")
+    if not _is_valid_rtl_sample_rate(config.rtl_sample_rate):
+        raise ValueError(
+            f"Cannot sample at {config.rtl_sample_rate} S/s. "
+            "The sample rate must be between 225001 S/s and 300000 S/s "
+            "or 900001 S/s and 3200000 S/s."
+        )
+    if config.rtl_gain is not None and not (1.0 <= config.rtl_gain <= 49.6):
+        raise ValueError("rtl_gain must be between 1.0 dB and 49.6 dB")
+    if not (0.005 <= config.transition_bandwidth <= 0.05):
+        raise ValueError("transition_bandwidth must be between 0.005 and 0.05")
     if config.listen_port <= 0 or config.listen_port > 65535:
         raise ValueError("listen_port must be between 1 and 65535")
     if config.read_chunk_size <= 0:
@@ -647,6 +653,13 @@ def _validate_config(config: ServerConfig) -> None:
         raise ValueError("client_queue_chunks must be positive")
     if config.enqueue_timeout_seconds < 0:
         raise ValueError("enqueue_timeout_seconds must be non-negative")
+
+
+def _is_valid_rtl_sample_rate(sample_rate: int) -> bool:
+    return (
+        225_001 <= sample_rate <= 300_000
+        or 900_001 <= sample_rate <= 3_200_000
+    )
 
 
 def _check_dependencies() -> None:

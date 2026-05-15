@@ -42,6 +42,13 @@ capture center frequency.
 Configuration is loaded once when the server starts and remains in memory until
 the process exits.
 
+Configuration limits:
+
+- `rtl_sample_rate` must be between `225001` and `300000` S/s, or between
+  `900001` and `3200000` S/s.
+- `rtl_gain` must be between `1.0` and `49.6` dB when set.
+- `transition_bandwidth` must be between `0.005` and `0.05`.
+
 ## Run
 
 ```bash

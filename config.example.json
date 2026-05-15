@@ -4,9 +4,11 @@
   "center_frequency": 162475000,
   "rtl_sample_rate": 2400000,
   "rtl_gain": 35.0,
-  "transition_bandwidth": 0.05,
+  "transition_bandwidth": 0.005,
   "listen_host": "0.0.0.0",
   "listen_port": 7355,
   "read_chunk_size": 262144,
-  "client_queue_chunks": 8
+  "stream_queue_chunks": 64,
+  "client_queue_chunks": 64,
+  "enqueue_timeout_seconds": 0.25
 }
