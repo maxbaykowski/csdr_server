@@ -147,7 +147,6 @@ def main() -> int:
                 if _shutdown_requested:
                     return SHUTDOWN_SIGNAL_EXIT
                 stdout.write(chunk)
-                stdout.flush()
             if _shutdown_requested:
                 return SHUTDOWN_SIGNAL_EXIT
         except BrokenPipeError:

@@ -45,7 +45,9 @@ class ServerConfig:
     listen_host: str = "0.0.0.0"
     listen_port: int = 7355
     read_chunk_size: int = 262_144
-    client_queue_chunks: int = 8
+    stream_queue_chunks: int = 64
+    client_queue_chunks: int = 64
+    enqueue_timeout_seconds: float = 0.25
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "ServerConfig":
@@ -60,7 +62,9 @@ class ServerConfig:
             listen_host=str(data.get("listen_host", "0.0.0.0")),
             listen_port=int(data.get("listen_port", 7355)),
             read_chunk_size=int(data.get("read_chunk_size", 262_144)),
-            client_queue_chunks=int(data.get("client_queue_chunks", 8)),
+            stream_queue_chunks=int(data.get("stream_queue_chunks", 64)),
+            client_queue_chunks=int(data.get("client_queue_chunks", 64)),
+            enqueue_timeout_seconds=float(data.get("enqueue_timeout_seconds", 0.25)),
         )
         _validate_config(config)
         return config
@@ -92,8 +96,7 @@ class CaptureManager:
         self.process_lock = threading.Lock()
         self.supervisor_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
-        self.clients: set[ClientSession] = set()
-        self.clients_lock = threading.Lock()
+        self.graph = StreamGraph(config)
 
     def start(self) -> None:
         self.supervisor_thread = threading.Thread(
@@ -105,24 +108,13 @@ class CaptureManager:
 
     def stop(self) -> None:
         self.stop_event.set()
-        with self.clients_lock:
-            clients = list(self.clients)
-        for client in clients:
-            client.close("server shutdown")
+        self.graph.stop("server shutdown")
         with self.process_lock:
             process = self.process
         if process is not None:
             self._terminate_process(process, "rtl_sdr")
         if self.supervisor_thread is not None:
             self.supervisor_thread.join(timeout=2.0)
-
-    def add_client(self, client: "ClientSession") -> None:
-        with self.clients_lock:
-            self.clients.add(client)
-
-    def remove_client(self, client: "ClientSession") -> None:
-        with self.clients_lock:
-            self.clients.discard(client)
 
     def _build_rtl_command(self, device: str) -> list[str]:
         command = [
@@ -178,10 +170,7 @@ class CaptureManager:
                     if not chunk:
                         break
                     got_data = True
-                    with self.clients_lock:
-                        clients = list(self.clients)
-                    for client in clients:
-                        client.enqueue(chunk)
+                    self.graph.feed_raw(chunk)
             except Exception:
                 LOGGER.exception("rtl_sdr reader loop failed")
             finally:
@@ -200,6 +189,9 @@ class CaptureManager:
             else:
                 LOGGER.warning("rtl_sdr exited before producing data: rc=%s; restarting", return_code)
             self.stop_event.wait(0.5)
+
+    def get_output_stream(self, frequency: int, output_rate: int) -> "SharedStream":
+        return self.graph.get_output_stream(frequency, output_rate)
 
     def _stderr_loop(self, process: subprocess.Popen[bytes]) -> None:
         assert process.stderr is not None
@@ -263,69 +255,307 @@ class CaptureManager:
             process.wait(timeout=2.0)
 
 
+class SharedStream:
+    def __init__(
+        self,
+        config: ServerConfig,
+        name: str,
+        command: list[str],
+        manager: "StreamGraph",
+        parent: "SharedStream | None" = None,
+        close_when_unused: bool = True,
+    ) -> None:
+        self.config = config
+        self.name = name
+        self.command = command
+        self.manager = manager
+        self.parent = parent
+        self.close_when_unused = close_when_unused
+        self.process: subprocess.Popen[bytes] | None = None
+        self.input_queue: queue.Queue[bytes | None] = queue.Queue(
+            maxsize=config.stream_queue_chunks
+        )
+        self.closed = threading.Event()
+        self.subscribers: set[Any] = set()
+        self.subscribers_lock = threading.Lock()
+        self.input_thread: threading.Thread | None = None
+        self.output_thread: threading.Thread | None = None
+        self.stderr_thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.process = subprocess.Popen(
+            self.command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            start_new_session=True,
+        )
+        self.input_thread = threading.Thread(
+            target=self._input_loop,
+            name=f"{self.name}-input",
+            daemon=True,
+        )
+        self.output_thread = threading.Thread(
+            target=self._output_loop,
+            name=f"{self.name}-output",
+            daemon=True,
+        )
+        self.stderr_thread = threading.Thread(
+            target=self._stderr_loop,
+            name=f"{self.name}-stderr",
+            daemon=True,
+        )
+        self.input_thread.start()
+        self.output_thread.start()
+        self.stderr_thread.start()
+        if self.parent is not None:
+            self.parent.add_subscriber(self)
+        LOGGER.info("started shared stream %s: %s", self.name, " ".join(self.command))
+
+    def add_subscriber(self, subscriber: Any) -> None:
+        with self.subscribers_lock:
+            self.subscribers.add(subscriber)
+
+    def remove_subscriber(self, subscriber: Any) -> None:
+        should_close = False
+        with self.subscribers_lock:
+            self.subscribers.discard(subscriber)
+            should_close = (
+                self.close_when_unused
+                and not self.subscribers
+                and not self.closed.is_set()
+            )
+        if should_close:
+            self.close("unused shared stream", propagate=False)
+
+    def enqueue(self, chunk: bytes) -> bool:
+        if self.closed.is_set():
+            return False
+        try:
+            self.input_queue.put(chunk, timeout=self.config.enqueue_timeout_seconds)
+            return True
+        except queue.Full:
+            LOGGER.warning("%s fell behind upstream input; closing branch", self.name)
+            self.close("stream backlog")
+            return False
+
+    def close(self, reason: str, propagate: bool = True) -> None:
+        if self.closed.is_set():
+            return
+        LOGGER.info("closing shared stream %s: %s", self.name, reason)
+        self.closed.set()
+        if self.parent is not None:
+            self.parent.remove_subscriber(self)
+        self.manager.on_stream_closed(self)
+        try:
+            self.input_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        with self.subscribers_lock:
+            subscribers = list(self.subscribers)
+            self.subscribers.clear()
+        if propagate:
+            for subscriber in subscribers:
+                subscriber.close(f"upstream stream closed: {self.name}")
+        if self.process is not None:
+            CaptureManager._terminate_process(self.process, self.command[0])
+
+    def _input_loop(self) -> None:
+        try:
+            assert self.process is not None
+            assert self.process.stdin is not None
+            while not self.closed.is_set():
+                chunk = self.input_queue.get()
+                if chunk is None:
+                    break
+                self.process.stdin.write(chunk)
+        except BrokenPipeError:
+            LOGGER.info("%s stdin closed", self.name)
+        except Exception:
+            LOGGER.exception("%s input loop failed", self.name)
+        finally:
+            if self.process is not None and self.process.stdin is not None and not self.process.stdin.closed:
+                try:
+                    self.process.stdin.close()
+                except OSError:
+                    pass
+
+    def _output_loop(self) -> None:
+        try:
+            assert self.process is not None
+            assert self.process.stdout is not None
+            while not self.closed.is_set():
+                data = self.process.stdout.read(65_536)
+                if not data:
+                    break
+                with self.subscribers_lock:
+                    subscribers = list(self.subscribers)
+                for subscriber in subscribers:
+                    subscriber.enqueue(data)
+        except Exception:
+            LOGGER.exception("%s output loop failed", self.name)
+        finally:
+            if not self.closed.is_set():
+                self.close("process output ended")
+
+    def _stderr_loop(self) -> None:
+        assert self.process is not None
+        if self.process.stderr is None:
+            return
+        for line in iter(self.process.stderr.readline, b""):
+            if not line:
+                break
+            LOGGER.info(
+                "%s: %s",
+                self.name,
+                line.decode("utf-8", errors="replace").rstrip(),
+            )
+
+
+class StreamGraph:
+    def __init__(self, config: ServerConfig) -> None:
+        self.config = config
+        self.lock = threading.Lock()
+        self.root_stream: SharedStream | None = None
+        self.shift_streams: dict[int, SharedStream] = {}
+        self.decimation_streams: dict[tuple[int, int], SharedStream] = {}
+
+    def stop(self, reason: str) -> None:
+        with self.lock:
+            root = self.root_stream
+            shifts = list(self.shift_streams.values())
+            decimations = list(self.decimation_streams.values())
+            self.root_stream = None
+            self.shift_streams = {}
+            self.decimation_streams = {}
+        for stream in decimations:
+            stream.close(reason, propagate=True)
+        for stream in shifts:
+            stream.close(reason, propagate=True)
+        if root is not None:
+            root.close(reason, propagate=True)
+
+    def feed_raw(self, chunk: bytes) -> None:
+        with self.lock:
+            root = self.root_stream
+        if root is None:
+            return
+        if not root.enqueue(chunk):
+            self.stop("root convert stream failed")
+
+    def get_output_stream(self, frequency: int, output_rate: int) -> SharedStream:
+        decimation = _compute_decimation(self.config.rtl_sample_rate, output_rate)
+        _validate_request(self.config, frequency, output_rate)
+
+        with self.lock:
+            root = self.root_stream
+            if root is None:
+                root = SharedStream(
+                    config=self.config,
+                    name="convert",
+                    command=["csdr", "convert", "-i", "char", "-o", "float"],
+                    manager=self,
+                    parent=None,
+                    close_when_unused=True,
+                )
+                root.start()
+                self.root_stream = root
+
+            shift_stream = self.shift_streams.get(frequency)
+            if shift_stream is None:
+                shift_rate = (self.config.center_frequency - frequency) / self.config.rtl_sample_rate
+                shift_stream = SharedStream(
+                    config=self.config,
+                    name=f"shift-{frequency}",
+                    command=["csdr", "shift", str(shift_rate)],
+                    manager=self,
+                    parent=root,
+                    close_when_unused=True,
+                )
+                shift_stream.start()
+                self.shift_streams[frequency] = shift_stream
+
+            if decimation == 1:
+                return shift_stream
+
+            key = (frequency, output_rate)
+            decimation_stream = self.decimation_streams.get(key)
+            if decimation_stream is None:
+                decimation_stream = SharedStream(
+                    config=self.config,
+                    name=f"firdecimate-{frequency}-{output_rate}",
+                    command=[
+                        "csdr",
+                        "firdecimate",
+                        str(decimation),
+                        str(self.config.transition_bandwidth),
+                    ],
+                    manager=self,
+                    parent=shift_stream,
+                    close_when_unused=True,
+                )
+                decimation_stream.start()
+                self.decimation_streams[key] = decimation_stream
+            return decimation_stream
+
+    def on_stream_closed(self, stream: SharedStream) -> None:
+        with self.lock:
+            if self.root_stream is stream:
+                self.root_stream = None
+            for frequency, candidate in list(self.shift_streams.items()):
+                if candidate is stream:
+                    del self.shift_streams[frequency]
+            for key, candidate in list(self.decimation_streams.items()):
+                if candidate is stream:
+                    del self.decimation_streams[key]
+
+
 class ClientSession:
     def __init__(
         self,
         conn: socket.socket,
         address: tuple[str, int],
         config: ServerConfig,
-        capture: CaptureManager,
-        request: dict[str, Any],
+        source_stream: SharedStream,
+        frequency: int,
+        output_rate: int,
     ) -> None:
         self.conn = conn
         self.address = address
         self.config = config
-        self.capture = capture
+        self.source_stream = source_stream
+        self.frequency = frequency
+        self.output_rate = output_rate
         self.chunk_queue: queue.Queue[bytes | None] = queue.Queue(
             maxsize=config.client_queue_chunks
         )
         self.closed = threading.Event()
-        self.pipeline: list[subprocess.Popen[bytes]] = []
-        self.input_thread: threading.Thread | None = None
         self.output_thread: threading.Thread | None = None
 
-        self.frequency = int(request["frequency"])
-        self.output_rate = int(request.get("sample_rate", request.get("bandwidth")))
-        self.shift_rate = (
-            self.config.center_frequency - self.frequency
-        ) / self.config.rtl_sample_rate
-        self.decimation = _compute_decimation(
-            self.config.rtl_sample_rate,
-            self.output_rate,
-        )
-        _validate_request(self.config, self.frequency, self.output_rate)
-
     def start(self) -> None:
-        self.pipeline = self._start_pipeline()
-        self.capture.add_client(self)
-        
+        self.source_stream.add_subscriber(self)
+
     def activate(self) -> None:
-        self.input_thread = threading.Thread(
-            target=self._input_loop,
-            name=f"client-input-{self.address[0]}:{self.address[1]}",
-            daemon=True,
-        )
         self.output_thread = threading.Thread(
             target=self._output_loop,
             name=f"client-output-{self.address[0]}:{self.address[1]}",
             daemon=True,
         )
-        self.input_thread.start()
         self.output_thread.start()
         LOGGER.info(
-            "client %s:%s started freq=%s sample_rate=%s decimation=%s",
+            "client %s:%s started freq=%s sample_rate=%s",
             self.address[0],
             self.address[1],
             self.frequency,
             self.output_rate,
-            self.decimation,
         )
 
     def enqueue(self, chunk: bytes) -> None:
         if self.closed.is_set():
             return
         try:
-            self.chunk_queue.put_nowait(chunk)
+            self.chunk_queue.put(chunk, timeout=self.config.enqueue_timeout_seconds)
         except queue.Full:
             LOGGER.warning(
                 "client %s:%s fell behind capture rate; dropping connection",
@@ -339,7 +569,7 @@ class ClientSession:
             return
         LOGGER.info("closing client %s:%s: %s", self.address[0], self.address[1], reason)
         self.closed.set()
-        self.capture.remove_client(self)
+        self.source_stream.remove_subscriber(self)
         try:
             self.chunk_queue.put_nowait(None)
         except queue.Full:
@@ -349,96 +579,12 @@ class ClientSession:
         except OSError:
             pass
         self.conn.close()
-        for process in self.pipeline:
-            CaptureManager._terminate_process(process, process.args[0])
-
-    def _start_pipeline(self) -> list[subprocess.Popen[bytes]]:
-        convert = subprocess.Popen(
-            ["csdr", "convert", "-i", "char", "-o", "float"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-            start_new_session=True,
-        )
-        shift = subprocess.Popen(
-            ["csdr", "shift", str(self.shift_rate)],
-            stdin=convert.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-            start_new_session=True,
-        )
-        assert convert.stdout is not None
-        convert.stdout.close()
-
-        processes = [convert, shift]
-        tail_stdout = shift.stdout
-        if self.decimation > 1:
-            decimate = subprocess.Popen(
-                [
-                    "csdr",
-                    "firdecimate",
-                    str(self.decimation),
-                    str(self.config.transition_bandwidth),
-                ],
-                stdin=shift.stdout,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0,
-                start_new_session=True,
-            )
-            assert shift.stdout is not None
-            shift.stdout.close()
-            tail_stdout = decimate.stdout
-            processes.append(decimate)
-
-        for process in processes:
-            threading.Thread(
-                target=self._log_process_stderr,
-                args=(process,),
-                name=f"stderr-{process.args[1]}-{self.address[1]}",
-                daemon=True,
-            ).start()
-
-        assert tail_stdout is not None
-        return processes
-
-    def _input_loop(self) -> None:
-        try:
-            process = self.pipeline[0]
-            assert process.stdin is not None
-            while not self.closed.is_set():
-                chunk = self.chunk_queue.get()
-                if chunk is None:
-                    break
-                process.stdin.write(chunk)
-                process.stdin.flush()
-        except BrokenPipeError:
-            LOGGER.info(
-                "client %s:%s processing pipeline closed upstream",
-                self.address[0],
-                self.address[1],
-            )
-        except Exception:
-            LOGGER.exception("client input loop failed for %s:%s", *self.address)
-        finally:
-            if self.pipeline:
-                stdin = self.pipeline[0].stdin
-                if stdin is not None and not stdin.closed:
-                    try:
-                        stdin.close()
-                    except OSError:
-                        pass
-            self.close("input loop ended")
 
     def _output_loop(self) -> None:
-        tail = self.pipeline[-1]
-        assert tail.stdout is not None
         try:
             while not self.closed.is_set():
-                data = tail.stdout.read(65_536)
-                if not data:
+                data = self.chunk_queue.get()
+                if data is None:
                     break
                 self.conn.sendall(data)
         except (BrokenPipeError, ConnectionResetError, OSError):
@@ -451,20 +597,6 @@ class ClientSession:
             LOGGER.exception("client output loop failed for %s:%s", *self.address)
         finally:
             self.close("output loop ended")
-
-    def _log_process_stderr(self, process: subprocess.Popen[bytes]) -> None:
-        if process.stderr is None:
-            return
-        for line in iter(process.stderr.readline, b""):
-            if not line:
-                break
-            LOGGER.info(
-                "client %s:%s %s: %s",
-                self.address[0],
-                self.address[1],
-                process.args[1],
-                line.decode("utf-8", errors="replace").rstrip(),
-            )
 
 
 def _compute_decimation(input_rate: int, output_rate: int) -> int:
@@ -509,8 +641,12 @@ def _validate_config(config: ServerConfig) -> None:
         raise ValueError("listen_port must be between 1 and 65535")
     if config.read_chunk_size <= 0:
         raise ValueError("read_chunk_size must be positive")
+    if config.stream_queue_chunks <= 0:
+        raise ValueError("stream_queue_chunks must be positive")
     if config.client_queue_chunks <= 0:
         raise ValueError("client_queue_chunks must be positive")
+    if config.enqueue_timeout_seconds < 0:
+        raise ValueError("enqueue_timeout_seconds must be non-negative")
 
 
 def _check_dependencies() -> None:
@@ -579,7 +715,17 @@ def serve(config: ServerConfig) -> int:
 
                 try:
                     request = parse_client_request(conn)
-                    session = ClientSession(conn, address, config, capture, request)
+                    frequency = int(request["frequency"])
+                    output_rate = int(request.get("sample_rate", request.get("bandwidth")))
+                    source_stream = capture.get_output_stream(frequency, output_rate)
+                    session = ClientSession(
+                        conn=conn,
+                        address=address,
+                        config=config,
+                        source_stream=source_stream,
+                        frequency=frequency,
+                        output_rate=output_rate,
+                    )
                     session.start()
                     send_handshake(conn, {"status": "ok"})
                     session.activate()

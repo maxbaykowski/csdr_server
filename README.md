@@ -8,7 +8,11 @@ Minimal network RTL-SDR server in Python, using `rtl_sdr` as the IQ source and
 This implementation is intentionally narrow:
 
 - One shared RTL-SDR capture process provides unsigned 8-bit IQ samples.
-- Each client gets its own `csdr` pipeline.
+- `csdr convert -i char -o float` is shared instead of run per client.
+- If multiple clients request the same frequency, one shared `csdr shift` stage
+  is reused for that frequency.
+- If multiple clients request the same frequency and sample rate, one shared
+  `csdr firdecimate` stage is reused for that `(frequency, sample_rate)` pair.
 - The only CSDR stages used are:
   - `convert -i char -o float`
   - `shift`
@@ -96,6 +100,9 @@ The shift value passed to `csdr shift` is computed as:
   `0.5`, inclusive.
 - If a client cannot keep up and its queue fills, that client is disconnected
   instead of letting memory usage grow without bound.
+- Queueing is bounded but less aggressive than before: shared stream stages and
+  client outputs buffer multiple chunks and wait briefly before a lagging branch
+  is dropped.
 
 ## Exit Codes
 
