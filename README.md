@@ -108,6 +108,8 @@ Important settings:
   - frequency correction in PPM
 - `transition_bandwidth`
   - alias filter width used during decimation
+- `audio.nfm_deemphasis_tau`
+  - NFM deemphasis time constant in microseconds
 
 ### Config Limits
 
@@ -116,6 +118,7 @@ Important settings:
 - `rtl_gain` must be between `1.0` and `49.6` dB when AGC is off
 - `ppm_correction` must be between `-500` and `500`
 - `transition_bandwidth` must be between `0.005` and `0.05`
+- `audio.nfm_deemphasis_tau` must be between `0` and `530`
 
 ## Live Reload
 
@@ -139,6 +142,7 @@ These settings can be changed live:
 - `rtl_gain`
 - `ppm_correction`
 - `transition_bandwidth`
+- `audio.nfm_deemphasis_tau`
 
 What live reload does:
 
@@ -154,6 +158,8 @@ What live reload does:
   - updates frequency correction
 - `transition_bandwidth`
   - rebuilds decimation stages
+- `audio.nfm_deemphasis_tau`
+  - rebuilds active audio demodulation stages so NFM clients pick up the new deemphasis value
 
 If a live `center_frequency` or `rtl_sample_rate` change would put an existing
 client out of band, or make its requested sample rate impossible to decimate
@@ -186,6 +192,7 @@ Supported audio modes are:
 - `modulation=am`
 - `modulation=usb`
 - `modulation=lsb`
+- `modulation=nfm`
 
 AM audio uses a fixed internal pipeline:
 
@@ -218,6 +225,19 @@ LSB audio uses the same fixed output, with the sideband filter reversed:
 - `realpart`
 - `agc -r 0.2`
 - convert to `s16`
+
+NFM audio also uses the same 16 kHz / `s16` output:
+
+- shift to the requested frequency
+- decimate to `16000` S/s
+- transition bandwidth `0.005`
+- `fmdemod`
+- `deemphasis --wfm 16000 <tau>e-6`
+- `dcblock`
+- convert to `s16`
+
+The NFM deemphasis time constant comes from `audio.nfm_deemphasis_tau` in the
+server config. The default is `300`.
 
 ## Operational Notes
 
@@ -271,7 +291,7 @@ This section is only needed if you want to write your own client.
 - one request per connection
 - UTF-8 JSON request line terminated by `\n`
 - UTF-8 JSON handshake line terminated by `\n`
-- raw binary IQ stream after a successful handshake
+- raw binary stream after a successful handshake
 
 ### Request
 
@@ -301,7 +321,7 @@ Request fields:
   - defaults to `f32`
 - `modulation`
   - required in `audio` mode
-  - `am`, `usb`, or `lsb`
+  - `am`, `usb`, `lsb`, or `nfm`
 
 IQ request example:
 
@@ -317,6 +337,10 @@ Audio request example:
 
 ```json
 {"frequency": 7200000, "mode": "audio", "modulation": "usb"}
+```
+
+```json
+{"frequency": 162550000, "mode": "audio", "modulation": "nfm"}
 ```
 
 ### Handshake

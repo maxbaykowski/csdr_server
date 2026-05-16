@@ -7,6 +7,9 @@
   "rtl_gain": 35.0,
   "ppm_correction": 0,
   "transition_bandwidth": 0.005,
+  "audio": {
+    "nfm_deemphasis_tau": 300
+  },
   "listen_host": "0.0.0.0",
   "listen_port": 7355,
   "read_chunk_size": 262144,

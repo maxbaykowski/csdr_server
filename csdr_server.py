@@ -50,7 +50,7 @@ PR_SET_NAME = 15
 DEFAULT_MODE = "iq"
 VALID_MODES = {DEFAULT_MODE, "audio"}
 DEFAULT_MODULATION = "am"
-VALID_AUDIO_MODULATIONS = {DEFAULT_MODULATION, "lsb", "usb"}
+VALID_AUDIO_MODULATIONS = {DEFAULT_MODULATION, "lsb", "nfm", "usb"}
 DEFAULT_SAMPLE_FORMAT = "f32"
 VALID_SAMPLE_FORMATS = {DEFAULT_SAMPLE_FORMAT, "s16"}
 DEFAULT_STREAM_OUTPUT_READ_SIZE = 65_536
@@ -58,6 +58,7 @@ AM_AUDIO_OUTPUT_RATE = 16_000
 AM_AUDIO_TRANSITION_BANDWIDTH = 0.005
 AM_AUDIO_OUTPUT_FORMAT = "s16"
 AM_AUDIO_AGC_REFERENCE = 0.2
+NFM_AUDIO_DEEMPHASIS_TAU = 300
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,7 @@ class ServerConfig:
     rtl_gain: float | None = None
     ppm_correction: int = 0
     transition_bandwidth: float = 0.05
+    nfm_deemphasis_tau: int = NFM_AUDIO_DEEMPHASIS_TAU
     listen_host: str = "0.0.0.0"
     listen_port: int = 7355
     read_chunk_size: int = 262_144
@@ -81,6 +83,11 @@ class ServerConfig:
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "ServerConfig":
         data = dict(raw)
+        audio_settings = data.get("audio", {})
+        if audio_settings is None:
+            audio_settings = {}
+        if not isinstance(audio_settings, dict):
+            raise ValueError("audio must be an object")
         config = cls(
             rtl_device_index=_parse_int(data.get("rtl_device_index", 0), "rtl_device_index"),
             rtl_serial=_optional_string(data.get("rtl_serial")),
@@ -95,6 +102,10 @@ class ServerConfig:
             transition_bandwidth=_parse_float(
                 data["transition_bandwidth"],
                 "transition_bandwidth",
+            ),
+            nfm_deemphasis_tau=_parse_int(
+                audio_settings.get("nfm_deemphasis_tau", NFM_AUDIO_DEEMPHASIS_TAU),
+                "audio.nfm_deemphasis_tau",
             ),
             listen_host=_parse_string(data.get("listen_host", "0.0.0.0"), "listen_host"),
             listen_port=_parse_int(data.get("listen_port", 7355), "listen_port"),
@@ -383,6 +394,7 @@ class CaptureManager:
             "rtl_sample_rate",
             "center_frequency",
             "transition_bandwidth",
+            "nfm_deemphasis_tau",
         }
         ignored_fields = [
             field_name
@@ -408,6 +420,9 @@ class CaptureManager:
         )
         transition_changed = (
             next_config.transition_bandwidth != current_config.transition_bandwidth
+        )
+        nfm_deemphasis_changed = (
+            next_config.nfm_deemphasis_tau != current_config.nfm_deemphasis_tau
         )
 
         client_requests = self._snapshot_client_requests()
@@ -435,16 +450,18 @@ class CaptureManager:
             new_config=next_config,
             sessions=client_requests,
             rebuild_decimators=center_or_rate_changed or transition_changed,
+            rebuild_nfm_audio=nfm_deemphasis_changed,
         )
         self.config = next_config
         LOGGER.info(
-            "config reload applied: center_frequency=%s rtl_sample_rate=%s automatic_gain_control=%s rtl_gain=%s ppm_correction=%s transition_bandwidth=%s",
+            "config reload applied: center_frequency=%s rtl_sample_rate=%s automatic_gain_control=%s rtl_gain=%s ppm_correction=%s transition_bandwidth=%s nfm_deemphasis_tau=%s",
             next_config.center_frequency,
             next_config.rtl_sample_rate,
             next_config.automatic_gain_control,
             next_config.rtl_gain,
             next_config.ppm_correction,
             next_config.transition_bandwidth,
+            next_config.nfm_deemphasis_tau,
         )
         return True
 
@@ -971,6 +988,7 @@ class StreamGraph:
         new_config: ServerConfig,
         sessions: list["ClientSession"],
         rebuild_decimators: bool,
+        rebuild_nfm_audio: bool,
     ) -> None:
         old_decimation_streams: list[SharedStream] = []
         old_format_streams: list[Any] = []
@@ -993,6 +1011,17 @@ class StreamGraph:
                 self.decimation_streams = {}
                 self.format_streams = {}
                 self.audio_streams = {}
+            elif rebuild_nfm_audio:
+                old_audio_streams = [
+                    stream
+                    for key, stream in self.audio_streams.items()
+                    if key[1] == "nfm"
+                ]
+                self.audio_streams = {
+                    key: stream
+                    for key, stream in self.audio_streams.items()
+                    if key[1] != "nfm"
+                }
 
             for session in sessions:
                 session.config = new_config
@@ -1492,6 +1521,61 @@ def _build_audio_stream(
             raise
         return output_stream
 
+    if modulation == "nfm":
+        demod_stream = SharedStream(
+            config=config,
+            name=f"audio-{modulation}-{frequency}-fmdemod",
+            command=["csdr", "fmdemod"],
+            manager=manager,
+            parent=parent,
+            close_when_unused=True,
+        )
+        deemphasis_stream = SharedStream(
+            config=config,
+            name=f"audio-{modulation}-{frequency}-deemphasis",
+            command=[
+                "csdr",
+                "deemphasis",
+                "--wfm",
+                str(AM_AUDIO_OUTPUT_RATE),
+                f"{config.nfm_deemphasis_tau}e-6",
+            ],
+            manager=manager,
+            parent=demod_stream,
+            close_when_unused=True,
+        )
+        dcblock_stream = SharedStream(
+            config=config,
+            name=f"audio-{modulation}-{frequency}-dcblock",
+            command=["csdr", "dcblock"],
+            manager=manager,
+            parent=deemphasis_stream,
+            close_when_unused=True,
+        )
+        output_stream = SharedStream(
+            config=config,
+            name=f"audio-{modulation}-{frequency}",
+            command=["csdr", "convert", "-i", "float", "-o", "s16"],
+            manager=manager,
+            parent=dcblock_stream,
+            close_when_unused=True,
+            output_read_size=_compute_output_read_size("s16", AM_AUDIO_OUTPUT_RATE),
+        )
+        try:
+            demod_stream.start()
+            started_streams.append(demod_stream)
+            deemphasis_stream.start()
+            started_streams.append(deemphasis_stream)
+            dcblock_stream.start()
+            started_streams.append(dcblock_stream)
+            output_stream.start()
+            started_streams.append(output_stream)
+        except Exception:
+            for stream in reversed(started_streams):
+                stream.close("audio stream startup failed", propagate=False)
+            raise
+        return output_stream
+
     raise ValueError(f"unsupported audio modulation {modulation!r}")
 
 
@@ -1554,6 +1638,7 @@ def _validate_config(config: ServerConfig) -> None:
     _validate_rtl_gain(config.automatic_gain_control, config.rtl_gain)
     _validate_ppm_correction(config.ppm_correction)
     _validate_transition_bandwidth(config.transition_bandwidth)
+    _validate_nfm_deemphasis_tau(config.nfm_deemphasis_tau)
     _validate_listen_host(config.listen_host)
     _validate_listen_port(config.listen_port)
     _validate_read_chunk_size(config.read_chunk_size)
@@ -1609,6 +1694,11 @@ def _validate_ppm_correction(value: int) -> None:
 def _validate_transition_bandwidth(value: float) -> None:
     if not (0.005 <= value <= 0.05):
         raise ValueError("transition_bandwidth must be between 0.005 and 0.05")
+
+
+def _validate_nfm_deemphasis_tau(value: int) -> None:
+    if not (0 <= value <= 530):
+        raise ValueError("audio.nfm_deemphasis_tau must be between 0 and 530")
 
 
 def _validate_listen_host(value: str) -> None:
