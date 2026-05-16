@@ -60,6 +60,8 @@ def _request_shutdown(signum: int, _frame: object) -> None:
 def _install_signal_handlers() -> None:
     signal.signal(signal.SIGINT, _request_shutdown)
     signal.signal(signal.SIGTERM, _request_shutdown)
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
 
 def _handle_stdout_pipe_closed() -> int:
@@ -76,6 +78,19 @@ def _handle_stdout_pipe_closed() -> int:
     except OSError:
         pass
     return 0
+
+
+def _exit_after_stdout_pipe_closed() -> "NoReturn":
+    _handle_stdout_pipe_closed()
+    os._exit(0)
+
+
+def _write_stdout_unbuffered(data: bytes) -> None:
+    stdout_fd = sys.stdout.fileno()
+    view = memoryview(data)
+    while view:
+        written = os.write(stdout_fd, view)
+        view = view[written:]
 
 
 def parse_scaled_integer(value: str, label: str) -> int:
@@ -176,18 +191,17 @@ def main() -> int:
                 return int(handshake.get("code", EXIT_REQUEST_ERROR))
 
             sock.settimeout(None)
-            stdout = sys.stdout.buffer
             while True:
                 chunk = sock_file.read1(65_536)
                 if not chunk:
                     break
                 if _shutdown_requested:
                     return SHUTDOWN_SIGNAL_EXIT
-                stdout.write(chunk)
+                _write_stdout_unbuffered(chunk)
             if _shutdown_requested:
                 return SHUTDOWN_SIGNAL_EXIT
         except BrokenPipeError:
-            return _handle_stdout_pipe_closed()
+            _exit_after_stdout_pipe_closed()
         except json.JSONDecodeError as exc:
             print(f"error: invalid handshake from server: {exc}", file=sys.stderr)
             return EXIT_REQUEST_ERROR
@@ -211,4 +225,4 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except BrokenPipeError:
-        sys.exit(_handle_stdout_pipe_closed())
+        _exit_after_stdout_pipe_closed()
