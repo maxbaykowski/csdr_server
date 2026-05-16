@@ -50,7 +50,7 @@ PR_SET_NAME = 15
 DEFAULT_MODE = "iq"
 VALID_MODES = {DEFAULT_MODE, "audio"}
 DEFAULT_MODULATION = "am"
-VALID_AUDIO_MODULATIONS = {DEFAULT_MODULATION}
+VALID_AUDIO_MODULATIONS = {DEFAULT_MODULATION, "lsb", "usb"}
 DEFAULT_SAMPLE_FORMAT = "f32"
 VALID_SAMPLE_FORMATS = {DEFAULT_SAMPLE_FORMAT, "s16"}
 DEFAULT_STREAM_OUTPUT_READ_SIZE = 65_536
@@ -1369,6 +1369,8 @@ def _build_audio_stream(
     manager: "StreamGraph",
     parent: SharedStream,
 ) -> SharedStream:
+    started_streams: list[SharedStream] = []
+
     if modulation == "am":
         demod_stream = SharedStream(
             config=config,
@@ -1403,7 +1405,6 @@ def _build_audio_stream(
             close_when_unused=True,
             output_read_size=_compute_output_read_size("s16", AM_AUDIO_OUTPUT_RATE),
         )
-        started_streams: list[SharedStream] = []
         try:
             demod_stream.start()
             started_streams.append(demod_stream)
@@ -1418,6 +1419,79 @@ def _build_audio_stream(
                 stream.close("audio stream startup failed", propagate=False)
             raise
         return output_stream
+
+    if modulation in {"usb", "lsb"}:
+        if modulation == "usb":
+            bandpass_command = [
+                "csdr",
+                "bandpass",
+                "--fft",
+                "--low",
+                "0",
+                "--high",
+                "0.3",
+                "0.05",
+            ]
+        else:
+            bandpass_command = [
+                "csdr",
+                "bandpass",
+                "--fft",
+                "--low",
+                "0.3",
+                "--high",
+                "0",
+                "0.05",
+            ]
+
+        bandpass_stream = SharedStream(
+            config=config,
+            name=f"audio-{modulation}-{frequency}-bandpass",
+            command=bandpass_command,
+            manager=manager,
+            parent=parent,
+            close_when_unused=True,
+        )
+        realpart_stream = SharedStream(
+            config=config,
+            name=f"audio-{modulation}-{frequency}-realpart",
+            command=["csdr", "realpart"],
+            manager=manager,
+            parent=bandpass_stream,
+            close_when_unused=True,
+        )
+        agc_stream = SharedStream(
+            config=config,
+            name=f"audio-{modulation}-{frequency}-agc",
+            command=["csdr", "agc", "-r", str(AM_AUDIO_AGC_REFERENCE)],
+            manager=manager,
+            parent=realpart_stream,
+            close_when_unused=True,
+        )
+        output_stream = SharedStream(
+            config=config,
+            name=f"audio-{modulation}-{frequency}",
+            command=["csdr", "convert", "-i", "float", "-o", "s16"],
+            manager=manager,
+            parent=agc_stream,
+            close_when_unused=True,
+            output_read_size=_compute_output_read_size("s16", AM_AUDIO_OUTPUT_RATE),
+        )
+        try:
+            bandpass_stream.start()
+            started_streams.append(bandpass_stream)
+            realpart_stream.start()
+            started_streams.append(realpart_stream)
+            agc_stream.start()
+            started_streams.append(agc_stream)
+            output_stream.start()
+            started_streams.append(output_stream)
+        except Exception:
+            for stream in reversed(started_streams):
+                stream.close("audio stream startup failed", propagate=False)
+            raise
+        return output_stream
+
     raise ValueError(f"unsupported audio modulation {modulation!r}")
 
 

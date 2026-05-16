@@ -180,12 +180,14 @@ The server supports two IQ output formats:
 Audio mode is separate from IQ mode. Instead of returning IQ data, the server
 demodulates the signal and sends audio.
 
-The first supported audio mode is:
+Supported audio modes are:
 
 - `mode=audio`
 - `modulation=am`
+- `modulation=usb`
+- `modulation=lsb`
 
-AM audio currently uses a fixed internal pipeline:
+AM audio uses a fixed internal pipeline:
 
 - shift to the requested frequency
 - decimate to `16000` S/s
@@ -196,6 +198,26 @@ AM audio currently uses a fixed internal pipeline:
 - convert to `s16`
 
 So AM audio clients always receive 16 kHz signed 16-bit mono audio.
+
+USB audio uses the same 16 kHz / `s16` output, but demodulates with:
+
+- shift to the requested frequency
+- decimate to `16000` S/s
+- transition bandwidth `0.005`
+- `bandpass --fft --low 0 --high 0.3 0.05`
+- `realpart`
+- `agc -r 0.2`
+- convert to `s16`
+
+LSB audio uses the same fixed output, with the sideband filter reversed:
+
+- shift to the requested frequency
+- decimate to `16000` S/s
+- transition bandwidth `0.005`
+- `bandpass --fft --low 0.3 --high 0 0.05`
+- `realpart`
+- `agc -r 0.2`
+- convert to `s16`
 
 ## Operational Notes
 
@@ -279,7 +301,7 @@ Request fields:
   - defaults to `f32`
 - `modulation`
   - required in `audio` mode
-  - currently only `am`
+  - `am`, `usb`, or `lsb`
 
 IQ request example:
 
@@ -291,6 +313,10 @@ Audio request example:
 
 ```json
 {"frequency": 1000000, "mode": "audio", "modulation": "am"}
+```
+
+```json
+{"frequency": 7200000, "mode": "audio", "modulation": "usb"}
 ```
 
 ### Handshake
