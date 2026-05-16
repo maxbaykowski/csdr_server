@@ -16,6 +16,7 @@ The main goal is to be boring and reliable:
 - One RTL-SDR dongle can serve multiple clients at once.
 - Clients can tune anywhere inside the currently sampled RF window.
 - Clients can request decimated IQ at the sample rate they actually need.
+- Clients can also request demodulated audio instead of raw IQ.
 - Two output formats are supported:
   - `f32`
   - `s16`
@@ -74,6 +75,12 @@ Request signed 16-bit IQ instead:
 
 ```bash
 csdr_server_client -a 127.0.0.1 -p 7355 -f 162.475M -s 16K -F s16 > iq.s16
+```
+
+Request AM audio instead of IQ:
+
+```bash
+csdr_server_client -a 127.0.0.1 -p 7355 -f 1000K -m audio -M am > audio.s16
 ```
 
 `-f` and `-s` accept plain integers or `K`, `M`, and `G` suffixes.
@@ -168,6 +175,28 @@ The server supports two IQ output formats:
   - little-endian
   - layout: `I0, Q0, I1, Q1, ...`
 
+## Audio Mode
+
+Audio mode is separate from IQ mode. Instead of returning IQ data, the server
+demodulates the signal and sends audio.
+
+The first supported audio mode is:
+
+- `mode=audio`
+- `modulation=am`
+
+AM audio currently uses a fixed internal pipeline:
+
+- shift to the requested frequency
+- decimate to `16000` S/s
+- transition bandwidth `0.005`
+- `amdemod`
+- `dcblock`
+- `agc -r 0.2`
+- convert to `s16`
+
+So AM audio clients always receive 16 kHz signed 16-bit mono audio.
+
 ## Operational Notes
 
 ### Device Selection
@@ -235,22 +264,47 @@ Request fields:
 - `frequency`
   - required
   - integer Hz
+- `mode`
+  - optional
+  - `iq` or `audio`
+  - defaults to `iq`
 - `sample_rate`
-  - required unless `bandwidth` is used
+  - required in `iq` mode unless `bandwidth` is used
   - integer S/s
 - `bandwidth`
-  - optional alias for `sample_rate`
+  - optional alias for `sample_rate` in `iq` mode
 - `format`
-  - optional
+  - optional in `iq` mode
   - `f32` or `s16`
   - defaults to `f32`
+- `modulation`
+  - required in `audio` mode
+  - currently only `am`
+
+IQ request example:
+
+```json
+{"frequency": 162475000, "mode": "iq", "sample_rate": 16000, "format": "s16"}
+```
+
+Audio request example:
+
+```json
+{"frequency": 1000000, "mode": "audio", "modulation": "am"}
+```
 
 ### Handshake
 
-Success:
+IQ success:
 
 ```json
-{"status": "ok", "format": "s16"}
+{"status": "ok", "mode": "iq", "format": "s16"}
+```
+
+Audio success:
+
+```json
+{"status": "ok", "mode": "audio", "format": "s16", "modulation": "am", "sample_rate": 16000}
 ```
 
 Error:
@@ -265,6 +319,10 @@ Handshake fields:
   - `"ok"` or `"error"`
 - `format`
   - present on success
+- `modulation`
+  - present on audio success
+- `sample_rate`
+  - present on audio success
 - `code`
   - present on error
 - `error`
@@ -272,14 +330,17 @@ Handshake fields:
 
 ### Stream Payload
 
-After an `ok` handshake, the server sends raw IQ samples using the accepted
-format.
+After an `ok` handshake, the server sends either:
+
+- raw IQ samples for `iq` mode
+- demodulated audio samples for `audio` mode
 
 ### Request Rules
 
 - requested frequency must stay within the current sampled RF window
-- requested sample rate must be less than or equal to `rtl_sample_rate`
-- decimation must be an integer ratio
+- in `iq` mode, requested sample rate must be less than or equal to `rtl_sample_rate`
+- in `iq` mode, decimation must be an integer ratio
+- in `audio` mode, the server must be able to decimate cleanly to `16000` S/s
 
 Example:
 

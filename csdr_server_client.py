@@ -25,6 +25,10 @@ EXIT_REQUEST_ERROR = 3
 
 SHUTDOWN_SIGNAL_EXIT = 0
 PR_SET_NAME = 15
+DEFAULT_MODE = "iq"
+VALID_MODES = (DEFAULT_MODE, "audio")
+DEFAULT_MODULATION = "am"
+VALID_AUDIO_MODULATIONS = (DEFAULT_MODULATION,)
 DEFAULT_SAMPLE_FORMAT = "f32"
 VALID_SAMPLE_FORMATS = (DEFAULT_SAMPLE_FORMAT, "s16")
 
@@ -93,6 +97,20 @@ def _write_stdout_unbuffered(data: bytes) -> None:
         view = view[written:]
 
 
+def _option_was_provided(options: tuple[str, ...]) -> bool:
+    argv = sys.argv[1:]
+    for arg in argv:
+        if arg in options:
+            return True
+        for option in options:
+            if option.startswith("--") and arg.startswith(f"{option}="):
+                return True
+            if option.startswith("-") and not option.startswith("--") and arg.startswith(option):
+                if arg != option:
+                    return True
+    return False
+
+
 def parse_scaled_integer(value: str, label: str) -> int:
     text = value.strip().upper()
     match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([KMG]?)", text)
@@ -129,13 +147,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-a", "--address", required=True, help="Server IP address or hostname")
     parser.add_argument("-p", "--port", required=True, type=int, help="Server TCP port")
     parser.add_argument("-f", "--frequency", required=True, type=parse_frequency, help="Tuned frequency in Hz, or with K/M/G suffix")
-    parser.add_argument("-s", "--sample-rate", required=True, type=parse_sample_rate, help="Output sample rate in Sps, or with K/M/G suffix")
+    parser.add_argument(
+        "-m",
+        "--mode",
+        default=DEFAULT_MODE,
+        choices=VALID_MODES,
+        help="Request IQ or demodulated audio",
+    )
+    parser.add_argument(
+        "-s",
+        "--sample-rate",
+        type=parse_sample_rate,
+        help="Output sample rate in Sps, or with K/M/G suffix",
+    )
     parser.add_argument(
         "-F",
         "--format",
         default=DEFAULT_SAMPLE_FORMAT,
         choices=VALID_SAMPLE_FORMATS,
         help="Requested output IQ format",
+    )
+    parser.add_argument(
+        "-M",
+        "--modulation",
+        default=DEFAULT_MODULATION,
+        choices=VALID_AUDIO_MODULATIONS,
+        help="Audio modulation type",
     )
     return parser.parse_args()
 
@@ -148,9 +185,20 @@ def main() -> int:
     args = parse_args()
     request = {
         "frequency": args.frequency,
-        "sample_rate": args.sample_rate,
-        "format": args.format,
+        "mode": args.mode,
     }
+    if args.mode == "iq":
+        if args.sample_rate is None:
+            print("error: iq mode requires --sample-rate", file=sys.stderr)
+            return EXIT_REQUEST_ERROR
+        request["sample_rate"] = args.sample_rate
+        request["format"] = args.format
+    else:
+        if _option_was_provided(("-s", "--sample-rate")):
+            request["sample_rate"] = args.sample_rate
+        if _option_was_provided(("-F", "--format")):
+            request["format"] = args.format
+        request["modulation"] = args.modulation
 
     try:
         sock = socket.create_connection((args.address, args.port), timeout=30.0)
@@ -189,6 +237,8 @@ def main() -> int:
                 message = handshake.get("error", "server rejected request")
                 print(f"error: {message}", file=sys.stderr)
                 return int(handshake.get("code", EXIT_REQUEST_ERROR))
+            for warning in handshake.get("warnings", []):
+                print(f"warning: {warning}", file=sys.stderr)
 
             sock.settimeout(None)
             while True:

@@ -47,9 +47,17 @@ EXIT_REQUEST_ERROR = 3
 
 PR_SET_NAME = 15
 
+DEFAULT_MODE = "iq"
+VALID_MODES = {DEFAULT_MODE, "audio"}
+DEFAULT_MODULATION = "am"
+VALID_AUDIO_MODULATIONS = {DEFAULT_MODULATION}
 DEFAULT_SAMPLE_FORMAT = "f32"
 VALID_SAMPLE_FORMATS = {DEFAULT_SAMPLE_FORMAT, "s16"}
 DEFAULT_STREAM_OUTPUT_READ_SIZE = 65_536
+AM_AUDIO_OUTPUT_RATE = 16_000
+AM_AUDIO_TRANSITION_BANDWIDTH = 0.005
+AM_AUDIO_OUTPUT_FORMAT = "s16"
+AM_AUDIO_AGC_REFERENCE = 0.2
 
 
 @dataclass(frozen=True)
@@ -344,10 +352,18 @@ class CaptureManager:
     def get_output_stream(
         self,
         frequency: int,
-        output_rate: int,
-        sample_format: str,
+        mode: str,
+        output_rate: int | None,
+        sample_format: str | None,
+        modulation: str | None,
     ) -> "SharedStream":
-        return self.graph.get_output_stream(frequency, output_rate, sample_format)
+        return self.graph.get_output_stream(
+            frequency,
+            mode,
+            output_rate,
+            sample_format,
+            modulation,
+        )
 
     def register_client(self, client: "ClientSession") -> None:
         with self.clients_lock:
@@ -444,13 +460,13 @@ class CaptureManager:
         errors: list[str] = []
         for session in sessions:
             try:
-                _validate_request(config, session.frequency, session.output_rate)
-                _compute_decimation(config.rtl_sample_rate, session.output_rate)
+                _validate_session_request(config, session)
             except RequestValidationError as exc:
                 errors.append(
                     f"client {session.address[0]}:{session.address[1]} "
-                    f"freq={session.frequency} sample_rate={session.output_rate} "
-                    f"format={session.sample_format}: {exc.message}"
+                    f"mode={session.mode} freq={session.frequency} "
+                    f"sample_rate={session.output_rate} format={session.sample_format} "
+                    f"modulation={session.modulation}: {exc.message}"
                 )
         return errors
 
@@ -898,19 +914,24 @@ class StreamGraph:
         self.lock = threading.Lock()
         self.root_stream: SharedStream | None = None
         self.shift_streams: dict[int, SharedStream] = {}
-        self.decimation_streams: dict[tuple[int, int], SharedStream] = {}
+        self.decimation_streams: dict[tuple[int, int, float], SharedStream] = {}
         self.format_streams: dict[tuple[int, int, str], Any] = {}
+        self.audio_streams: dict[tuple[int, str], SharedStream] = {}
 
     def stop(self, reason: str) -> None:
         with self.lock:
             root = self.root_stream
+            audio = list(self.audio_streams.values())
             formats = list(self.format_streams.values())
             shifts = list(self.shift_streams.values())
             decimations = list(self.decimation_streams.values())
             self.root_stream = None
+            self.audio_streams = {}
             self.format_streams = {}
             self.shift_streams = {}
             self.decimation_streams = {}
+        for stream in audio:
+            stream.close(reason, propagate=True)
         for stream in formats:
             stream.close(reason, propagate=True)
         for stream in decimations:
@@ -931,11 +952,19 @@ class StreamGraph:
     def get_output_stream(
         self,
         frequency: int,
-        output_rate: int,
-        sample_format: str,
+        mode: str,
+        output_rate: int | None,
+        sample_format: str | None,
+        modulation: str | None,
     ) -> SharedStream:
         with self.lock:
-            return self._get_output_stream_locked(frequency, output_rate, sample_format)
+            return self._get_output_stream_locked(
+                frequency,
+                mode,
+                output_rate,
+                sample_format,
+                modulation,
+            )
 
     def apply_runtime_config(
         self,
@@ -945,6 +974,7 @@ class StreamGraph:
     ) -> None:
         old_decimation_streams: list[SharedStream] = []
         old_format_streams: list[Any] = []
+        old_audio_streams: list[SharedStream] = []
         stream_switches: list[tuple[ClientSession, SharedStream]] = []
         with self.lock:
             self.config = new_config
@@ -959,8 +989,10 @@ class StreamGraph:
             if rebuild_decimators:
                 old_decimation_streams = list(self.decimation_streams.values())
                 old_format_streams = list(self.format_streams.values())
+                old_audio_streams = list(self.audio_streams.values())
                 self.decimation_streams = {}
                 self.format_streams = {}
+                self.audio_streams = {}
 
             for session in sessions:
                 session.config = new_config
@@ -969,8 +1001,10 @@ class StreamGraph:
                         session,
                         self._get_output_stream_locked(
                             session.frequency,
+                            session.mode,
                             session.output_rate,
                             session.sample_format,
+                            session.modulation,
                         ),
                     )
                 )
@@ -978,6 +1012,8 @@ class StreamGraph:
         for session, desired_stream in stream_switches:
             session.switch_source_stream(desired_stream)
 
+        for stream in old_audio_streams:
+            stream.close("reconfigured audio stream", propagate=False)
         for stream in old_format_streams:
             stream.close("reconfigured output format", propagate=False)
         for stream in old_decimation_streams:
@@ -986,12 +1022,13 @@ class StreamGraph:
     def _get_output_stream_locked(
         self,
         frequency: int,
-        output_rate: int,
-        sample_format: str,
+        mode: str,
+        output_rate: int | None,
+        sample_format: str | None,
+        modulation: str | None,
     ) -> SharedStream:
-        decimation = _compute_decimation(self.config.rtl_sample_rate, output_rate)
-        _validate_request(self.config, frequency, output_rate)
-        _validate_sample_format(sample_format)
+        _validate_mode(mode)
+        _validate_request_frequency(self.config, frequency)
 
         root = self.root_stream
         if root is None:
@@ -1028,55 +1065,102 @@ class StreamGraph:
         else:
             shift_stream.config = self.config
 
-        base_stream = shift_stream
+        if mode == "iq":
+            assert output_rate is not None
+            assert sample_format is not None
+            _validate_sample_format(sample_format)
+            decimation = _compute_decimation(self.config.rtl_sample_rate, output_rate)
+            base_stream = self._get_decimation_stream_locked(
+                frequency,
+                output_rate,
+                self.config.transition_bandwidth,
+                shift_stream,
+                decimation,
+            )
+            if sample_format == DEFAULT_SAMPLE_FORMAT:
+                return base_stream
 
-        if decimation != 1:
-            key = (frequency, output_rate)
-            decimation_stream = self.decimation_streams.get(key)
-            if decimation_stream is None:
-                decimation_stream = SharedStream(
+            format_key = (frequency, output_rate, sample_format)
+            format_stream = self.format_streams.get(format_key)
+            if format_stream is None:
+                format_stream = _build_output_format_stream(
                     config=self.config,
-                    name=f"firdecimate-{frequency}-{output_rate}",
-                    command=[
-                        "csdr",
-                        "firdecimate",
-                        str(decimation),
-                        str(self.config.transition_bandwidth),
-                    ],
+                    frequency=frequency,
+                    output_rate=output_rate,
+                    sample_format=sample_format,
                     manager=self,
-                    parent=shift_stream,
-                    close_when_unused=True,
+                    parent=base_stream,
                 )
-                decimation_stream.start()
-                self.decimation_streams[key] = decimation_stream
+                format_stream.start()
+                self.format_streams[format_key] = format_stream
             else:
-                decimation_stream.config = self.config
-            base_stream = decimation_stream
+                format_stream.config = self.config
+            return format_stream
 
-        if sample_format == DEFAULT_SAMPLE_FORMAT:
-            return base_stream
-
-        format_key = (frequency, output_rate, sample_format)
-        format_stream = self.format_streams.get(format_key)
-        if format_stream is None:
-            format_stream = _build_output_format_stream(
+        assert modulation is not None
+        _validate_audio_modulation(modulation)
+        decimation = _compute_decimation(self.config.rtl_sample_rate, AM_AUDIO_OUTPUT_RATE)
+        base_stream = self._get_decimation_stream_locked(
+            frequency,
+            AM_AUDIO_OUTPUT_RATE,
+            AM_AUDIO_TRANSITION_BANDWIDTH,
+            shift_stream,
+            decimation,
+        )
+        audio_key = (frequency, modulation)
+        audio_stream = self.audio_streams.get(audio_key)
+        if audio_stream is None:
+            audio_stream = _build_audio_stream(
                 config=self.config,
                 frequency=frequency,
-                output_rate=output_rate,
-                sample_format=sample_format,
+                modulation=modulation,
                 manager=self,
                 parent=base_stream,
             )
-            format_stream.start()
-            self.format_streams[format_key] = format_stream
+            self.audio_streams[audio_key] = audio_stream
         else:
-            format_stream.config = self.config
-        return format_stream
+            audio_stream.config = self.config
+        return audio_stream
+
+    def _get_decimation_stream_locked(
+        self,
+        frequency: int,
+        output_rate: int,
+        transition_bandwidth: float,
+        parent: SharedStream,
+        decimation: int,
+    ) -> SharedStream:
+        if decimation == 1:
+            return parent
+        key = (frequency, output_rate, transition_bandwidth)
+        decimation_stream = self.decimation_streams.get(key)
+        if decimation_stream is None:
+            decimation_stream = SharedStream(
+                config=self.config,
+                name=f"firdecimate-{frequency}-{output_rate}-{transition_bandwidth}",
+                command=[
+                    "csdr",
+                    "firdecimate",
+                    str(decimation),
+                    str(transition_bandwidth),
+                ],
+                manager=self,
+                parent=parent,
+                close_when_unused=True,
+            )
+            decimation_stream.start()
+            self.decimation_streams[key] = decimation_stream
+        else:
+            decimation_stream.config = self.config
+        return decimation_stream
 
     def on_stream_closed(self, stream: SharedStream) -> None:
         with self.lock:
             if self.root_stream is stream:
                 self.root_stream = None
+            for key, candidate in list(self.audio_streams.items()):
+                if candidate is stream:
+                    del self.audio_streams[key]
             for key, candidate in list(self.format_streams.items()):
                 if candidate is stream:
                     del self.format_streams[key]
@@ -1097,8 +1181,10 @@ class ClientSession:
         config: ServerConfig,
         source_stream: SharedStream,
         frequency: int,
+        mode: str,
         output_rate: int,
-        sample_format: str,
+        sample_format: str | None,
+        modulation: str | None,
     ) -> None:
         self.conn = conn
         self.address = address
@@ -1106,8 +1192,10 @@ class ClientSession:
         self.config = config
         self.source_stream = source_stream
         self.frequency = frequency
+        self.mode = mode
         self.output_rate = output_rate
         self.sample_format = sample_format
+        self.modulation = modulation
         self.chunk_queue: queue.Queue[bytes | None] = queue.Queue(
             maxsize=config.client_queue_chunks
         )
@@ -1125,12 +1213,14 @@ class ClientSession:
         )
         self.output_thread.start()
         LOGGER.info(
-            "client %s:%s started freq=%s sample_rate=%s format=%s",
+            "client %s:%s started mode=%s freq=%s sample_rate=%s format=%s modulation=%s",
             self.address[0],
             self.address[1],
+            self.mode,
             self.frequency,
             self.output_rate,
             self.sample_format,
+            self.modulation,
         )
 
     def enqueue(self, chunk: bytes) -> None:
@@ -1217,12 +1307,37 @@ def _normalize_sample_format(value: Any) -> str:
     return str(value).strip().lower()
 
 
+def _normalize_mode(value: Any) -> str:
+    return str(value).strip().lower()
+
+
+def _normalize_audio_modulation(value: Any) -> str:
+    return str(value).strip().lower()
+
+
+def _validate_mode(mode: str) -> None:
+    if mode not in VALID_MODES:
+        raise RequestValidationError(
+            EXIT_REQUEST_ERROR,
+            f"unsupported mode {mode!r}; expected one of {', '.join(sorted(VALID_MODES))}",
+        )
+
+
 def _validate_sample_format(sample_format: str) -> None:
     if sample_format not in VALID_SAMPLE_FORMATS:
         raise RequestValidationError(
             EXIT_REQUEST_ERROR,
             f"unsupported sample format {sample_format!r}; expected one of "
             f"{', '.join(sorted(VALID_SAMPLE_FORMATS))}",
+        )
+
+
+def _validate_audio_modulation(modulation: str) -> None:
+    if modulation not in VALID_AUDIO_MODULATIONS:
+        raise RequestValidationError(
+            EXIT_REQUEST_ERROR,
+            "unsupported audio modulation "
+            f"{modulation!r}; expected one of {', '.join(sorted(VALID_AUDIO_MODULATIONS))}",
         )
 
 
@@ -1247,6 +1362,65 @@ def _build_output_format_stream(
     raise ValueError(f"unsupported sample format {sample_format!r}")
 
 
+def _build_audio_stream(
+    config: ServerConfig,
+    frequency: int,
+    modulation: str,
+    manager: "StreamGraph",
+    parent: SharedStream,
+) -> SharedStream:
+    if modulation == "am":
+        demod_stream = SharedStream(
+            config=config,
+            name=f"audio-{modulation}-{frequency}-amdemod",
+            command=["csdr", "amdemod"],
+            manager=manager,
+            parent=parent,
+            close_when_unused=True,
+        )
+        dcblock_stream = SharedStream(
+            config=config,
+            name=f"audio-{modulation}-{frequency}-dcblock",
+            command=["csdr", "dcblock"],
+            manager=manager,
+            parent=demod_stream,
+            close_when_unused=True,
+        )
+        agc_stream = SharedStream(
+            config=config,
+            name=f"audio-{modulation}-{frequency}-agc",
+            command=["csdr", "agc", "-r", str(AM_AUDIO_AGC_REFERENCE)],
+            manager=manager,
+            parent=dcblock_stream,
+            close_when_unused=True,
+        )
+        output_stream = SharedStream(
+            config=config,
+            name=f"audio-{modulation}-{frequency}",
+            command=["csdr", "convert", "-i", "float", "-o", "s16"],
+            manager=manager,
+            parent=agc_stream,
+            close_when_unused=True,
+            output_read_size=_compute_output_read_size("s16", AM_AUDIO_OUTPUT_RATE),
+        )
+        started_streams: list[SharedStream] = []
+        try:
+            demod_stream.start()
+            started_streams.append(demod_stream)
+            dcblock_stream.start()
+            started_streams.append(dcblock_stream)
+            agc_stream.start()
+            started_streams.append(agc_stream)
+            output_stream.start()
+            started_streams.append(output_stream)
+        except Exception:
+            for stream in reversed(started_streams):
+                stream.close("audio stream startup failed", propagate=False)
+            raise
+        return output_stream
+    raise ValueError(f"unsupported audio modulation {modulation!r}")
+
+
 def _compute_output_read_size(sample_format: str, output_rate: int) -> int:
     bytes_per_complex_sample = {
         "f32": 8,
@@ -1257,13 +1431,39 @@ def _compute_output_read_size(sample_format: str, output_rate: int) -> int:
     return max(4096, min(DEFAULT_STREAM_OUTPUT_READ_SIZE, size))
 
 
-def _validate_request(config: ServerConfig, frequency: int, output_rate: int) -> None:
+def _validate_request_frequency(config: ServerConfig, frequency: int) -> None:
     shift_rate = (config.center_frequency - frequency) / config.rtl_sample_rate
     if shift_rate < -0.5 or shift_rate > 0.5:
         raise RequestValidationError(
             EXIT_OUT_OF_BAND,
             "requested frequency is out of band for the current RTL capture window",
         )
+
+
+def _validate_session_request(config: ServerConfig, session: "ClientSession") -> None:
+    _validate_request_frequency(config, session.frequency)
+    if session.mode == "iq":
+        if session.output_rate is None or session.sample_format is None:
+            raise RequestValidationError(
+                EXIT_REQUEST_ERROR,
+                "iq session is missing output sample rate or format",
+            )
+        _validate_sample_format(session.sample_format)
+        _compute_decimation(config.rtl_sample_rate, session.output_rate)
+        return
+    if session.mode == "audio":
+        if session.modulation is None:
+            raise RequestValidationError(
+                EXIT_REQUEST_ERROR,
+                "audio session is missing modulation",
+            )
+        _validate_audio_modulation(session.modulation)
+        _compute_decimation(config.rtl_sample_rate, AM_AUDIO_OUTPUT_RATE)
+        return
+    raise RequestValidationError(
+        EXIT_REQUEST_ERROR,
+        f"unsupported session mode {session.mode!r}",
+    )
 
 
 def load_config(path: Path) -> ServerConfig:
@@ -1396,15 +1596,36 @@ def parse_client_request(conn: socket.socket) -> dict[str, Any]:
         request = json.loads(line.decode("utf-8"))
     except json.JSONDecodeError as exc:
         raise RequestValidationError(EXIT_REQUEST_ERROR, f"invalid request json: {exc}") from exc
+    warnings: list[str] = []
     if "frequency" not in request:
         raise RequestValidationError(EXIT_REQUEST_ERROR, "request must include frequency")
-    if "sample_rate" not in request and "bandwidth" not in request:
-        raise RequestValidationError(
-            EXIT_REQUEST_ERROR,
-            "request must include sample_rate or bandwidth",
+    request["mode"] = _normalize_mode(request.get("mode", DEFAULT_MODE))
+    _validate_mode(request["mode"])
+    if request["mode"] == "iq":
+        if "sample_rate" not in request and "bandwidth" not in request:
+            raise RequestValidationError(
+                EXIT_REQUEST_ERROR,
+                "iq mode request must include sample_rate or bandwidth",
+            )
+        request["format"] = _normalize_sample_format(
+            request.get("format", DEFAULT_SAMPLE_FORMAT)
         )
-    request["format"] = _normalize_sample_format(request.get("format", DEFAULT_SAMPLE_FORMAT))
-    _validate_sample_format(request["format"])
+        _validate_sample_format(request["format"])
+        request["modulation"] = None
+    else:
+        if "modulation" not in request:
+            raise RequestValidationError(
+                EXIT_REQUEST_ERROR,
+                "audio mode request must include modulation",
+            )
+        if "sample_rate" in request or "bandwidth" in request:
+            warnings.append("sample rate is fixed in audio mode and will be ignored")
+        if "format" in request:
+            warnings.append("format is fixed to s16 in audio mode and will be ignored")
+        request["modulation"] = _normalize_audio_modulation(request["modulation"])
+        _validate_audio_modulation(request["modulation"])
+        request["format"] = None
+    request["warnings"] = warnings
     conn.settimeout(None)
     return request
 
@@ -1461,12 +1682,19 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                 try:
                     request = parse_client_request(conn)
                     frequency = int(request["frequency"])
-                    output_rate = int(request.get("sample_rate", request.get("bandwidth")))
+                    mode = request["mode"]
+                    output_rate = None
+                    if mode == "iq":
+                        output_rate = int(request.get("sample_rate", request.get("bandwidth")))
                     sample_format = request["format"]
+                    modulation = request["modulation"]
+                    request_warnings = request["warnings"]
                     source_stream = capture.get_output_stream(
                         frequency,
+                        mode,
                         output_rate,
                         sample_format,
+                        modulation,
                     )
                     session = ClientSession(
                         conn=conn,
@@ -1475,12 +1703,30 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                         config=capture.config,
                         source_stream=source_stream,
                         frequency=frequency,
+                        mode=mode,
                         output_rate=output_rate,
                         sample_format=sample_format,
+                        modulation=modulation,
                     )
                     capture.register_client(session)
                     session.start()
-                    send_handshake(conn, {"status": "ok", "format": sample_format})
+                    handshake = {"status": "ok", "mode": mode}
+                    if mode == "iq":
+                        handshake["format"] = sample_format
+                    else:
+                        handshake["format"] = AM_AUDIO_OUTPUT_FORMAT
+                        handshake["modulation"] = modulation
+                        handshake["sample_rate"] = AM_AUDIO_OUTPUT_RATE
+                    if request_warnings:
+                        handshake["warnings"] = request_warnings
+                        for warning in request_warnings:
+                            LOGGER.warning(
+                                "client %s:%s: %s",
+                                address[0],
+                                address[1],
+                                warning,
+                            )
+                    send_handshake(conn, handshake)
                     session.activate()
                 except RequestValidationError as exc:
                     LOGGER.warning(
