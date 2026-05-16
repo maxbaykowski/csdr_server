@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
+import os
 import re
 import signal
 import socket
@@ -59,6 +60,22 @@ def _request_shutdown(signum: int, _frame: object) -> None:
 def _install_signal_handlers() -> None:
     signal.signal(signal.SIGINT, _request_shutdown)
     signal.signal(signal.SIGTERM, _request_shutdown)
+
+
+def _handle_stdout_pipe_closed() -> int:
+    global _shutdown_requested
+    _shutdown_requested = True
+    if _active_socket is not None:
+        try:
+            _active_socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    try:
+        devnull = open("/dev/null", "wb")
+        os.dup2(devnull.fileno(), sys.stdout.fileno())
+    except OSError:
+        pass
+    return 0
 
 
 def parse_scaled_integer(value: str, label: str) -> int:
@@ -170,7 +187,7 @@ def main() -> int:
             if _shutdown_requested:
                 return SHUTDOWN_SIGNAL_EXIT
         except BrokenPipeError:
-            return SHUTDOWN_SIGNAL_EXIT if _shutdown_requested else EXIT_REQUEST_ERROR
+            return _handle_stdout_pipe_closed()
         except json.JSONDecodeError as exc:
             print(f"error: invalid handshake from server: {exc}", file=sys.stderr)
             return EXIT_REQUEST_ERROR
@@ -191,4 +208,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.exit(_handle_stdout_pipe_closed())
