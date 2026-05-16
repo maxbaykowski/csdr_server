@@ -3,7 +3,7 @@
 Minimal client for csdr_server.py.
 
 The client sends one JSON request to the server, then writes the returned raw
-complex float32 IQ stream to stdout.
+IQ stream to stdout.
 """
 
 from __future__ import annotations
@@ -24,6 +24,8 @@ EXIT_REQUEST_ERROR = 3
 
 SHUTDOWN_SIGNAL_EXIT = 0
 PR_SET_NAME = 15
+DEFAULT_SAMPLE_FORMAT = "f32"
+VALID_SAMPLE_FORMATS = (DEFAULT_SAMPLE_FORMAT, "s16")
 
 
 SUFFIXES = {
@@ -96,6 +98,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-p", "--port", required=True, type=int, help="Server TCP port")
     parser.add_argument("-f", "--frequency", required=True, type=parse_frequency, help="Tuned frequency in Hz, or with K/M/G suffix")
     parser.add_argument("-s", "--sample-rate", required=True, type=parse_sample_rate, help="Output sample rate in Sps, or with K/M/G suffix")
+    parser.add_argument(
+        "-F",
+        "--format",
+        default=DEFAULT_SAMPLE_FORMAT,
+        choices=VALID_SAMPLE_FORMATS,
+        help="Requested output IQ format",
+    )
     return parser.parse_args()
 
 
@@ -108,6 +117,7 @@ def main() -> int:
     request = {
         "frequency": args.frequency,
         "sample_rate": args.sample_rate,
+        "format": args.format,
     }
 
     try:

@@ -4,8 +4,8 @@ Minimal RTL-SDR + CSDR network server.
 
 The server runs a single wideband RTL-SDR capture path and fans the raw IQ
 stream out to per-client CSDR pipelines. Each client sends one JSON line with a
-target frequency and output sample rate, then receives a raw complex float32 IQ
-stream.
+target frequency, output sample rate, and optional output format, then receives
+raw IQ data in the requested format.
 """
 
 from __future__ import annotations
@@ -47,6 +47,10 @@ EXIT_REQUEST_ERROR = 3
 
 PR_SET_NAME = 15
 
+DEFAULT_SAMPLE_FORMAT = "f32"
+VALID_SAMPLE_FORMATS = {DEFAULT_SAMPLE_FORMAT, "s16"}
+DEFAULT_STREAM_OUTPUT_READ_SIZE = 65_536
+
 
 @dataclass(frozen=True)
 class ServerConfig:
@@ -54,7 +58,9 @@ class ServerConfig:
     rtl_serial: str | None = None
     center_frequency: int = 100_000_000
     rtl_sample_rate: int = 2_400_000
+    automatic_gain_control: bool = False
     rtl_gain: float | None = None
+    ppm_correction: int = 0
     transition_bandwidth: float = 0.05
     listen_host: str = "0.0.0.0"
     listen_port: int = 7355
@@ -68,19 +74,42 @@ class ServerConfig:
     def from_dict(cls, raw: dict[str, Any]) -> "ServerConfig":
         data = dict(raw)
         config = cls(
-            rtl_device_index=int(data.get("rtl_device_index", 0)),
+            rtl_device_index=_parse_int(data.get("rtl_device_index", 0), "rtl_device_index"),
             rtl_serial=_optional_string(data.get("rtl_serial")),
-            center_frequency=int(data["center_frequency"]),
-            rtl_sample_rate=int(data["rtl_sample_rate"]),
+            center_frequency=_parse_int(data["center_frequency"], "center_frequency"),
+            rtl_sample_rate=_parse_int(data["rtl_sample_rate"], "rtl_sample_rate"),
+            automatic_gain_control=_parse_bool(
+                data.get("automatic_gain_control", False),
+                "automatic_gain_control",
+            ),
             rtl_gain=_optional_float(data.get("rtl_gain")),
-            transition_bandwidth=float(data["transition_bandwidth"]),
-            listen_host=str(data.get("listen_host", "0.0.0.0")),
-            listen_port=int(data.get("listen_port", 7355)),
-            read_chunk_size=int(data.get("read_chunk_size", 262_144)),
-            rtl_read_timeout_seconds=float(data.get("rtl_read_timeout_seconds", 2.0)),
-            stream_queue_chunks=int(data.get("stream_queue_chunks", 64)),
-            client_queue_chunks=int(data.get("client_queue_chunks", 64)),
-            enqueue_timeout_seconds=float(data.get("enqueue_timeout_seconds", 0.25)),
+            ppm_correction=_parse_int(data.get("ppm_correction", 0), "ppm_correction"),
+            transition_bandwidth=_parse_float(
+                data["transition_bandwidth"],
+                "transition_bandwidth",
+            ),
+            listen_host=_parse_string(data.get("listen_host", "0.0.0.0"), "listen_host"),
+            listen_port=_parse_int(data.get("listen_port", 7355), "listen_port"),
+            read_chunk_size=_parse_int(
+                data.get("read_chunk_size", 262_144),
+                "read_chunk_size",
+            ),
+            rtl_read_timeout_seconds=_parse_float(
+                data.get("rtl_read_timeout_seconds", 2.0),
+                "rtl_read_timeout_seconds",
+            ),
+            stream_queue_chunks=_parse_int(
+                data.get("stream_queue_chunks", 64),
+                "stream_queue_chunks",
+            ),
+            client_queue_chunks=_parse_int(
+                data.get("client_queue_chunks", 64),
+                "client_queue_chunks",
+            ),
+            enqueue_timeout_seconds=_parse_float(
+                data.get("enqueue_timeout_seconds", 0.25),
+                "enqueue_timeout_seconds",
+            ),
         )
         _validate_config(config)
         return config
@@ -134,7 +163,39 @@ def _optional_string(value: Any) -> str | None:
 def _optional_float(value: Any) -> float | None:
     if value in (None, "", "null", "auto"):
         return None
-    return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid rtl_gain: {value!r}") from exc
+
+
+def _parse_int(value: Any, name: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid {name}: {value!r}") from exc
+
+
+def _parse_float(value: Any, name: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid {name}: {value!r}") from exc
+
+
+def _parse_string(value: Any, name: str) -> str:
+    if value is None:
+        raise ValueError(f"{name} must not be null")
+    text = str(value)
+    if not text:
+        raise ValueError(f"{name} must not be empty")
+    return text
+
+
+def _parse_bool(value: Any, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"{name} must be true or false")
 
 
 def _read_sysfs_text(path: Path) -> str | None:
@@ -280,8 +341,13 @@ class CaptureManager:
                 )
             self.stop_event.wait(0.5)
 
-    def get_output_stream(self, frequency: int, output_rate: int) -> "SharedStream":
-        return self.graph.get_output_stream(frequency, output_rate)
+    def get_output_stream(
+        self,
+        frequency: int,
+        output_rate: int,
+        sample_format: str,
+    ) -> "SharedStream":
+        return self.graph.get_output_stream(frequency, output_rate, sample_format)
 
     def register_client(self, client: "ClientSession") -> None:
         with self.clients_lock:
@@ -295,7 +361,9 @@ class CaptureManager:
         loaded_config = load_config(path)
         current_config = self.config
         reloadable_fields = {
+            "automatic_gain_control",
             "rtl_gain",
+            "ppm_correction",
             "rtl_sample_rate",
             "center_frequency",
             "transition_bandwidth",
@@ -354,10 +422,12 @@ class CaptureManager:
         )
         self.config = next_config
         LOGGER.info(
-            "config reload applied: center_frequency=%s rtl_sample_rate=%s rtl_gain=%s transition_bandwidth=%s",
+            "config reload applied: center_frequency=%s rtl_sample_rate=%s automatic_gain_control=%s rtl_gain=%s ppm_correction=%s transition_bandwidth=%s",
             next_config.center_frequency,
             next_config.rtl_sample_rate,
+            next_config.automatic_gain_control,
             next_config.rtl_gain,
+            next_config.ppm_correction,
             next_config.transition_bandwidth,
         )
         return True
@@ -379,7 +449,8 @@ class CaptureManager:
             except RequestValidationError as exc:
                 errors.append(
                     f"client {session.address[0]}:{session.address[1]} "
-                    f"freq={session.frequency} sample_rate={session.output_rate}: {exc.message}"
+                    f"freq={session.frequency} sample_rate={session.output_rate} "
+                    f"format={session.sample_format}: {exc.message}"
                 )
         return errors
 
@@ -392,8 +463,17 @@ class CaptureManager:
             sdr = self.sdr
             if sdr is None:
                 return
-            if next_config.rtl_gain != current_config.rtl_gain:
-                sdr.gain = "auto" if next_config.rtl_gain is None else next_config.rtl_gain
+            gain_mode_changed = (
+                next_config.automatic_gain_control != current_config.automatic_gain_control
+            )
+            gain_value_changed = next_config.rtl_gain != current_config.rtl_gain
+            if gain_mode_changed or gain_value_changed:
+                if next_config.automatic_gain_control:
+                    sdr.gain = "auto"
+                else:
+                    sdr.gain = next_config.rtl_gain
+            if next_config.ppm_correction != current_config.ppm_correction:
+                sdr.freq_correction = next_config.ppm_correction
             if next_config.center_frequency != current_config.center_frequency:
                 sdr.center_freq = next_config.center_frequency
             if next_config.rtl_sample_rate != current_config.rtl_sample_rate:
@@ -422,7 +502,9 @@ class CaptureManager:
             raise
         sdr.sample_rate = self.config.rtl_sample_rate
         sdr.center_freq = self.config.center_frequency
-        sdr.gain = "auto" if self.config.rtl_gain is None else self.config.rtl_gain
+        if self.config.ppm_correction != 0:
+            sdr.freq_correction = self.config.ppm_correction
+        sdr.gain = "auto" if self.config.automatic_gain_control else self.config.rtl_gain
         result = rtlsdr_lib.rtlsdr_reset_buffer(sdr.dev_p)
         if result < 0:
             sdr.close()
@@ -611,6 +693,7 @@ class SharedStream:
         close_when_unused: bool = True,
         control_fifo_value: str | None = None,
         control_fifo_path: Path | None = None,
+        output_read_size: int = DEFAULT_STREAM_OUTPUT_READ_SIZE,
     ) -> None:
         self.config = config
         self.name = name
@@ -620,6 +703,7 @@ class SharedStream:
         self.close_when_unused = close_when_unused
         self.control_fifo_value = control_fifo_value
         self.control_fifo_path = control_fifo_path
+        self.output_read_size = output_read_size
         self.process: subprocess.Popen[bytes] | None = None
         self.input_queue: queue.Queue[bytes | None] = queue.Queue(
             maxsize=config.stream_queue_chunks
@@ -743,7 +827,7 @@ class SharedStream:
             assert self.process is not None
             assert self.process.stdout is not None
             while not self.closed.is_set():
-                data = self.process.stdout.read(65_536)
+                data = self.process.stdout.read(self.output_read_size)
                 if not data:
                     break
                 with self.subscribers_lock:
@@ -815,15 +899,20 @@ class StreamGraph:
         self.root_stream: SharedStream | None = None
         self.shift_streams: dict[int, SharedStream] = {}
         self.decimation_streams: dict[tuple[int, int], SharedStream] = {}
+        self.format_streams: dict[tuple[int, int, str], Any] = {}
 
     def stop(self, reason: str) -> None:
         with self.lock:
             root = self.root_stream
+            formats = list(self.format_streams.values())
             shifts = list(self.shift_streams.values())
             decimations = list(self.decimation_streams.values())
             self.root_stream = None
+            self.format_streams = {}
             self.shift_streams = {}
             self.decimation_streams = {}
+        for stream in formats:
+            stream.close(reason, propagate=True)
         for stream in decimations:
             stream.close(reason, propagate=True)
         for stream in shifts:
@@ -839,9 +928,14 @@ class StreamGraph:
         if not root.enqueue(chunk):
             self.stop("root convert stream failed")
 
-    def get_output_stream(self, frequency: int, output_rate: int) -> SharedStream:
+    def get_output_stream(
+        self,
+        frequency: int,
+        output_rate: int,
+        sample_format: str,
+    ) -> SharedStream:
         with self.lock:
-            return self._get_output_stream_locked(frequency, output_rate)
+            return self._get_output_stream_locked(frequency, output_rate, sample_format)
 
     def apply_runtime_config(
         self,
@@ -850,6 +944,7 @@ class StreamGraph:
         rebuild_decimators: bool,
     ) -> None:
         old_decimation_streams: list[SharedStream] = []
+        old_format_streams: list[Any] = []
         stream_switches: list[tuple[ClientSession, SharedStream]] = []
         with self.lock:
             self.config = new_config
@@ -863,7 +958,9 @@ class StreamGraph:
 
             if rebuild_decimators:
                 old_decimation_streams = list(self.decimation_streams.values())
+                old_format_streams = list(self.format_streams.values())
                 self.decimation_streams = {}
+                self.format_streams = {}
 
             for session in sessions:
                 session.config = new_config
@@ -873,6 +970,7 @@ class StreamGraph:
                         self._get_output_stream_locked(
                             session.frequency,
                             session.output_rate,
+                            session.sample_format,
                         ),
                     )
                 )
@@ -880,12 +978,20 @@ class StreamGraph:
         for session, desired_stream in stream_switches:
             session.switch_source_stream(desired_stream)
 
+        for stream in old_format_streams:
+            stream.close("reconfigured output format", propagate=False)
         for stream in old_decimation_streams:
             stream.close("reconfigured decimator", propagate=False)
 
-    def _get_output_stream_locked(self, frequency: int, output_rate: int) -> SharedStream:
+    def _get_output_stream_locked(
+        self,
+        frequency: int,
+        output_rate: int,
+        sample_format: str,
+    ) -> SharedStream:
         decimation = _compute_decimation(self.config.rtl_sample_rate, output_rate)
         _validate_request(self.config, frequency, output_rate)
+        _validate_sample_format(sample_format)
 
         root = self.root_stream
         if root is None:
@@ -922,35 +1028,58 @@ class StreamGraph:
         else:
             shift_stream.config = self.config
 
-        if decimation == 1:
-            return shift_stream
+        base_stream = shift_stream
 
-        key = (frequency, output_rate)
-        decimation_stream = self.decimation_streams.get(key)
-        if decimation_stream is None:
-            decimation_stream = SharedStream(
+        if decimation != 1:
+            key = (frequency, output_rate)
+            decimation_stream = self.decimation_streams.get(key)
+            if decimation_stream is None:
+                decimation_stream = SharedStream(
+                    config=self.config,
+                    name=f"firdecimate-{frequency}-{output_rate}",
+                    command=[
+                        "csdr",
+                        "firdecimate",
+                        str(decimation),
+                        str(self.config.transition_bandwidth),
+                    ],
+                    manager=self,
+                    parent=shift_stream,
+                    close_when_unused=True,
+                )
+                decimation_stream.start()
+                self.decimation_streams[key] = decimation_stream
+            else:
+                decimation_stream.config = self.config
+            base_stream = decimation_stream
+
+        if sample_format == DEFAULT_SAMPLE_FORMAT:
+            return base_stream
+
+        format_key = (frequency, output_rate, sample_format)
+        format_stream = self.format_streams.get(format_key)
+        if format_stream is None:
+            format_stream = _build_output_format_stream(
                 config=self.config,
-                name=f"firdecimate-{frequency}-{output_rate}",
-                command=[
-                    "csdr",
-                    "firdecimate",
-                    str(decimation),
-                    str(self.config.transition_bandwidth),
-                ],
+                frequency=frequency,
+                output_rate=output_rate,
+                sample_format=sample_format,
                 manager=self,
-                parent=shift_stream,
-                close_when_unused=True,
+                parent=base_stream,
             )
-            decimation_stream.start()
-            self.decimation_streams[key] = decimation_stream
+            format_stream.start()
+            self.format_streams[format_key] = format_stream
         else:
-            decimation_stream.config = self.config
-        return decimation_stream
+            format_stream.config = self.config
+        return format_stream
 
     def on_stream_closed(self, stream: SharedStream) -> None:
         with self.lock:
             if self.root_stream is stream:
                 self.root_stream = None
+            for key, candidate in list(self.format_streams.items()):
+                if candidate is stream:
+                    del self.format_streams[key]
             for frequency, candidate in list(self.shift_streams.items()):
                 if candidate is stream:
                     del self.shift_streams[frequency]
@@ -969,6 +1098,7 @@ class ClientSession:
         source_stream: SharedStream,
         frequency: int,
         output_rate: int,
+        sample_format: str,
     ) -> None:
         self.conn = conn
         self.address = address
@@ -977,6 +1107,7 @@ class ClientSession:
         self.source_stream = source_stream
         self.frequency = frequency
         self.output_rate = output_rate
+        self.sample_format = sample_format
         self.chunk_queue: queue.Queue[bytes | None] = queue.Queue(
             maxsize=config.client_queue_chunks
         )
@@ -994,11 +1125,12 @@ class ClientSession:
         )
         self.output_thread.start()
         LOGGER.info(
-            "client %s:%s started freq=%s sample_rate=%s",
+            "client %s:%s started freq=%s sample_rate=%s format=%s",
             self.address[0],
             self.address[1],
             self.frequency,
             self.output_rate,
+            self.sample_format,
         )
 
     def enqueue(self, chunk: bytes) -> None:
@@ -1081,6 +1213,50 @@ def _compute_decimation(input_rate: int, output_rate: int) -> int:
     return input_rate // output_rate
 
 
+def _normalize_sample_format(value: Any) -> str:
+    return str(value).strip().lower()
+
+
+def _validate_sample_format(sample_format: str) -> None:
+    if sample_format not in VALID_SAMPLE_FORMATS:
+        raise RequestValidationError(
+            EXIT_REQUEST_ERROR,
+            f"unsupported sample format {sample_format!r}; expected one of "
+            f"{', '.join(sorted(VALID_SAMPLE_FORMATS))}",
+        )
+
+
+def _build_output_format_stream(
+    config: ServerConfig,
+    frequency: int,
+    output_rate: int,
+    sample_format: str,
+    manager: "StreamGraph",
+    parent: SharedStream,
+) -> SharedStream:
+    if sample_format == "s16":
+        return SharedStream(
+            config=config,
+            name=f"{sample_format}-{frequency}-{output_rate}",
+            command=["csdr", "convert", "-i", "float", "-o", "s16"],
+            manager=manager,
+            parent=parent,
+            close_when_unused=True,
+            output_read_size=_compute_output_read_size(sample_format, output_rate),
+        )
+    raise ValueError(f"unsupported sample format {sample_format!r}")
+
+
+def _compute_output_read_size(sample_format: str, output_rate: int) -> int:
+    bytes_per_complex_sample = {
+        "f32": 8,
+        "s16": 4,
+    }[sample_format]
+    target_ms = 100
+    size = int((output_rate * bytes_per_complex_sample * target_ms) / 1000)
+    return max(4096, min(DEFAULT_STREAM_OUTPUT_READ_SIZE, size))
+
+
 def _validate_request(config: ServerConfig, frequency: int, output_rate: int) -> None:
     shift_rate = (config.center_frequency - frequency) / config.rtl_sample_rate
     if shift_rate < -0.5 or shift_rate > 0.5:
@@ -1096,29 +1272,103 @@ def load_config(path: Path) -> ServerConfig:
 
 
 def _validate_config(config: ServerConfig) -> None:
-    if config.center_frequency <= 0:
+    _validate_rtl_device_index(config.rtl_device_index)
+    _validate_rtl_serial(config.rtl_serial)
+    _validate_center_frequency(config.center_frequency)
+    _validate_rtl_sample_rate(config.rtl_sample_rate)
+    _validate_automatic_gain_control(config.automatic_gain_control)
+    _validate_rtl_gain(config.automatic_gain_control, config.rtl_gain)
+    _validate_ppm_correction(config.ppm_correction)
+    _validate_transition_bandwidth(config.transition_bandwidth)
+    _validate_listen_host(config.listen_host)
+    _validate_listen_port(config.listen_port)
+    _validate_read_chunk_size(config.read_chunk_size)
+    _validate_rtl_read_timeout_seconds(config.rtl_read_timeout_seconds)
+    _validate_stream_queue_chunks(config.stream_queue_chunks)
+    _validate_client_queue_chunks(config.client_queue_chunks)
+    _validate_enqueue_timeout_seconds(config.enqueue_timeout_seconds)
+
+
+def _validate_rtl_device_index(value: int) -> None:
+    if value < 0:
+        raise ValueError("rtl_device_index must be non-negative")
+
+
+def _validate_rtl_serial(value: str | None) -> None:
+    if value is not None and not value:
+        raise ValueError("rtl_serial must not be empty")
+
+
+def _validate_center_frequency(value: int) -> None:
+    if value <= 0:
         raise ValueError("center_frequency must be positive")
-    if not _is_valid_rtl_sample_rate(config.rtl_sample_rate):
+
+
+def _validate_rtl_sample_rate(value: int) -> None:
+    if not _is_valid_rtl_sample_rate(value):
         raise ValueError(
-            f"Cannot sample at {config.rtl_sample_rate} S/s. "
+            f"Cannot sample at {value} S/s. "
             "The sample rate must be between 225001 S/s and 300000 S/s "
             "or 900001 S/s and 3200000 S/s."
         )
-    if config.rtl_gain is not None and not (1.0 <= config.rtl_gain <= 49.6):
+
+
+def _validate_automatic_gain_control(value: bool) -> None:
+    if not isinstance(value, bool):
+        raise ValueError("automatic_gain_control must be true or false")
+
+
+def _validate_rtl_gain(automatic_gain_control: bool, value: float | None) -> None:
+    if automatic_gain_control:
+        return
+    if value is None:
+        raise ValueError("rtl_gain must be set when automatic_gain_control is false")
+    if not (1.0 <= value <= 49.6):
         raise ValueError("rtl_gain must be between 1.0 dB and 49.6 dB")
-    if not (0.005 <= config.transition_bandwidth <= 0.05):
+
+
+def _validate_ppm_correction(value: int) -> None:
+    if not (-500 <= value <= 500):
+        raise ValueError("ppm_correction must be between -500 and 500")
+
+
+def _validate_transition_bandwidth(value: float) -> None:
+    if not (0.005 <= value <= 0.05):
         raise ValueError("transition_bandwidth must be between 0.005 and 0.05")
-    if config.listen_port <= 0 or config.listen_port > 65535:
+
+
+def _validate_listen_host(value: str) -> None:
+    if not value:
+        raise ValueError("listen_host must not be empty")
+
+
+def _validate_listen_port(value: int) -> None:
+    if value <= 0 or value > 65535:
         raise ValueError("listen_port must be between 1 and 65535")
-    if config.read_chunk_size <= 0:
+
+
+def _validate_read_chunk_size(value: int) -> None:
+    if value <= 0:
         raise ValueError("read_chunk_size must be positive")
-    if config.rtl_read_timeout_seconds <= 0:
+
+
+def _validate_rtl_read_timeout_seconds(value: float) -> None:
+    if value <= 0:
         raise ValueError("rtl_read_timeout_seconds must be positive")
-    if config.stream_queue_chunks <= 0:
+
+
+def _validate_stream_queue_chunks(value: int) -> None:
+    if value <= 0:
         raise ValueError("stream_queue_chunks must be positive")
-    if config.client_queue_chunks <= 0:
+
+
+def _validate_client_queue_chunks(value: int) -> None:
+    if value <= 0:
         raise ValueError("client_queue_chunks must be positive")
-    if config.enqueue_timeout_seconds < 0:
+
+
+def _validate_enqueue_timeout_seconds(value: float) -> None:
+    if value < 0:
         raise ValueError("enqueue_timeout_seconds must be non-negative")
 
 
@@ -1153,6 +1403,8 @@ def parse_client_request(conn: socket.socket) -> dict[str, Any]:
             EXIT_REQUEST_ERROR,
             "request must include sample_rate or bandwidth",
         )
+    request["format"] = _normalize_sample_format(request.get("format", DEFAULT_SAMPLE_FORMAT))
+    _validate_sample_format(request["format"])
     conn.settimeout(None)
     return request
 
@@ -1210,7 +1462,12 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                     request = parse_client_request(conn)
                     frequency = int(request["frequency"])
                     output_rate = int(request.get("sample_rate", request.get("bandwidth")))
-                    source_stream = capture.get_output_stream(frequency, output_rate)
+                    sample_format = request["format"]
+                    source_stream = capture.get_output_stream(
+                        frequency,
+                        output_rate,
+                        sample_format,
+                    )
                     session = ClientSession(
                         conn=conn,
                         address=address,
@@ -1219,10 +1476,11 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                         source_stream=source_stream,
                         frequency=frequency,
                         output_rate=output_rate,
+                        sample_format=sample_format,
                     )
                     capture.register_client(session)
                     session.start()
-                    send_handshake(conn, {"status": "ok"})
+                    send_handshake(conn, {"status": "ok", "format": sample_format})
                     session.activate()
                 except RequestValidationError as exc:
                     LOGGER.warning(

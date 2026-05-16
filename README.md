@@ -50,9 +50,9 @@ Configuration limits:
 
 - `rtl_sample_rate` must be between `225001` and `300000` S/s, or between
   `900001` and `3200000` S/s (yes I know the RTL SDR sample rate limitations are weird)
-- `rtl_gain` must be between `1.0` and `49.6` dB when set.
-- `transition_bandwidth` must be between `0.005` and `0.05`
-This controls the alias filter when decimating to the requested bandwidth. If you're planning to use the server primarily for narrowband FM, set it to 0.005. If you're using something like broadcast FM, set it to 0.05.
+- `rtl_gain` must be between `1.0` and `49.6` dB when set. If `automatic_gain_control` is `true`, manual gain is ignored.
+- `ppm_correction` must be between `-500` and `500`. This isn't a limitation on the underlying libraries being used, but you should never have to set your PPM above or below this range. In fact, you shouldn't need more than `±50` PPM, if you do then your SDR has issues.
+- `transition_bandwidth` must be between `0.005` and `0.05`. This controls the alias filter when decimating to the requested bandwidth. If you're planning to use the server primarily for narrowband FM, set it to 0.005. If you're using something like broadcast FM, set it to 0.05.
 
 ## Run
 
@@ -76,7 +76,9 @@ ps -e | grep 'csdr_server'
 
 - `center_frequency`
 - `rtl_sample_rate`
+- `automatic_gain_control`
 - `rtl_gain`
+- `ppm_correction`
 - `transition_bandwidth`
 
 `center_frequency` will retune the hardware frequency of the SDR, while clients keep their requested RF
@@ -85,29 +87,52 @@ ps -e | grep 'csdr_server'
   decimate cleanly, the server keeps the old center/rate and logs that a server
   restart is required forthe change to take effect. All other config changes, such as the configured RTL SDR device, are ignored until the server is restarted.
 
+`automatic_gain_control` enables RTL-SDR automatic gain control. When it is `true`, the server applies `pyrtlsdr` gain mode `"auto"` and ignores `rtl_gain`. When it is `false`, `rtl_gain` must be set and is applied as manual tuner gain.
+
+`ppm_correction` is applied through the SDR's frequency correction setting and can be changed live.
+
 ## Client
 
 Use `csdr_server_client` to connect to a running server and print IQ data to stdout:
 
 ```bash
-csdr_server_client -a 127.0.0.1 -p 7355 -f 162.475M -s 16K > iq.cf32
+csdr_server_client -a 127.0.0.1 -p 7355 -f 162.475M -s 16K > iq.f32
 ```
 
-The above example will output 32 bit float IQ at a sample rate of 16000 S/s and a frequency of 162.475 MHz (yes if you haven't figured it out by now I am obsessed with NOAA Weather Radio). It then redirects stdout to a file called `iq.cf32`. A better use might be to pipe the IQ data to another program, like `csdr` if you have it installed on the client machine.
+Optional transport formats are available with `-F` or `--format`:
+
+```bash
+csdr_server_client -a 127.0.0.1 -p 7355 -f 162.475M -s 16K -F s16 > iq.s16
+```
+
+The above example will output 32 bit float IQ at a sample rate of 16000 S/s and a frequency of 162.475 MHz (yes if you haven't figured it out by now I am obsessed with NOAA Weather Radio). It then redirects stdout to a file called `iq.f32`. A better use might be to pipe the IQ data to another program, like `csdr` if you have it installed on the client machine.
 
 `-f` and `-s` accept plain integers or `K`, `M`, and `G` suffixes, `K`, so entering a frequency of `162.475M` gets translated to `162475000` and entering a sample rate of `16K` gets translated to `16000`.
 
 ## IQ format
 
-The server sends interleaved 32-bit floating point little-endian IQ samples to clients. The layout would look something like this:
-`I`, `Q`
+The server can send one of two interleaved IQ formats:
 
-That means the binary stream is:
+- `f32`: complex float32, little-endian
+- `s16`: complex signed 16-bit integer, little-endian
+
+All three are interleaved as:
+
+```text
+I, Q, I, Q, I, Q, ...
+```
+
+For `f32`, the binary stream is:
 
 ```text
 I0(float32), Q0(float32), I1(float32), Q1(float32), ...
 ```
-but you should already know that, shouldn't you?
+
+For `s16`, the binary stream is:
+
+```text
+I0(int16), Q0(int16), I1(int16), Q1(int16), ...
+```
 
 ## Constraints
 
@@ -173,6 +198,7 @@ Each client opens a TCP connection and sends a single JSON line:
 ```
 
 `bandwidth` may be used as an alias for `sample_rate`.
+`format` may be used to request a transport format. If omitted, the server uses `f32`.
 
 Request fields:
 
@@ -187,11 +213,16 @@ Request fields:
 - `bandwidth`
   - optional alias for `sample_rate`
   - integer
+- `format`
+  - optional
+  - string
+  - one of `f32` or `s16`
+  - defaults to `f32`
 
 Valid example:
 
 ```json
-{"frequency": 162475000, "sample_rate": 16000}
+{"frequency": 162475000, "sample_rate": 16000, "format": "s16"}
 ```
 
 Handshake:
@@ -199,7 +230,7 @@ Handshake:
 After the request line, the server sends a one-line JSON handshake:
 
 ```json
-{"status": "ok"}
+{"status": "ok", "format": "s16"}
 ```
 
 or:
@@ -212,6 +243,9 @@ Handshake fields:
 
 - `status`
   - `"ok"` or `"error"`
+- `format`
+  - present on success
+  - the accepted output format
 - `code`
   - present on errors
   - numeric error code
@@ -227,9 +261,4 @@ Error codes:
 
 Stream payload:
 
-Only after an `ok` handshake does the server stream raw `complex float32` IQ
-samples back to the client.
-
-
-I think that's everything, have fun!
-
+Only after an `ok` handshake does the server stream raw IQ samples back to the client, using the accepted `format`.
