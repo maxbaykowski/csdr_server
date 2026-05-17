@@ -8,7 +8,8 @@
   "ppm_correction": 0,
   "transition_bandwidth": 0.005,
   "audio": {
-    "nfm_deemphasis_tau": 300
+    "nfm_deemphasis_tau": 300,
+    "wfm_deemphasis_region": "us"
   },
   "listen_host": "0.0.0.0",
   "listen_port": 7355,

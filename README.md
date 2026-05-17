@@ -110,6 +110,8 @@ Important settings:
   - alias filter width used during decimation
 - `audio.nfm_deemphasis_tau`
   - NFM deemphasis time constant in microseconds
+- `audio.wfm_deemphasis_region`
+  - WFM deemphasis region, either `us` or `europe`
 
 ### Config Limits
 
@@ -119,6 +121,7 @@ Important settings:
 - `ppm_correction` must be between `-500` and `500`
 - `transition_bandwidth` must be between `0.005` and `0.05`
 - `audio.nfm_deemphasis_tau` must be between `0` and `530`
+- `audio.wfm_deemphasis_region` must be either `us` or `europe`
 
 ## Live Reload
 
@@ -143,6 +146,7 @@ These settings can be changed live:
 - `ppm_correction`
 - `transition_bandwidth`
 - `audio.nfm_deemphasis_tau`
+- `audio.wfm_deemphasis_region`
 
 What live reload does:
 
@@ -160,6 +164,8 @@ What live reload does:
   - rebuilds decimation stages
 - `audio.nfm_deemphasis_tau`
   - rebuilds active audio demodulation stages so NFM clients pick up the new deemphasis value
+- `audio.wfm_deemphasis_region`
+  - rebuilds active WFM audio stages so clients pick up the new deemphasis curve
 
 If a live `center_frequency` or `rtl_sample_rate` change would put an existing
 client out of band, or make its requested sample rate exceed the new RTL sample
@@ -197,6 +203,7 @@ Supported audio modes are:
 - `modulation=usb`
 - `modulation=lsb`
 - `modulation=nfm`
+- `modulation=wfm`
 
 AM audio uses a fixed internal pipeline:
 
@@ -242,6 +249,23 @@ NFM audio also uses the same 16 kHz / `s16` output:
 
 The NFM deemphasis time constant comes from `audio.nfm_deemphasis_tau` in the
 server config. The default is `300`.
+
+WFM audio uses a wider demodulation path and a 32 kHz final audio rate:
+
+- shift to the requested frequency
+- decimate to `170000` S/s
+- transition bandwidth `0.05`
+- `fmdemod`
+- `fractionaldecimator --format float 170000/32000 --prefilter`
+- `deemphasis --wfm 32000 <tau>e-6`
+- convert to `s16`
+
+The WFM deemphasis curve comes from `audio.wfm_deemphasis_region`:
+
+- `us`
+  - `75` microseconds
+- `europe`
+  - `50` microseconds
 
 ## Operational Notes
 
@@ -325,7 +349,7 @@ Request fields:
   - defaults to `f32`
 - `modulation`
   - required in `audio` mode
-  - `am`, `usb`, `lsb`, or `nfm`
+  - `am`, `usb`, `lsb`, `nfm`, or `wfm`
 
 IQ request example:
 
@@ -345,6 +369,10 @@ Audio request example:
 
 ```json
 {"frequency": 162550000, "mode": "audio", "modulation": "nfm"}
+```
+
+```json
+{"frequency": 101100000, "mode": "audio", "modulation": "wfm"}
 ```
 
 ### Handshake
