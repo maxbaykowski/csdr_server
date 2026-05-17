@@ -931,7 +931,7 @@ class StreamGraph:
         self.lock = threading.Lock()
         self.root_stream: SharedStream | None = None
         self.shift_streams: dict[int, SharedStream] = {}
-        self.decimation_streams: dict[tuple[int, int, float], SharedStream] = {}
+        self.decimation_streams: dict[tuple[int, int, float, str], SharedStream] = {}
         self.format_streams: dict[tuple[int, int, str], Any] = {}
         self.audio_streams: dict[tuple[int, str], SharedStream] = {}
 
@@ -1098,13 +1098,11 @@ class StreamGraph:
             assert output_rate is not None
             assert sample_format is not None
             _validate_sample_format(sample_format)
-            decimation = _compute_decimation(self.config.rtl_sample_rate, output_rate)
             base_stream = self._get_decimation_stream_locked(
                 frequency,
                 output_rate,
                 self.config.transition_bandwidth,
                 shift_stream,
-                decimation,
             )
             if sample_format == DEFAULT_SAMPLE_FORMAT:
                 return base_stream
@@ -1128,13 +1126,11 @@ class StreamGraph:
 
         assert modulation is not None
         _validate_audio_modulation(modulation)
-        decimation = _compute_decimation(self.config.rtl_sample_rate, AM_AUDIO_OUTPUT_RATE)
         base_stream = self._get_decimation_stream_locked(
             frequency,
             AM_AUDIO_OUTPUT_RATE,
             AM_AUDIO_TRANSITION_BANDWIDTH,
             shift_stream,
-            decimation,
         )
         audio_key = (frequency, modulation)
         audio_stream = self.audio_streams.get(audio_key)
@@ -1157,27 +1153,56 @@ class StreamGraph:
         output_rate: int,
         transition_bandwidth: float,
         parent: SharedStream,
-        decimation: int,
     ) -> SharedStream:
-        if decimation == 1:
+        _validate_output_rate(self.config.rtl_sample_rate, output_rate)
+        strategy = _get_decimation_strategy(self.config.rtl_sample_rate, output_rate)
+        if strategy == "identity":
             return parent
-        key = (frequency, output_rate, transition_bandwidth)
+        key = (frequency, output_rate, transition_bandwidth, strategy)
         decimation_stream = self.decimation_streams.get(key)
         if decimation_stream is None:
-            decimation_stream = SharedStream(
-                config=self.config,
-                name=f"firdecimate-{frequency}-{output_rate}-{transition_bandwidth}",
-                command=[
-                    "csdr",
-                    "firdecimate",
-                    str(decimation),
-                    str(transition_bandwidth),
-                ],
-                manager=self,
-                parent=parent,
-                close_when_unused=True,
-            )
-            decimation_stream.start()
+            if strategy == "integer":
+                decimation = _compute_integer_decimation(
+                    self.config.rtl_sample_rate,
+                    output_rate,
+                )
+                decimation_stream = SharedStream(
+                    config=self.config,
+                    name=f"firdecimate-{frequency}-{output_rate}-{transition_bandwidth}",
+                    command=[
+                        "csdr",
+                        "firdecimate",
+                        str(decimation),
+                        _format_csdr_float(transition_bandwidth),
+                    ],
+                    manager=self,
+                    parent=parent,
+                    close_when_unused=True,
+                )
+                decimation_stream.start()
+            else:
+                decimation_ratio = _compute_fractional_decimation_ratio(
+                    self.config.rtl_sample_rate,
+                    output_rate,
+                )
+                decimation_stream = SharedStream(
+                    config=self.config,
+                    name=f"fractionaldecimator-{frequency}-{output_rate}-{transition_bandwidth}",
+                    command=[
+                        "csdr",
+                        "fractionaldecimator",
+                        "-f",
+                        "complex",
+                        "--prefilter",
+                        "--transition",
+                        _format_csdr_float(transition_bandwidth),
+                        _format_csdr_float(decimation_ratio),
+                    ],
+                    manager=self,
+                    parent=parent,
+                    close_when_unused=True,
+                )
+                decimation_stream.start()
             self.decimation_streams[key] = decimation_stream
         else:
             decimation_stream.config = self.config
@@ -1315,7 +1340,7 @@ class ClientSession:
         )
 
 
-def _compute_decimation(input_rate: int, output_rate: int) -> int:
+def _validate_output_rate(input_rate: int, output_rate: int) -> None:
     if output_rate <= 0:
         raise RequestValidationError(EXIT_BAD_SAMPLE_RATE, "output sample rate must be positive")
     if output_rate > input_rate:
@@ -1323,6 +1348,19 @@ def _compute_decimation(input_rate: int, output_rate: int) -> int:
             EXIT_BAD_SAMPLE_RATE,
             "output sample rate cannot exceed rtl sample rate",
         )
+
+
+def _get_decimation_strategy(input_rate: int, output_rate: int) -> str:
+    _validate_output_rate(input_rate, output_rate)
+    if input_rate == output_rate:
+        return "identity"
+    if input_rate % output_rate == 0:
+        return "integer"
+    return "fractional"
+
+
+def _compute_integer_decimation(input_rate: int, output_rate: int) -> int:
+    _validate_output_rate(input_rate, output_rate)
     if input_rate % output_rate != 0:
         raise RequestValidationError(
             EXIT_BAD_SAMPLE_RATE,
@@ -1330,6 +1368,15 @@ def _compute_decimation(input_rate: int, output_rate: int) -> int:
             f"sample rate {output_rate}",
         )
     return input_rate // output_rate
+
+
+def _compute_fractional_decimation_ratio(input_rate: int, output_rate: int) -> float:
+    _validate_output_rate(input_rate, output_rate)
+    return float(input_rate) / float(output_rate)
+
+
+def _format_csdr_float(value: float) -> str:
+    return format(value, ".12g")
 
 
 def _normalize_sample_format(value: Any) -> str:
@@ -1607,7 +1654,7 @@ def _validate_session_request(config: ServerConfig, session: "ClientSession") ->
                 "iq session is missing output sample rate or format",
             )
         _validate_sample_format(session.sample_format)
-        _compute_decimation(config.rtl_sample_rate, session.output_rate)
+        _validate_output_rate(config.rtl_sample_rate, session.output_rate)
         return
     if session.mode == "audio":
         if session.modulation is None:
@@ -1616,7 +1663,7 @@ def _validate_session_request(config: ServerConfig, session: "ClientSession") ->
                 "audio session is missing modulation",
             )
         _validate_audio_modulation(session.modulation)
-        _compute_decimation(config.rtl_sample_rate, AM_AUDIO_OUTPUT_RATE)
+        _validate_output_rate(config.rtl_sample_rate, AM_AUDIO_OUTPUT_RATE)
         return
     raise RequestValidationError(
         EXIT_REQUEST_ERROR,

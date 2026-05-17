@@ -15,7 +15,7 @@ The main goal is to be boring and reliable:
 
 - One RTL-SDR dongle can serve multiple clients at once.
 - Clients can tune anywhere inside the currently sampled RF window.
-- Clients can request decimated IQ at the sample rate they actually need.
+- Clients can request decimated IQ at nearly any sample rate up to the RTL sample rate.
 - Clients can also request demodulated audio instead of raw IQ.
 - Two output formats are supported:
   - `f32`
@@ -162,9 +162,9 @@ What live reload does:
   - rebuilds active audio demodulation stages so NFM clients pick up the new deemphasis value
 
 If a live `center_frequency` or `rtl_sample_rate` change would put an existing
-client out of band, or make its requested sample rate impossible to decimate
-cleanly, the server keeps the old setting and logs that a restart is required
-for that change.
+client out of band, or make its requested sample rate exceed the new RTL sample
+rate, the server keeps the old setting and logs that a restart is required for
+that change.
 
 All other config changes still require a restart.
 
@@ -180,6 +180,10 @@ The server supports two IQ output formats:
   - complex signed 16-bit integer
   - little-endian
   - layout: `I0, Q0, I1, Q1, ...`
+
+For IQ resampling, the server prefers `firdecimate` when the requested sample
+rate is an integer ratio of the RTL sample rate. If not, it falls back to
+`fractionaldecimator --prefilter`.
 
 ## Audio Mode
 
