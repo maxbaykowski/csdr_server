@@ -14,6 +14,7 @@ import argparse
 import ctypes
 from ctypes import c_ubyte
 import json
+import json5
 import logging
 import os
 import queue
@@ -2189,7 +2190,7 @@ def _validate_session_request(config: ServerConfig, session: "ClientSession") ->
 
 
 def load_config(path: Path) -> ServerConfig:
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw = json5.loads(path.read_text(encoding="utf-8"))
     return ServerConfig.from_dict(raw)
 
 
@@ -2560,8 +2561,8 @@ def parse_args() -> argparse.Namespace:
         "-c",
         "--config",
         type=Path,
-        default=Path("config.json"),
-        help="Path to JSON configuration file",
+        default=Path("config.json5"),
+        help="Path to JSON5 configuration file",
     )
     parser.add_argument(
         "--log-level",
@@ -2591,8 +2592,8 @@ def main() -> int:
         else:
             LOGGER.error("%s", exc)
         return 1
-    except json.JSONDecodeError as exc:
-        LOGGER.error("invalid json in %s: %s", args.config, exc)
+    except ValueError as exc:
+        LOGGER.error("invalid JSON5 or configuration in %s: %s", args.config, exc)
         return 1
     except KeyboardInterrupt:
         return 0

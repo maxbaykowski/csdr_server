@@ -61,13 +61,13 @@ András Retzler version.
 Copy the example config:
 
 ```bash
-cp config.example.json config.json
+cp config.example.json5 config.json5
 ```
 
 Start the server:
 
 ```bash
-csdr_server --config config.json
+csdr_server --config config.json5
 ```
 
 Connect a client:
@@ -98,7 +98,10 @@ csdr_server_client -a 127.0.0.1 -p 7355 -f 101.1M -m audio -M wfm-stereo > stere
 
 ## Configuration
 
-Copy `config.example.json` and adjust it for your system.
+Copy `config.example.json5` and adjust it for your system.
+
+The server configuration now uses JSON5, so comments and trailing commas are
+allowed. Plain JSON also remains valid because JSON is a subset of JSON5.
 
 The config is grouped into three sections:
 

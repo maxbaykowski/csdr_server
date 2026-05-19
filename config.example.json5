@@ -1,0 +1,106 @@
+{
+  // RTL-SDR device and tuning settings.
+  rtl: {
+    // RTL device index when the device serial is not specified
+    rtl_device_index: 0,
+
+    // The serial number of the SDR dongle. Set to null to use index number instead.
+    rtl_serial: "00000001",
+
+    // Hardware frequency of the SDR dongle. Used when automatic tuning is disabled.
+    center_frequency: 162475000,
+
+    // Automatically retune the dongle based on connected clients.
+    automatic_tuning: false,
+
+    // The sample rate of the SDR dongle.
+    rtl_sample_rate: 2400000,
+
+    // Enable hardware AGC.
+    automatic_gain_control: false,
+
+    // Manual gain control when AGC is disabled.
+    rtl_gain: 35.0,
+
+    // Controls hardware frequency correction for dongles that experience frequency drift.
+    ppm_correction: 0,
+
+    /*
+    The alias filter when decimating IQ data.
+    It should be between 0.005 and 0.05
+    Larger values will save some CPU, but will cause more aliasing on the sides of the passband.
+    Smaller values will result in a longer alias filter, which helps to reject frequencies outside the passband.
+    This alias filter is only used for raw IQ mode, audio demodulators have their own hardcoded values.
+    */
+    transition_bandwidth: 0.005,
+  },
+
+  // Audio mode settings
+  audio: {
+    // Allow clients to request demodulated audio
+    audio_support: true,
+
+    am: {
+      // Enable this demodulator
+      enabled: true,
+    },
+
+    lsb: {
+      // Enable this demodulator
+      enabled: true,
+    },
+
+    usb: {
+      // Enable this demodulator
+      enabled: true,
+    },
+
+    nfm: {
+      // Enable this demodulator
+      enabled: true,
+
+      /*
+      The NFM deemphasis time constant for attenuating high frequencies.
+      Generally this setting does not need to be changed from its default value.
+      Higher values will result in more aggressive frequency attenuation.
+      Set to null to disable NFM deemphasis entirely.
+      */
+      deemphasis_tau: 300,
+    },
+
+    wfm: {
+      // Enable this demodulator
+      enabled: true,
+
+      // Deemphasis region, either "us" or "europe".
+      deemphasis_region: "us",
+
+      // Enable FM stereo support (requires Stereo Demux's demux binary to be on PATH).
+      stereo_support: false,
+    },
+  },
+
+  // Listener and buffering settings.
+  server: {
+    // The listener IP address. Set it to 0.0.0.0 to allow any machine on your network to connect. Point it at a specific address of a device on your network to only allow that machine to connect.
+    listen_host: "0.0.0.0",
+
+    // The port csdr_server listens on
+    listen_port: 7355,
+
+        // The number of bytes read from the RTL SDR at a time. Leave this value alone!
+    read_chunk_size: 262144,
+
+    // The maximum amount of time allowed to receive data from the RTL SDR before declaring there's a hardware failure
+    rtl_read_timeout_seconds: 2.0,
+
+    // Maximum number of chunks buffered between internal processes. Leave this value alone!
+    stream_queue_chunks: 64,
+
+    // the maximum number of chunks sent to clients. Increase this value to 128 or 256 if not using LAN.
+    client_queue_chunks: 64,
+
+    // The maximum amount of time allowed for clients to read chunks before they are dropped. Increase to 0.5 or 1.0 if not using LAN.
+    enqueue_timeout_seconds: 0.25,
+  },
+}

@@ -13,6 +13,7 @@ authors = [
   {name = "Max Baykowski"}
 ]
 dependencies = [
+  "json5",
   "pyrtlsdr",
   "pyrtlsdrlib",
 ]
@@ -40,4 +41,3 @@ Repository = "https://github.com/maxbaykowski/csdr_server"
 [tool.setuptools]
 py-modules = ["csdr_server", "csdr_server_client"]
 include-package-data = true
-
