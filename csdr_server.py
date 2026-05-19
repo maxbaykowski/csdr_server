@@ -78,6 +78,7 @@ class ServerConfig:
     automatic_gain_control: bool = False
     rtl_gain: float | None = None
     ppm_correction: int = 0
+    dc_block: bool = False
     transition_bandwidth: float = 0.05
     audio_support: bool = True
     am_enabled: bool = True
@@ -146,6 +147,10 @@ class ServerConfig:
             ppm_correction=_parse_int(
                 _config_value(data, rtl_settings, "ppm_correction", 0),
                 "rtl.ppm_correction",
+            ),
+            dc_block=_parse_bool(
+                _config_value(data, rtl_settings, "dc_block", False),
+                "rtl.dc_block",
             ),
             transition_bandwidth=_parse_float(
                 _config_value(data, rtl_settings, "transition_bandwidth"),
@@ -620,6 +625,7 @@ class CaptureManager:
             "automatic_gain_control",
             "rtl_gain",
             "ppm_correction",
+            "dc_block",
             "rtl_sample_rate",
             "center_frequency",
             "transition_bandwidth",
@@ -659,6 +665,7 @@ class CaptureManager:
         transition_changed = (
             next_config.transition_bandwidth != current_config.transition_bandwidth
         )
+        dc_block_changed = next_config.dc_block != current_config.dc_block
         rebuild_audio_modulations: set[str] = set()
         if (
             next_config.nfm_deemphasis_tau != current_config.nfm_deemphasis_tau
@@ -694,17 +701,18 @@ class CaptureManager:
         self.graph.apply_runtime_config(
             new_config=next_config,
             sessions=client_requests,
-            rebuild_decimators=center_or_rate_changed or transition_changed,
+            rebuild_decimators=center_or_rate_changed or transition_changed or dc_block_changed,
             rebuild_audio_modulations=rebuild_audio_modulations,
         )
         self.config = next_config
         LOGGER.info(
-            "config reload applied: center_frequency=%s rtl_sample_rate=%s automatic_gain_control=%s rtl_gain=%s ppm_correction=%s transition_bandwidth=%s nfm_deemphasis_tau=%s wfm_deemphasis_region=%s",
+            "config reload applied: center_frequency=%s rtl_sample_rate=%s automatic_gain_control=%s rtl_gain=%s ppm_correction=%s dc_block=%s transition_bandwidth=%s nfm_deemphasis_tau=%s wfm_deemphasis_region=%s",
             next_config.center_frequency,
             next_config.rtl_sample_rate,
             next_config.automatic_gain_control,
             next_config.rtl_gain,
             next_config.ppm_correction,
+            next_config.dc_block,
             next_config.transition_bandwidth,
             next_config.nfm_deemphasis_tau,
             next_config.wfm_deemphasis_region,
@@ -1463,17 +1471,24 @@ class StreamGraph:
     ) -> SharedStream:
         _validate_output_rate(self.config.rtl_sample_rate, output_rate)
         strategy = _get_decimation_strategy(self.config.rtl_sample_rate, output_rate)
-        if strategy == "identity":
+        if strategy == "identity" and not self.config.dc_block:
+            LOGGER.debug(
+                "using identity IQ stream frequency=%s output_rate=%s dc_block=%s",
+                frequency,
+                output_rate,
+                self.config.dc_block,
+            )
             return parent
-        key = (frequency, output_rate, transition_bandwidth, strategy)
+        key = (frequency, output_rate, transition_bandwidth, strategy, self.config.dc_block)
         decimation_stream = self.decimation_streams.get(key)
         if decimation_stream is None:
+            rate_stream = parent
             if strategy == "integer":
                 decimation = _compute_integer_decimation(
                     self.config.rtl_sample_rate,
                     output_rate,
                 )
-                decimation_stream = SharedStream(
+                rate_stream = SharedStream(
                     config=self.config,
                     name=f"firdecimate-{frequency}-{output_rate}-{transition_bandwidth}",
                     command=[
@@ -1486,7 +1501,7 @@ class StreamGraph:
                     parent=parent,
                     close_when_unused=True,
                 )
-                decimation_stream.start()
+                rate_stream.start()
                 LOGGER.debug(
                     "created shared integer decimation stream frequency=%s output_rate=%s transition_bandwidth=%s decimation=%s",
                     frequency,
@@ -1494,12 +1509,12 @@ class StreamGraph:
                     transition_bandwidth,
                     decimation,
                 )
-            else:
+            elif strategy == "fractional":
                 decimation_ratio = _compute_fractional_decimation_ratio(
                     self.config.rtl_sample_rate,
                     output_rate,
                 )
-                decimation_stream = SharedStream(
+                rate_stream = SharedStream(
                     config=self.config,
                     name=f"fractionaldecimator-{frequency}-{output_rate}-{transition_bandwidth}",
                     command=[
@@ -1516,7 +1531,7 @@ class StreamGraph:
                     parent=parent,
                     close_when_unused=True,
                 )
-                decimation_stream.start()
+                rate_stream.start()
                 LOGGER.debug(
                     "created shared fractional decimation stream frequency=%s output_rate=%s transition_bandwidth=%s decimation_ratio=%s",
                     frequency,
@@ -1524,15 +1539,45 @@ class StreamGraph:
                     transition_bandwidth,
                     decimation_ratio,
                 )
+            elif strategy == "identity":
+                LOGGER.debug(
+                    "using identity IQ stream frequency=%s output_rate=%s dc_block=%s",
+                    frequency,
+                    output_rate,
+                    self.config.dc_block,
+                )
+            else:
+                raise ValueError(f"unsupported decimation strategy {strategy!r}")
+
+            if self.config.dc_block:
+                decimation_stream = SharedStream(
+                    config=self.config,
+                    name=f"iq-dcblock-{frequency}-{output_rate}-{transition_bandwidth}-{strategy}",
+                    command=["csdr", "dcblock"],
+                    manager=self,
+                    parent=rate_stream,
+                    close_when_unused=True,
+                )
+                decimation_stream.start()
+                LOGGER.debug(
+                    "created shared IQ dcblock stream frequency=%s output_rate=%s transition_bandwidth=%s strategy=%s",
+                    frequency,
+                    output_rate,
+                    transition_bandwidth,
+                    strategy,
+                )
+            else:
+                decimation_stream = rate_stream
             self.decimation_streams[key] = decimation_stream
         else:
             decimation_stream.config = self.config
             LOGGER.debug(
-                "reusing shared %s decimation stream frequency=%s output_rate=%s transition_bandwidth=%s",
+                "reusing shared %s decimation stream frequency=%s output_rate=%s transition_bandwidth=%s dc_block=%s",
                 strategy,
                 frequency,
                 output_rate,
                 transition_bandwidth,
+                self.config.dc_block,
             )
         return decimation_stream
 
@@ -2274,6 +2319,7 @@ def _validate_config(config: ServerConfig) -> None:
     _validate_automatic_gain_control(config.automatic_gain_control)
     _validate_rtl_gain(config.automatic_gain_control, config.rtl_gain)
     _validate_ppm_correction(config.ppm_correction)
+    _validate_dc_block(config.dc_block)
     _validate_transition_bandwidth(config.transition_bandwidth)
     _validate_listen_host(config.listen_host)
     _validate_listen_port(config.listen_port)
@@ -2346,6 +2392,11 @@ def _validate_rtl_gain(automatic_gain_control: bool, value: float | None) -> Non
 def _validate_ppm_correction(value: int) -> None:
     if not (-500 <= value <= 500):
         raise ValueError("ppm_correction must be between -500 and 500")
+
+
+def _validate_dc_block(value: bool) -> None:
+    if not isinstance(value, bool):
+        raise ValueError("rtl.dc_block must be true or false")
 
 
 def _validate_transition_bandwidth(value: float) -> None:

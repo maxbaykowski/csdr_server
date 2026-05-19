@@ -25,6 +25,9 @@
     // Controls hardware frequency correction for dongles that experience frequency drift.
     ppm_correction: 0,
 
+    // Apply IQ-level DC blocking after shared decimation to suppress the center spike.
+    dc_block: false,
+
     /*
     The alias filter when decimating IQ data.
     It should be between 0.005 and 0.5

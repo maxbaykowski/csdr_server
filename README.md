@@ -143,6 +143,8 @@ Important settings:
   - manual gain in dB when AGC is off
 - `rtl.ppm_correction`
   - frequency correction in PPM
+- `rtl.dc_block`
+  - enables or disables IQ-level DC blocking after shared decimation
 - `rtl.transition_bandwidth`
   - alias filter width used during IQ decimation
 - `audio.audio_support`
@@ -179,6 +181,7 @@ Important settings:
   `900001` and `3200000` S/s
 - `rtl.rtl_gain` must be between `1.0` and `49.6` dB when AGC is off
 - `rtl.ppm_correction` must be between `-500` and `500`
+- `rtl.dc_block` must be `true` or `false`
 - `rtl.transition_bandwidth` must be between `0.005` and `0.5`
 - `rtl.automatic_tuning` must be `true` or `false`
 - `audio.audio_support` must be `true` or `false`
@@ -210,6 +213,7 @@ These settings can be changed live:
 - `rtl.automatic_gain_control`
 - `rtl.rtl_gain`
 - `rtl.ppm_correction`
+- `rtl.dc_block`
 - `rtl.transition_bandwidth`
 - `audio.nfm.deemphasis_tau`
 - `audio.wfm.deemphasis_region`
@@ -227,6 +231,8 @@ What live reload does:
   - updates manual gain when AGC is off
 - `rtl.ppm_correction`
   - updates frequency correction
+- `rtl.dc_block`
+  - rebuilds shared IQ-rate stages so both IQ and audio clients pick up the new IQ-level DC blocker
 - `rtl.transition_bandwidth`
   - rebuilds decimation stages
 - `audio.nfm.deemphasis_tau`
