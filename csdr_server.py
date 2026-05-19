@@ -2152,8 +2152,8 @@ def _validate_ppm_correction(value: int) -> None:
 
 
 def _validate_transition_bandwidth(value: float) -> None:
-    if not (0.005 <= value <= 0.05):
-        raise ValueError("transition_bandwidth must be between 0.005 and 0.05")
+    if not (0.005 <= value <= 0.5):
+        raise ValueError("transition_bandwidth must be between 0.005 and 0.5")
 
 
 def _validate_nfm_deemphasis_tau(value: int | None) -> None:

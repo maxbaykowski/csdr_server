@@ -157,7 +157,7 @@ Important settings:
   `900001` and `3200000` S/s
 - `rtl.rtl_gain` must be between `1.0` and `49.6` dB when AGC is off
 - `rtl.ppm_correction` must be between `-500` and `500`
-- `rtl.transition_bandwidth` must be between `0.005` and `0.05`
+- `rtl.transition_bandwidth` must be between `0.005` and `0.5`
 - `audio.audio_support` must be `true` or `false`
 - `audio.am.enabled`, `audio.lsb.enabled`, `audio.usb.enabled`, `audio.nfm.enabled`, and `audio.wfm.enabled` must be `true` or `false`
 - `audio.nfm.deemphasis_tau` must be `null` or between `32` and `530`
