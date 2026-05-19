@@ -16,6 +16,7 @@ import re
 import signal
 import socket
 import sys
+import uuid
 from decimal import Decimal, InvalidOperation
 
 EXIT_CONNECT_FAILED = 255
@@ -187,9 +188,14 @@ def main() -> int:
     _set_process_name("csdr_client")
     _install_signal_handlers()
     args = parse_args()
+    if args.port >= 65535:
+        print("error: stream port must be between 1 and 65534 so the control socket can use port+1", file=sys.stderr)
+        return EXIT_CONNECT_FAILED
+    stream_token = uuid.uuid4().hex
     request = {
         "frequency": args.frequency,
         "mode": args.mode,
+        "stream_token": stream_token,
     }
     if args.mode == "iq":
         if args.sample_rate is None:
@@ -205,7 +211,7 @@ def main() -> int:
         request["modulation"] = normalize_audio_modulation(args.modulation)
 
     try:
-        sock = socket.create_connection((args.address, args.port), timeout=30.0)
+        stream_sock = socket.create_connection((args.address, args.port), timeout=30.0)
     except socket.timeout:
         print(
             f"error: timed out after 30 seconds connecting to {args.address}:{args.port}",
@@ -225,12 +231,44 @@ def main() -> int:
         )
         return EXIT_CONNECT_FAILED
 
-    with sock:
-        _active_socket = sock
+    try:
+        stream_sock.sendall(stream_token.encode("utf-8") + b"\n")
+    except OSError as exc:
+        stream_sock.close()
+        print(f"error: could not initialize stream socket: {exc}", file=sys.stderr)
+        return EXIT_CONNECT_FAILED
+
+    control_port = args.port + 1
+    try:
+        control_sock = socket.create_connection((args.address, control_port), timeout=30.0)
+    except socket.timeout:
+        stream_sock.close()
+        print(
+            f"error: timed out after 30 seconds connecting to {args.address}:{control_port}",
+            file=sys.stderr,
+        )
+        return EXIT_CONNECT_FAILED
+    except ConnectionRefusedError:
+        stream_sock.close()
+        print(
+            f"error: connection refused by {args.address}:{control_port}",
+            file=sys.stderr,
+        )
+        return EXIT_CONNECT_FAILED
+    except OSError as exc:
+        stream_sock.close()
+        print(
+            f"error: could not connect to {args.address}:{control_port}: {exc}",
+            file=sys.stderr,
+        )
+        return EXIT_CONNECT_FAILED
+
+    with stream_sock, control_sock:
+        _active_socket = stream_sock
         try:
-            sock.sendall(json.dumps(request).encode("utf-8") + b"\n")
-            sock_file = sock.makefile("rb")
-            handshake_line = sock_file.readline(16_384)
+            control_sock.sendall(json.dumps(request).encode("utf-8") + b"\n")
+            control_file = control_sock.makefile("rb")
+            handshake_line = control_file.readline(16_384)
             if _shutdown_requested:
                 return SHUTDOWN_SIGNAL_EXIT
             if not handshake_line:
@@ -244,7 +282,8 @@ def main() -> int:
             for warning in handshake.get("warnings", []):
                 print(f"warning: {warning}", file=sys.stderr)
 
-            sock.settimeout(None)
+            stream_sock.settimeout(None)
+            sock_file = stream_sock.makefile("rb")
             while True:
                 chunk = sock_file.read1(65_536)
                 if not chunk:

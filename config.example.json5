@@ -27,7 +27,7 @@
 
     /*
     The alias filter when decimating IQ data.
-    It should be between 0.005 and 0.05
+    It should be between 0.005 and 0.5
     Larger values will save some CPU, but will cause more aliasing on the sides of the passband.
     Smaller values will result in a longer alias filter, which helps to reject frequencies outside the passband.
     This alias filter is only used for raw IQ mode, audio demodulators have their own hardcoded values.
@@ -66,6 +66,15 @@
       Set to null to disable NFM deemphasis entirely.
       */
       deemphasis_tau: 300,
+
+      /*
+      Optional post-deemphasis audio lowpass frequency in Hz.
+      Set to null to disable the lowpass stage entirely.
+      */
+      lowpass_frequency: 3200,
+
+      // Lowpass filter curve/steepness.
+      lowpass_curve: 0.5,
     },
 
     wfm: {

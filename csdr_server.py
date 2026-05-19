@@ -19,12 +19,14 @@ import logging
 import os
 import queue
 import re
+import select
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -83,6 +85,8 @@ class ServerConfig:
     usb_enabled: bool = True
     nfm_enabled: bool = True
     nfm_deemphasis_tau: int | None = NFM_AUDIO_DEEMPHASIS_TAU
+    nfm_lowpass_frequency: int | None = 3200
+    nfm_lowpass_curve: float = 0.5
     wfm_enabled: bool = True
     enable_wfm_stereo: bool = False
     wfm_deemphasis_region: str = WFM_DEEMPHASIS_REGION
@@ -164,6 +168,32 @@ class ServerConfig:
                 )
                 if audio_support and nfm_enabled
                 else NFM_AUDIO_DEEMPHASIS_TAU
+            ),
+            nfm_lowpass_frequency=(
+                _optional_int(
+                    _config_value(
+                        audio_settings,
+                        nfm_settings,
+                        "lowpass_frequency",
+                        3200,
+                    ),
+                    "audio.nfm.lowpass_frequency",
+                )
+                if audio_support and nfm_enabled
+                else 3200
+            ),
+            nfm_lowpass_curve=(
+                _parse_float(
+                    _config_value(
+                        audio_settings,
+                        nfm_settings,
+                        "lowpass_curve",
+                        0.5,
+                    ),
+                    "audio.nfm.lowpass_curve",
+                )
+                if audio_support and nfm_enabled
+                else 0.5
             ),
             wfm_enabled=wfm_enabled,
             enable_wfm_stereo=_parse_bool(
@@ -257,6 +287,13 @@ class UsbDeviceInfo:
     product_id: str
     serial: str | None
     description: str
+
+
+@dataclass
+class PendingStreamConnection:
+    conn: socket.socket
+    address: tuple[str, int]
+    created_at: float
 
 
 def _optional_string(value: Any) -> str | None:
@@ -587,6 +624,8 @@ class CaptureManager:
             "center_frequency",
             "transition_bandwidth",
             "nfm_deemphasis_tau",
+            "nfm_lowpass_frequency",
+            "nfm_lowpass_curve",
             "wfm_deemphasis_region",
         }
         ignored_fields = [
@@ -621,7 +660,11 @@ class CaptureManager:
             next_config.transition_bandwidth != current_config.transition_bandwidth
         )
         rebuild_audio_modulations: set[str] = set()
-        if next_config.nfm_deemphasis_tau != current_config.nfm_deemphasis_tau:
+        if (
+            next_config.nfm_deemphasis_tau != current_config.nfm_deemphasis_tau
+            or next_config.nfm_lowpass_frequency != current_config.nfm_lowpass_frequency
+            or next_config.nfm_lowpass_curve != current_config.nfm_lowpass_curve
+        ):
             rebuild_audio_modulations.add("nfm")
         if next_config.wfm_deemphasis_region != current_config.wfm_deemphasis_region:
             rebuild_audio_modulations.add("wfm")
@@ -1947,6 +1990,25 @@ def _build_audio_stream(
                 close_when_unused=True,
             )
             nfm_parent = deemphasis_stream
+        lowpass_stream: SharedStream | None = None
+        if config.nfm_lowpass_frequency is not None:
+            lowpass_cutoff = config.nfm_lowpass_frequency / float(_get_audio_output_rate(modulation))
+            lowpass_stream = SharedStream(
+                config=config,
+                name=f"audio-{modulation}-{frequency}-lowpass",
+                command=[
+                    "csdr",
+                    "lowpass",
+                    "--format",
+                    "float",
+                    _format_csdr_float(lowpass_cutoff),
+                    _format_csdr_float(config.nfm_lowpass_curve),
+                ],
+                manager=manager,
+                parent=nfm_parent,
+                close_when_unused=True,
+            )
+            nfm_parent = lowpass_stream
         dcblock_stream = SharedStream(
             config=config,
             name=f"audio-{modulation}-{frequency}-dcblock",
@@ -1970,6 +2032,9 @@ def _build_audio_stream(
             if deemphasis_stream is not None:
                 deemphasis_stream.start()
                 started_streams.append(deemphasis_stream)
+            if lowpass_stream is not None:
+                lowpass_stream.start()
+                started_streams.append(lowpass_stream)
             dcblock_stream.start()
             started_streams.append(dcblock_stream)
             output_stream.start()
@@ -2222,6 +2287,9 @@ def _validate_config(config: ServerConfig) -> None:
         return
     if config.nfm_enabled:
         _validate_nfm_deemphasis_tau(config.nfm_deemphasis_tau)
+        _validate_nfm_lowpass_frequency(config.nfm_lowpass_frequency)
+        if config.nfm_lowpass_frequency is not None:
+            _validate_nfm_lowpass_curve(config.nfm_lowpass_curve)
     if config.wfm_enabled:
         _validate_wfm_deemphasis_region(config.wfm_deemphasis_region)
 
@@ -2286,6 +2354,18 @@ def _validate_nfm_deemphasis_tau(value: int | None) -> None:
         raise ValueError("audio.nfm.deemphasis_tau must be null or between 32 and 530")
 
 
+def _validate_nfm_lowpass_frequency(value: int | None) -> None:
+    if value is None:
+        return
+    if not (3000 <= value <= 8000):
+        raise ValueError("audio.nfm.lowpass_frequency must be null or between 3000 and 8000")
+
+
+def _validate_nfm_lowpass_curve(value: float) -> None:
+    if not (0.005 <= value <= 0.5):
+        raise ValueError("audio.nfm.lowpass_curve must be between 0.005 and 0.5")
+
+
 def _validate_enable_wfm_stereo(value: bool) -> None:
     if not isinstance(value, bool):
         raise ValueError("audio.wfm.stereo_support must be true or false")
@@ -2311,8 +2391,8 @@ def _validate_listen_host(value: str) -> None:
 
 
 def _validate_listen_port(value: int) -> None:
-    if value <= 0 or value > 65535:
-        raise ValueError("listen_port must be between 1 and 65535")
+    if value <= 0 or value >= 65535:
+        raise ValueError("listen_port must be between 1 and 65534 so the control socket can use port+1")
 
 
 def _validate_read_chunk_size(value: int) -> None:
@@ -2369,6 +2449,11 @@ def parse_client_request(conn: socket.socket) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise RequestValidationError(EXIT_REQUEST_ERROR, f"invalid request json: {exc}") from exc
     warnings: list[str] = []
+    if "stream_token" not in request:
+        raise RequestValidationError(EXIT_REQUEST_ERROR, "request must include stream_token")
+    request["stream_token"] = str(request["stream_token"]).strip()
+    if not request["stream_token"]:
+        raise RequestValidationError(EXIT_REQUEST_ERROR, "stream_token must not be empty")
     if "frequency" not in request:
         raise RequestValidationError(EXIT_REQUEST_ERROR, "request must include frequency")
     request["mode"] = _normalize_mode(request.get("mode", DEFAULT_MODE))
@@ -2406,12 +2491,27 @@ def send_handshake(conn: socket.socket, payload: dict[str, Any]) -> None:
     conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
 
 
+def parse_stream_token(conn: socket.socket) -> str:
+    conn.settimeout(10.0)
+    reader = conn.makefile("rb")
+    line = reader.readline(256)
+    if not line:
+        raise RequestValidationError(EXIT_REQUEST_ERROR, "stream socket did not send a stream token")
+    token = line.decode("utf-8", errors="replace").strip()
+    if not token:
+        raise RequestValidationError(EXIT_REQUEST_ERROR, "stream token must not be empty")
+    conn.settimeout(None)
+    return token
+
+
 def serve(config_path: Path, config: ServerConfig) -> int:
     capture = CaptureManager(config)
     capture.start()
 
     shutdown_event = threading.Event()
     reload_event = threading.Event()
+    pending_streams: dict[str, PendingStreamConnection] = {}
+    pending_stream_timeout_seconds = 30.0
 
     def _handle_signal(signum: int, _frame: Any) -> None:
         LOGGER.info("received signal %s, shutting down", signum)
@@ -2424,129 +2524,197 @@ def serve(config_path: Path, config: ServerConfig) -> int:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGHUP, _handle_reload)
+    stream_port = config.listen_port
+    control_port = config.listen_port + 1
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((config.listen_host, config.listen_port))
-        server.listen()
-        server.settimeout(1.0)
+    def _cleanup_expired_pending_streams() -> None:
+        now = time.time()
+        expired_tokens = [
+            token
+            for token, pending in pending_streams.items()
+            if now - pending.created_at > pending_stream_timeout_seconds
+        ]
+        for token in expired_tokens:
+            pending = pending_streams.pop(token)
+            try:
+                pending.conn.close()
+            except OSError:
+                pass
+            LOGGER.info(
+                "dropped pending stream connection %s:%s after timeout",
+                pending.address[0],
+                pending.address[1],
+            )
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as stream_server, socket.socket(socket.AF_INET, socket.SOCK_STREAM) as control_server:
+        stream_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        control_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        stream_server.bind((config.listen_host, stream_port))
+        control_server.bind((config.listen_host, control_port))
+        stream_server.listen()
+        control_server.listen()
         LOGGER.info(
-            "listening on %s:%s, center_frequency=%s rtl_sample_rate=%s",
+            "listening on stream %s:%s and control %s:%s, center_frequency=%s rtl_sample_rate=%s",
             config.listen_host,
-            config.listen_port,
+            stream_port,
+            config.listen_host,
+            control_port,
             config.center_frequency,
             config.rtl_sample_rate,
         )
 
         try:
             while not shutdown_event.is_set() and not capture.stop_event.is_set():
+                _cleanup_expired_pending_streams()
                 if reload_event.is_set():
                     reload_event.clear()
                     try:
                         capture.reload_config(config_path)
                     except Exception:
                         LOGGER.exception("config reload failed")
-                try:
-                    conn, address = server.accept()
-                except socket.timeout:
-                    continue
-
-                try:
-                    request = parse_client_request(conn)
-                    frequency = int(request["frequency"])
-                    mode = request["mode"]
-                    output_rate = None
-                    if mode == "iq":
-                        output_rate = int(request.get("sample_rate", request.get("bandwidth")))
+                ready_sockets, _, _ = select.select([stream_server, control_server], [], [], 1.0)
+                for ready_socket in ready_sockets:
+                    if ready_socket is stream_server:
+                        conn, address = stream_server.accept()
+                        try:
+                            token = parse_stream_token(conn)
+                            if token in pending_streams:
+                                previous = pending_streams.pop(token)
+                                try:
+                                    previous.conn.close()
+                                except OSError:
+                                    pass
+                            pending_streams[token] = PendingStreamConnection(
+                                conn=conn,
+                                address=address,
+                                created_at=time.time(),
+                            )
+                        except Exception:
+                            conn.close()
                     else:
-                        output_rate = _get_audio_output_rate(request["modulation"])
-                    sample_format = request["format"]
-                    modulation = request["modulation"]
-                    request_warnings = request["warnings"]
-                    capture.prepare_request(
-                        frequency,
-                        mode,
-                        output_rate,
-                        modulation,
-                    )
-                    source_stream = capture.get_output_stream(
-                        frequency,
-                        mode,
-                        output_rate,
-                        sample_format,
-                        modulation,
-                    )
-                    session = ClientSession(
-                        conn=conn,
-                        address=address,
-                        manager=capture,
-                        config=capture.config,
-                        source_stream=source_stream,
-                        frequency=frequency,
-                        mode=mode,
-                        output_rate=output_rate,
-                        sample_format=sample_format,
-                        modulation=modulation,
-                    )
-                    capture.register_client(session)
-                    session.start()
-                    handshake = {"status": "ok", "mode": mode}
-                    if mode == "iq":
-                        handshake["format"] = sample_format
-                    else:
-                        handshake["format"] = DEFAULT_AUDIO_OUTPUT_FORMAT
-                        handshake["modulation"] = modulation
-                        handshake["sample_rate"] = _get_audio_output_rate(modulation)
-                    if request_warnings:
-                        handshake["warnings"] = request_warnings
-                        for warning in request_warnings:
+                        conn, address = control_server.accept()
+                        pending: PendingStreamConnection | None = None
+                        try:
+                            request = parse_client_request(conn)
+                            token = request["stream_token"]
+                            pending = pending_streams.pop(token, None)
+                            if pending is None:
+                                raise RequestValidationError(
+                                    EXIT_REQUEST_ERROR,
+                                    "no matching stream socket is connected for this request",
+                                )
+                            frequency = int(request["frequency"])
+                            mode = request["mode"]
+                            output_rate = None
+                            if mode == "iq":
+                                output_rate = int(request.get("sample_rate", request.get("bandwidth")))
+                            else:
+                                output_rate = _get_audio_output_rate(request["modulation"])
+                            sample_format = request["format"]
+                            modulation = request["modulation"]
+                            request_warnings = request["warnings"]
+                            capture.prepare_request(
+                                frequency,
+                                mode,
+                                output_rate,
+                                modulation,
+                            )
+                            source_stream = capture.get_output_stream(
+                                frequency,
+                                mode,
+                                output_rate,
+                                sample_format,
+                                modulation,
+                            )
+                            session = ClientSession(
+                                conn=pending.conn,
+                                address=pending.address,
+                                manager=capture,
+                                config=capture.config,
+                                source_stream=source_stream,
+                                frequency=frequency,
+                                mode=mode,
+                                output_rate=output_rate,
+                                sample_format=sample_format,
+                                modulation=modulation,
+                            )
+                            capture.register_client(session)
+                            session.start()
+                            handshake = {"status": "ok", "mode": mode}
+                            if mode == "iq":
+                                handshake["format"] = sample_format
+                            else:
+                                handshake["format"] = DEFAULT_AUDIO_OUTPUT_FORMAT
+                                handshake["modulation"] = modulation
+                                handshake["sample_rate"] = _get_audio_output_rate(modulation)
+                            if request_warnings:
+                                handshake["warnings"] = request_warnings
+                                for warning in request_warnings:
+                                    LOGGER.warning(
+                                        "client %s:%s: %s",
+                                        address[0],
+                                        address[1],
+                                        warning,
+                                    )
+                            send_handshake(conn, handshake)
+                            session.activate()
+                        except RequestValidationError as exc:
                             LOGGER.warning(
-                                "client %s:%s: %s",
+                                "rejecting control client %s:%s: %s",
                                 address[0],
                                 address[1],
-                                warning,
+                                exc,
                             )
-                    send_handshake(conn, handshake)
-                    session.activate()
-                except RequestValidationError as exc:
-                    LOGGER.warning(
-                        "rejecting client %s:%s: %s",
-                        address[0],
-                        address[1],
-                        exc,
-                    )
-                    try:
-                        send_handshake(
-                            conn,
-                            {
-                                "status": "error",
-                                "code": exc.code,
-                                "error": exc.message,
-                            },
-                        )
-                    except OSError:
-                        pass
-                    conn.close()
-                except Exception as exc:
-                    LOGGER.warning(
-                        "rejecting client %s:%s: %s",
-                        address[0],
-                        address[1],
-                        exc,
-                    )
-                    try:
-                        send_handshake(
-                            conn,
-                            {
-                                "status": "error",
-                                "code": EXIT_REQUEST_ERROR,
-                                "error": str(exc),
-                            },
-                        )
-                    except OSError:
-                        pass
-                    conn.close()
+                            if pending is not None:
+                                try:
+                                    pending.conn.close()
+                                except OSError:
+                                    pass
+                            try:
+                                send_handshake(
+                                    conn,
+                                    {
+                                        "status": "error",
+                                        "code": exc.code,
+                                        "error": exc.message,
+                                    },
+                                )
+                            except OSError:
+                                pass
+                        except Exception as exc:
+                            LOGGER.warning(
+                                "rejecting control client %s:%s: %s",
+                                address[0],
+                                address[1],
+                                exc,
+                            )
+                            if pending is not None:
+                                try:
+                                    pending.conn.close()
+                                except OSError:
+                                    pass
+                            try:
+                                send_handshake(
+                                    conn,
+                                    {
+                                        "status": "error",
+                                        "code": EXIT_REQUEST_ERROR,
+                                        "error": str(exc),
+                                    },
+                                )
+                            except OSError:
+                                pass
+                        finally:
+                            try:
+                                conn.close()
+                            except OSError:
+                                pass
         finally:
+            for pending in pending_streams.values():
+                try:
+                    pending.conn.close()
+                except OSError:
+                    pass
             capture.stop()
 
     if capture.fatal_error is not None:

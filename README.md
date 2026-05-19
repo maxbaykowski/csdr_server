@@ -146,6 +146,10 @@ Important settings:
   - enables or disables NFM support
 - `audio.nfm.deemphasis_tau`
   - NFM deemphasis time constant in microseconds, or `null` to disable NFM deemphasis
+- `audio.nfm.lowpass_frequency`
+  - optional post-deemphasis NFM audio lowpass frequency in Hz, or `null` to disable the lowpass stage
+- `audio.nfm.lowpass_curve`
+  - NFM audio lowpass filter curve/steepness
 - `audio.wfm.enabled`
   - enables or disables WFM support
 - `audio.wfm.stereo_support`
@@ -155,7 +159,8 @@ Important settings:
 - `server.listen_host`
   - address to bind the TCP listener
 - `server.listen_port`
-  - TCP port for client connections
+  - TCP port for stream connections
+  - the control socket uses `server.listen_port + 1`
 
 ### Config Limits
 
@@ -168,6 +173,8 @@ Important settings:
 - `audio.audio_support` must be `true` or `false`
 - `audio.am.enabled`, `audio.lsb.enabled`, `audio.usb.enabled`, `audio.nfm.enabled`, and `audio.wfm.enabled` must be `true` or `false`
 - `audio.nfm.deemphasis_tau` must be `null` or between `32` and `530`
+- `audio.nfm.lowpass_frequency` must be `null` or between `3000` and `8000`
+- `audio.nfm.lowpass_curve` must be between `0.005` and `0.5` when `audio.nfm.lowpass_frequency` is set
 - `audio.wfm.stereo_support` must be `true` or `false`
 - `audio.wfm.deemphasis_region` must be either `us` or `europe`
 
@@ -213,6 +220,10 @@ What live reload does:
   - rebuilds decimation stages
 - `audio.nfm.deemphasis_tau`
   - rebuilds active audio demodulation stages so NFM clients pick up the new deemphasis value
+- `audio.nfm.lowpass_frequency`
+  - rebuilds active NFM audio stages so clients pick up the new lowpass setting
+- `audio.nfm.lowpass_curve`
+  - rebuilds active NFM audio stages so clients pick up the new lowpass curve
 - `audio.wfm.deemphasis_region`
   - rebuilds active WFM audio stages so clients pick up the new deemphasis curve
 
@@ -308,6 +319,15 @@ The NFM deemphasis time constant comes from `audio.nfm.deemphasis_tau` in the
 server config. The default is `300`. If it is set to `null`, the deemphasis
 stage is omitted entirely.
 
+If `audio.nfm.lowpass_frequency` is set, the server inserts:
+
+- `lowpass --format float <cutoff_rate> <curve>`
+
+after the NFM deemphasis stage. The cutoff rate is computed as
+`lowpass_frequency / 16000`. The default lowpass frequency is `3200` and the
+default `audio.nfm.lowpass_curve` is `0.5`. If `audio.nfm.lowpass_frequency`
+is `null`, the lowpass stage is omitted entirely.
+
 WFM audio uses a wider demodulation path and a 32 kHz final audio rate:
 
 - shift to the requested frequency
@@ -391,21 +411,27 @@ This section is only needed if you want to write your own client.
 ### Transport
 
 - TCP
-- one request per connection
-- UTF-8 JSON request line terminated by `\n`
-- UTF-8 JSON handshake line terminated by `\n`
-- raw binary stream after a successful handshake
+- one stream connection plus one control connection per request
+- stream socket on `server.listen_port`
+- control socket on `server.listen_port + 1`
+- client sends a `stream_token` line on the stream socket
+- client sends one UTF-8 JSON request line on the control socket
+- server sends one UTF-8 JSON handshake line on the control socket
+- raw binary stream is sent on the stream socket after a successful control handshake
 
 ### Request
 
 A client sends one JSON line:
 
 ```json
-{"frequency": 162475000, "sample_rate": 16000, "format": "s16"}
+{"stream_token": "abc123", "frequency": 162475000, "sample_rate": 16000, "format": "s16"}
 ```
 
 Request fields:
 
+- `stream_token`
+  - required
+  - opaque string used to pair the control request with the already-open stream socket
 - `frequency`
   - required
   - integer Hz
@@ -429,29 +455,29 @@ Request fields:
 IQ request example:
 
 ```json
-{"frequency": 162475000, "mode": "iq", "sample_rate": 16000, "format": "s16"}
+{"stream_token": "abc123", "frequency": 162475000, "mode": "iq", "sample_rate": 16000, "format": "s16"}
 ```
 
 Audio request example:
 
 ```json
-{"frequency": 1000000, "mode": "audio", "modulation": "am"}
+{"stream_token": "abc123", "frequency": 1000000, "mode": "audio", "modulation": "am"}
 ```
 
 ```json
-{"frequency": 7200000, "mode": "audio", "modulation": "usb"}
+{"stream_token": "abc123", "frequency": 7200000, "mode": "audio", "modulation": "usb"}
 ```
 
 ```json
-{"frequency": 162550000, "mode": "audio", "modulation": "nfm"}
+{"stream_token": "abc123", "frequency": 162550000, "mode": "audio", "modulation": "nfm"}
 ```
 
 ```json
-{"frequency": 101100000, "mode": "audio", "modulation": "wfm"}
+{"stream_token": "abc123", "frequency": 101100000, "mode": "audio", "modulation": "wfm"}
 ```
 
 ```json
-{"frequency": 101100000, "mode": "audio", "modulation": "wfm_stereo"}
+{"stream_token": "abc123", "frequency": 101100000, "mode": "audio", "modulation": "wfm_stereo"}
 ```
 
 ### Handshake
