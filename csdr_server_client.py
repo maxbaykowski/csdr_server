@@ -28,7 +28,7 @@ PR_SET_NAME = 15
 DEFAULT_MODE = "iq"
 VALID_MODES = (DEFAULT_MODE, "audio")
 DEFAULT_MODULATION = "am"
-VALID_AUDIO_MODULATIONS = (DEFAULT_MODULATION, "lsb", "nfm", "usb", "wfm")
+VALID_AUDIO_MODULATIONS = (DEFAULT_MODULATION, "lsb", "nfm", "usb", "wfm", "wfm-stereo")
 DEFAULT_SAMPLE_FORMAT = "f32"
 VALID_SAMPLE_FORMATS = (DEFAULT_SAMPLE_FORMAT, "s16")
 
@@ -142,6 +142,10 @@ def parse_sample_rate(value: str) -> int:
     return parse_scaled_integer(value, "sample rate")
 
 
+def normalize_audio_modulation(value: str) -> str:
+    return value.strip().lower().replace("-", "_")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal client for csdr_server.py")
     parser.add_argument("-a", "--address", required=True, help="Server IP address or hostname")
@@ -198,7 +202,7 @@ def main() -> int:
             request["sample_rate"] = args.sample_rate
         if _option_was_provided(("-F", "--format")):
             request["format"] = args.format
-        request["modulation"] = args.modulation
+        request["modulation"] = normalize_audio_modulation(args.modulation)
 
     try:
         sock = socket.create_connection((args.address, args.port), timeout=30.0)

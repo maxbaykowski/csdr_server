@@ -1,21 +1,42 @@
 {
-  "rtl_device_index": 0,
-  "rtl_serial": "00000001",
-  "center_frequency": 162475000,
-  "rtl_sample_rate": 2400000,
-  "automatic_gain_control": false,
-  "rtl_gain": 35.0,
-  "ppm_correction": 0,
-  "transition_bandwidth": 0.005,
-  "audio": {
-    "nfm_deemphasis_tau": 300,
-    "wfm_deemphasis_region": "us"
+  "rtl": {
+    "rtl_device_index": 0,
+    "rtl_serial": "00000001",
+    "center_frequency": 162475000,
+    "rtl_sample_rate": 2400000,
+    "automatic_gain_control": false,
+    "rtl_gain": 35.0,
+    "ppm_correction": 0,
+    "transition_bandwidth": 0.005
   },
-  "listen_host": "0.0.0.0",
-  "listen_port": 7355,
-  "read_chunk_size": 262144,
-  "rtl_read_timeout_seconds": 2.0,
-  "stream_queue_chunks": 64,
-  "client_queue_chunks": 64,
-  "enqueue_timeout_seconds": 0.25
+  "audio": {
+    "audio_support": true,
+    "am": {
+      "enabled": true
+    },
+    "lsb": {
+      "enabled": true
+    },
+    "usb": {
+      "enabled": true
+    },
+    "nfm": {
+      "enabled": true,
+      "deemphasis_tau": 300
+    },
+    "wfm": {
+      "enabled": true,
+      "deemphasis_region": "us",
+      "stereo_support": false
+    }
+  },
+  "server": {
+    "listen_host": "0.0.0.0",
+    "listen_port": 7355,
+    "read_chunk_size": 262144,
+    "rtl_read_timeout_seconds": 2.0,
+    "stream_queue_chunks": 64,
+    "client_queue_chunks": 64,
+    "enqueue_timeout_seconds": 0.25
+  }
 }

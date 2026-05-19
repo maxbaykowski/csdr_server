@@ -50,7 +50,7 @@ PR_SET_NAME = 15
 DEFAULT_MODE = "iq"
 VALID_MODES = {DEFAULT_MODE, "audio"}
 DEFAULT_MODULATION = "am"
-VALID_AUDIO_MODULATIONS = {DEFAULT_MODULATION, "lsb", "nfm", "usb", "wfm"}
+VALID_AUDIO_MODULATIONS = {DEFAULT_MODULATION, "lsb", "nfm", "usb", "wfm", "wfm_stereo"}
 DEFAULT_SAMPLE_FORMAT = "f32"
 VALID_SAMPLE_FORMATS = {DEFAULT_SAMPLE_FORMAT, "s16"}
 DEFAULT_STREAM_OUTPUT_READ_SIZE = 65_536
@@ -75,7 +75,14 @@ class ServerConfig:
     rtl_gain: float | None = None
     ppm_correction: int = 0
     transition_bandwidth: float = 0.05
-    nfm_deemphasis_tau: int = NFM_AUDIO_DEEMPHASIS_TAU
+    audio_support: bool = True
+    am_enabled: bool = True
+    lsb_enabled: bool = True
+    usb_enabled: bool = True
+    nfm_enabled: bool = True
+    nfm_deemphasis_tau: int | None = NFM_AUDIO_DEEMPHASIS_TAU
+    wfm_enabled: bool = True
+    enable_wfm_stereo: bool = False
     wfm_deemphasis_region: str = WFM_DEEMPHASIS_REGION
     listen_host: str = "0.0.0.0"
     listen_port: int = 7355
@@ -88,54 +95,119 @@ class ServerConfig:
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "ServerConfig":
         data = dict(raw)
-        audio_settings = data.get("audio", {})
-        if audio_settings is None:
-            audio_settings = {}
-        if not isinstance(audio_settings, dict):
-            raise ValueError("audio must be an object")
+        rtl_settings = _get_config_section(data, "rtl")
+        server_settings = _get_config_section(data, "server")
+        audio_settings = _get_config_section(data, "audio")
+        am_settings = _get_config_section(audio_settings, "am")
+        lsb_settings = _get_config_section(audio_settings, "lsb")
+        usb_settings = _get_config_section(audio_settings, "usb")
+        nfm_settings = _get_config_section(audio_settings, "nfm")
+        wfm_settings = _get_config_section(audio_settings, "wfm")
+        audio_support = _parse_bool(
+            audio_settings.get("audio_support", True),
+            "audio.audio_support",
+        )
+        am_enabled = _parse_bool(am_settings.get("enabled", True), "audio.am.enabled")
+        lsb_enabled = _parse_bool(lsb_settings.get("enabled", True), "audio.lsb.enabled")
+        usb_enabled = _parse_bool(usb_settings.get("enabled", True), "audio.usb.enabled")
+        nfm_enabled = _parse_bool(nfm_settings.get("enabled", True), "audio.nfm.enabled")
+        wfm_enabled = _parse_bool(wfm_settings.get("enabled", True), "audio.wfm.enabled")
         config = cls(
-            rtl_device_index=_parse_int(data.get("rtl_device_index", 0), "rtl_device_index"),
-            rtl_serial=_optional_string(data.get("rtl_serial")),
-            center_frequency=_parse_int(data["center_frequency"], "center_frequency"),
-            rtl_sample_rate=_parse_int(data["rtl_sample_rate"], "rtl_sample_rate"),
+            rtl_device_index=_parse_int(
+                _config_value(data, rtl_settings, "rtl_device_index", 0),
+                "rtl.rtl_device_index",
+            ),
+            rtl_serial=_optional_string(
+                _config_value(data, rtl_settings, "rtl_serial")
+            ),
+            center_frequency=_parse_int(
+                _config_value(data, rtl_settings, "center_frequency"),
+                "rtl.center_frequency",
+            ),
+            rtl_sample_rate=_parse_int(
+                _config_value(data, rtl_settings, "rtl_sample_rate"),
+                "rtl.rtl_sample_rate",
+            ),
             automatic_gain_control=_parse_bool(
-                data.get("automatic_gain_control", False),
-                "automatic_gain_control",
+                _config_value(data, rtl_settings, "automatic_gain_control", False),
+                "rtl.automatic_gain_control",
             ),
-            rtl_gain=_optional_float(data.get("rtl_gain")),
-            ppm_correction=_parse_int(data.get("ppm_correction", 0), "ppm_correction"),
+            rtl_gain=_optional_float(_config_value(data, rtl_settings, "rtl_gain")),
+            ppm_correction=_parse_int(
+                _config_value(data, rtl_settings, "ppm_correction", 0),
+                "rtl.ppm_correction",
+            ),
             transition_bandwidth=_parse_float(
-                data["transition_bandwidth"],
-                "transition_bandwidth",
+                _config_value(data, rtl_settings, "transition_bandwidth"),
+                "rtl.transition_bandwidth",
             ),
-            nfm_deemphasis_tau=_parse_int(
-                audio_settings.get("nfm_deemphasis_tau", NFM_AUDIO_DEEMPHASIS_TAU),
-                "audio.nfm_deemphasis_tau",
+            audio_support=audio_support,
+            am_enabled=am_enabled,
+            lsb_enabled=lsb_enabled,
+            usb_enabled=usb_enabled,
+            nfm_enabled=nfm_enabled,
+            nfm_deemphasis_tau=(
+                _optional_int(
+                    _config_value(
+                        audio_settings,
+                        nfm_settings,
+                        "deemphasis_tau",
+                        audio_settings.get("nfm_deemphasis_tau", NFM_AUDIO_DEEMPHASIS_TAU),
+                    ),
+                    "audio.nfm.deemphasis_tau",
+                )
+                if audio_support and nfm_enabled
+                else NFM_AUDIO_DEEMPHASIS_TAU
             ),
-            wfm_deemphasis_region=_normalize_wfm_deemphasis_region(
-                audio_settings.get("wfm_deemphasis_region", WFM_DEEMPHASIS_REGION)
+            wfm_enabled=wfm_enabled,
+            enable_wfm_stereo=_parse_bool(
+                _config_value(
+                    audio_settings,
+                    wfm_settings,
+                    "stereo_support",
+                    audio_settings.get("enable_wfm_stereo", False),
+                ),
+                "audio.wfm.stereo_support",
             ),
-            listen_host=_parse_string(data.get("listen_host", "0.0.0.0"), "listen_host"),
-            listen_port=_parse_int(data.get("listen_port", 7355), "listen_port"),
+            wfm_deemphasis_region=(
+                _normalize_wfm_deemphasis_region(
+                    _config_value(
+                        audio_settings,
+                        wfm_settings,
+                        "deemphasis_region",
+                        audio_settings.get("wfm_deemphasis_region", WFM_DEEMPHASIS_REGION),
+                    )
+                )
+                if audio_support and wfm_enabled
+                else WFM_DEEMPHASIS_REGION
+            ),
+            listen_host=_parse_string(
+                _config_value(data, server_settings, "listen_host", "0.0.0.0"),
+                "server.listen_host",
+            ),
+            listen_port=_parse_int(
+                _config_value(data, server_settings, "listen_port", 7355),
+                "server.listen_port",
+            ),
             read_chunk_size=_parse_int(
-                data.get("read_chunk_size", 262_144),
-                "read_chunk_size",
+                _config_value(data, server_settings, "read_chunk_size", 262_144),
+                "server.read_chunk_size",
             ),
             rtl_read_timeout_seconds=_parse_float(
-                data.get("rtl_read_timeout_seconds", 2.0),
-                "rtl_read_timeout_seconds",
+                _config_value(data, server_settings, "rtl_read_timeout_seconds", 2.0),
+                "server.rtl_read_timeout_seconds",
             ),
             stream_queue_chunks=_parse_int(
-                data.get("stream_queue_chunks", 64),
-                "stream_queue_chunks",
+                _config_value(data, server_settings, "stream_queue_chunks", 64),
+                "server.stream_queue_chunks",
             ),
             client_queue_chunks=_parse_int(
-                data.get("client_queue_chunks", 64),
-                "client_queue_chunks",
+                _config_value(data, server_settings, "client_queue_chunks", 64),
+                "server.client_queue_chunks",
             ),
             enqueue_timeout_seconds=_parse_float(
-                data.get("enqueue_timeout_seconds", 0.25),
-                "enqueue_timeout_seconds",
+                _config_value(data, server_settings, "enqueue_timeout_seconds", 0.25),
+                "server.enqueue_timeout_seconds",
             ),
         )
         _validate_config(config)
@@ -196,6 +268,15 @@ def _optional_float(value: Any) -> float | None:
         raise ValueError(f"invalid rtl_gain: {value!r}") from exc
 
 
+def _optional_int(value: Any, name: str) -> int | None:
+    if value in (None, "", "null"):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid {name}: {value!r}") from exc
+
+
 def _parse_int(value: Any, name: str) -> int:
     try:
         return int(value)
@@ -226,7 +307,29 @@ def _parse_bool(value: Any, name: str) -> bool:
 
 
 def _normalize_wfm_deemphasis_region(value: Any) -> str:
-    return _parse_string(value, "audio.wfm_deemphasis_region").strip().lower()
+    return _parse_string(value, "audio.wfm.deemphasis_region").strip().lower()
+
+
+def _get_config_section(data: dict[str, Any], name: str) -> dict[str, Any]:
+    section = data.get(name, {})
+    if section is None:
+        return {}
+    if not isinstance(section, dict):
+        raise ValueError(f"{name} must be an object")
+    return section
+
+
+def _config_value(
+    root: dict[str, Any],
+    section: dict[str, Any],
+    key: str,
+    default: Any = None,
+) -> Any:
+    if key in section:
+        return section[key]
+    if key in root:
+        return root[key]
+    return default
 
 
 def _read_sysfs_text(path: Path) -> str | None:
@@ -439,6 +542,7 @@ class CaptureManager:
             rebuild_audio_modulations.add("nfm")
         if next_config.wfm_deemphasis_region != current_config.wfm_deemphasis_region:
             rebuild_audio_modulations.add("wfm")
+            rebuild_audio_modulations.add("wfm_stereo")
 
         client_requests = self._snapshot_client_requests()
         if center_or_rate_changed:
@@ -1087,8 +1191,10 @@ class StreamGraph:
             )
             root.start()
             self.root_stream = root
+            LOGGER.debug("created shared root stream convert")
         else:
             root.config = self.config
+            LOGGER.debug("reusing shared root stream convert")
 
         shift_stream = self.shift_streams.get(frequency)
         if shift_stream is None:
@@ -1107,8 +1213,14 @@ class StreamGraph:
             )
             shift_stream.start()
             self.shift_streams[frequency] = shift_stream
+            LOGGER.debug(
+                "created shared shift stream for frequency=%s shift_rate=%s",
+                frequency,
+                shift_rate,
+            )
         else:
             shift_stream.config = self.config
+            LOGGER.debug("reusing shared shift stream for frequency=%s", frequency)
 
         if mode == "iq":
             assert output_rate is not None
@@ -1136,12 +1248,25 @@ class StreamGraph:
                 )
                 format_stream.start()
                 self.format_streams[format_key] = format_stream
+                LOGGER.debug(
+                    "created shared IQ format stream frequency=%s output_rate=%s format=%s",
+                    frequency,
+                    output_rate,
+                    sample_format,
+                )
             else:
                 format_stream.config = self.config
+                LOGGER.debug(
+                    "reusing shared IQ format stream frequency=%s output_rate=%s format=%s",
+                    frequency,
+                    output_rate,
+                    sample_format,
+                )
             return format_stream
 
         assert modulation is not None
         _validate_audio_modulation(modulation)
+        _validate_audio_modulation_supported(self.config, modulation)
         audio_iq_rate = _get_audio_iq_rate(modulation)
         audio_transition_bandwidth = _get_audio_transition_bandwidth(modulation)
         base_stream = self._get_decimation_stream_locked(
@@ -1158,12 +1283,49 @@ class StreamGraph:
                 frequency=frequency,
                 modulation=modulation,
                 manager=self,
-                parent=base_stream,
+                parent=self._get_audio_demod_parent_locked(frequency, modulation, base_stream),
             )
             self.audio_streams[audio_key] = audio_stream
+            LOGGER.debug(
+                "created shared audio stream frequency=%s modulation=%s",
+                frequency,
+                modulation,
+            )
         else:
             audio_stream.config = self.config
+            LOGGER.debug(
+                "reusing shared audio stream frequency=%s modulation=%s",
+                frequency,
+                modulation,
+            )
         return audio_stream
+
+    def _get_audio_demod_parent_locked(
+        self,
+        frequency: int,
+        modulation: str,
+        parent: SharedStream,
+    ) -> SharedStream:
+        if modulation not in {"wfm", "wfm_stereo"}:
+            return parent
+        demod_key = (frequency, "wfm_shared_fmdemod")
+        demod_stream = self.audio_streams.get(demod_key)
+        if demod_stream is None:
+            demod_stream = SharedStream(
+                config=self.config,
+                name=f"audio-wfm-{frequency}-fmdemod",
+                command=["csdr", "fmdemod"],
+                manager=self,
+                parent=parent,
+                close_when_unused=True,
+            )
+            demod_stream.start()
+            self.audio_streams[demod_key] = demod_stream
+            LOGGER.debug("created shared WFM demod stream for frequency=%s", frequency)
+        else:
+            demod_stream.config = self.config
+            LOGGER.debug("reusing shared WFM demod stream for frequency=%s", frequency)
+        return demod_stream
 
     def _get_decimation_stream_locked(
         self,
@@ -1198,6 +1360,13 @@ class StreamGraph:
                     close_when_unused=True,
                 )
                 decimation_stream.start()
+                LOGGER.debug(
+                    "created shared integer decimation stream frequency=%s output_rate=%s transition_bandwidth=%s decimation=%s",
+                    frequency,
+                    output_rate,
+                    transition_bandwidth,
+                    decimation,
+                )
             else:
                 decimation_ratio = _compute_fractional_decimation_ratio(
                     self.config.rtl_sample_rate,
@@ -1221,9 +1390,23 @@ class StreamGraph:
                     close_when_unused=True,
                 )
                 decimation_stream.start()
+                LOGGER.debug(
+                    "created shared fractional decimation stream frequency=%s output_rate=%s transition_bandwidth=%s decimation_ratio=%s",
+                    frequency,
+                    output_rate,
+                    transition_bandwidth,
+                    decimation_ratio,
+                )
             self.decimation_streams[key] = decimation_stream
         else:
             decimation_stream.config = self.config
+            LOGGER.debug(
+                "reusing shared %s decimation stream frequency=%s output_rate=%s transition_bandwidth=%s",
+                strategy,
+                frequency,
+                output_rate,
+                transition_bandwidth,
+            )
         return decimation_stream
 
     def on_stream_closed(self, stream: SharedStream) -> None:
@@ -1406,7 +1589,7 @@ def _normalize_mode(value: Any) -> str:
 
 
 def _normalize_audio_modulation(value: Any) -> str:
-    return str(value).strip().lower()
+    return str(value).strip().lower().replace("-", "_")
 
 
 def _validate_mode(mode: str) -> None:
@@ -1436,21 +1619,59 @@ def _validate_audio_modulation(modulation: str) -> None:
 
 
 def _get_audio_output_rate(modulation: str) -> int:
-    if modulation == "wfm":
+    if modulation in {"wfm", "wfm_stereo"}:
         return WFM_AUDIO_OUTPUT_RATE
     return AM_AUDIO_OUTPUT_RATE
 
 
 def _get_audio_iq_rate(modulation: str) -> int:
-    if modulation == "wfm":
+    if modulation in {"wfm", "wfm_stereo"}:
         return WFM_IQ_RATE
     return AM_AUDIO_OUTPUT_RATE
 
 
 def _get_audio_transition_bandwidth(modulation: str) -> float:
-    if modulation == "wfm":
+    if modulation in {"wfm", "wfm_stereo"}:
         return WFM_AUDIO_TRANSITION_BANDWIDTH
     return AM_AUDIO_TRANSITION_BANDWIDTH
+
+
+def _validate_audio_modulation_supported(config: ServerConfig, modulation: str) -> None:
+    if not config.audio_support:
+        raise RequestValidationError(
+            EXIT_REQUEST_ERROR,
+            "Audio mode is disabled on this server",
+        )
+    if modulation == "am" and not config.am_enabled:
+        raise RequestValidationError(
+            EXIT_REQUEST_ERROR,
+            "AM support is disabled on this server",
+        )
+    if modulation == "lsb" and not config.lsb_enabled:
+        raise RequestValidationError(
+            EXIT_REQUEST_ERROR,
+            "LSB support is disabled on this server",
+        )
+    if modulation == "usb" and not config.usb_enabled:
+        raise RequestValidationError(
+            EXIT_REQUEST_ERROR,
+            "USB support is disabled on this server",
+        )
+    if modulation == "nfm" and not config.nfm_enabled:
+        raise RequestValidationError(
+            EXIT_REQUEST_ERROR,
+            "NFM support is disabled on this server",
+        )
+    if modulation in {"wfm", "wfm_stereo"} and not config.wfm_enabled:
+        raise RequestValidationError(
+            EXIT_REQUEST_ERROR,
+            f"{modulation.upper()} support is disabled on this server",
+        )
+    if modulation == "wfm_stereo" and not config.enable_wfm_stereo:
+        raise RequestValidationError(
+            EXIT_REQUEST_ERROR,
+            "Error: server does not support WFM stereo",
+        )
 
 
 def _get_wfm_deemphasis_tau(region: str) -> int:
@@ -1460,7 +1681,7 @@ def _get_wfm_deemphasis_tau(region: str) -> int:
     if normalized_region == "europe":
         return 50
     raise ValueError(
-        "audio.wfm_deemphasis_region must be either 'us' or 'europe'"
+        "audio.wfm.deemphasis_region must be either 'us' or 'europe'"
     )
 
 
@@ -1624,26 +1845,30 @@ def _build_audio_stream(
             parent=parent,
             close_when_unused=True,
         )
-        deemphasis_stream = SharedStream(
-            config=config,
-            name=f"audio-{modulation}-{frequency}-deemphasis",
-            command=[
-                "csdr",
-                "deemphasis",
-                "--wfm",
-                str(_get_audio_output_rate(modulation)),
-                f"{config.nfm_deemphasis_tau}e-6",
-            ],
-            manager=manager,
-            parent=demod_stream,
-            close_when_unused=True,
-        )
+        nfm_parent: SharedStream = demod_stream
+        deemphasis_stream: SharedStream | None = None
+        if config.nfm_deemphasis_tau is not None:
+            deemphasis_stream = SharedStream(
+                config=config,
+                name=f"audio-{modulation}-{frequency}-deemphasis",
+                command=[
+                    "csdr",
+                    "deemphasis",
+                    "--wfm",
+                    str(_get_audio_output_rate(modulation)),
+                    f"{config.nfm_deemphasis_tau}e-6",
+                ],
+                manager=manager,
+                parent=demod_stream,
+                close_when_unused=True,
+            )
+            nfm_parent = deemphasis_stream
         dcblock_stream = SharedStream(
             config=config,
             name=f"audio-{modulation}-{frequency}-dcblock",
             command=["csdr", "dcblock"],
             manager=manager,
-            parent=deemphasis_stream,
+            parent=nfm_parent,
             close_when_unused=True,
         )
         output_stream = SharedStream(
@@ -1658,8 +1883,9 @@ def _build_audio_stream(
         try:
             demod_stream.start()
             started_streams.append(demod_stream)
-            deemphasis_stream.start()
-            started_streams.append(deemphasis_stream)
+            if deemphasis_stream is not None:
+                deemphasis_stream.start()
+                started_streams.append(deemphasis_stream)
             dcblock_stream.start()
             started_streams.append(dcblock_stream)
             output_stream.start()
@@ -1671,14 +1897,6 @@ def _build_audio_stream(
         return output_stream
 
     if modulation == "wfm":
-        demod_stream = SharedStream(
-            config=config,
-            name=f"audio-{modulation}-{frequency}-fmdemod",
-            command=["csdr", "fmdemod"],
-            manager=manager,
-            parent=parent,
-            close_when_unused=True,
-        )
         audio_decimation_ratio = _compute_fractional_decimation_ratio(
             WFM_IQ_RATE,
             WFM_AUDIO_OUTPUT_RATE,
@@ -1695,7 +1913,7 @@ def _build_audio_stream(
                 _format_csdr_float(audio_decimation_ratio),
             ],
             manager=manager,
-            parent=demod_stream,
+            parent=parent,
             close_when_unused=True,
         )
         deemphasis_tau = _get_wfm_deemphasis_tau(config.wfm_deemphasis_region)
@@ -1723,12 +1941,48 @@ def _build_audio_stream(
             output_read_size=_compute_output_read_size("s16", _get_audio_output_rate(modulation)),
         )
         try:
-            demod_stream.start()
-            started_streams.append(demod_stream)
             audio_resample_stream.start()
             started_streams.append(audio_resample_stream)
             deemphasis_stream.start()
             started_streams.append(deemphasis_stream)
+            output_stream.start()
+            started_streams.append(output_stream)
+        except Exception:
+            for stream in reversed(started_streams):
+                stream.close("audio stream startup failed", propagate=False)
+            raise
+        return output_stream
+
+    if modulation == "wfm_stereo":
+        pcm_stream = SharedStream(
+            config=config,
+            name=f"audio-{modulation}-{frequency}-s16",
+            command=["csdr", "convert", "-i", "float", "-o", "s16"],
+            manager=manager,
+            parent=parent,
+            close_when_unused=True,
+        )
+        deemphasis_tau = _get_wfm_deemphasis_tau(config.wfm_deemphasis_region)
+        output_stream = SharedStream(
+            config=config,
+            name=f"audio-{modulation}-{frequency}",
+            command=[
+                "demux",
+                "-r",
+                str(WFM_IQ_RATE),
+                "-R",
+                str(WFM_AUDIO_OUTPUT_RATE),
+                "-d",
+                str(deemphasis_tau),
+            ],
+            manager=manager,
+            parent=pcm_stream,
+            close_when_unused=True,
+            output_read_size=_compute_output_read_size("s16", _get_audio_output_rate(modulation)),
+        )
+        try:
+            pcm_stream.start()
+            started_streams.append(pcm_stream)
             output_stream.start()
             started_streams.append(output_stream)
         except Exception:
@@ -1777,6 +2031,7 @@ def _validate_session_request(config: ServerConfig, session: "ClientSession") ->
                 "audio session is missing modulation",
             )
         _validate_audio_modulation(session.modulation)
+        _validate_audio_modulation_supported(config, session.modulation)
         _validate_output_rate(config.rtl_sample_rate, _get_audio_iq_rate(session.modulation))
         return
     raise RequestValidationError(
@@ -1799,8 +2054,6 @@ def _validate_config(config: ServerConfig) -> None:
     _validate_rtl_gain(config.automatic_gain_control, config.rtl_gain)
     _validate_ppm_correction(config.ppm_correction)
     _validate_transition_bandwidth(config.transition_bandwidth)
-    _validate_nfm_deemphasis_tau(config.nfm_deemphasis_tau)
-    _validate_wfm_deemphasis_region(config.wfm_deemphasis_region)
     _validate_listen_host(config.listen_host)
     _validate_listen_port(config.listen_port)
     _validate_read_chunk_size(config.read_chunk_size)
@@ -1808,6 +2061,19 @@ def _validate_config(config: ServerConfig) -> None:
     _validate_stream_queue_chunks(config.stream_queue_chunks)
     _validate_client_queue_chunks(config.client_queue_chunks)
     _validate_enqueue_timeout_seconds(config.enqueue_timeout_seconds)
+    _validate_audio_support(config.audio_support)
+    _validate_demodulator_enabled("audio.am.enabled", config.am_enabled)
+    _validate_demodulator_enabled("audio.lsb.enabled", config.lsb_enabled)
+    _validate_demodulator_enabled("audio.usb.enabled", config.usb_enabled)
+    _validate_demodulator_enabled("audio.nfm.enabled", config.nfm_enabled)
+    _validate_demodulator_enabled("audio.wfm.enabled", config.wfm_enabled)
+    _validate_enable_wfm_stereo(config.enable_wfm_stereo)
+    if not config.audio_support:
+        return
+    if config.nfm_enabled:
+        _validate_nfm_deemphasis_tau(config.nfm_deemphasis_tau)
+    if config.wfm_enabled:
+        _validate_wfm_deemphasis_region(config.wfm_deemphasis_region)
 
 
 def _validate_rtl_device_index(value: int) -> None:
@@ -1858,13 +2124,30 @@ def _validate_transition_bandwidth(value: float) -> None:
         raise ValueError("transition_bandwidth must be between 0.005 and 0.05")
 
 
-def _validate_nfm_deemphasis_tau(value: int) -> None:
-    if not (0 <= value <= 530):
-        raise ValueError("audio.nfm_deemphasis_tau must be between 0 and 530")
+def _validate_nfm_deemphasis_tau(value: int | None) -> None:
+    if value is None:
+        return
+    if not (32 <= value <= 530):
+        raise ValueError("audio.nfm.deemphasis_tau must be null or between 32 and 530")
+
+
+def _validate_enable_wfm_stereo(value: bool) -> None:
+    if not isinstance(value, bool):
+        raise ValueError("audio.wfm.stereo_support must be true or false")
 
 
 def _validate_wfm_deemphasis_region(value: str) -> None:
     _get_wfm_deemphasis_tau(value)
+
+
+def _validate_audio_support(value: bool) -> None:
+    if not isinstance(value, bool):
+        raise ValueError("audio.audio_support must be true or false")
+
+
+def _validate_demodulator_enabled(name: str, value: bool) -> None:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be true or false")
 
 
 def _validate_listen_host(value: str) -> None:
@@ -1909,11 +2192,15 @@ def _is_valid_rtl_sample_rate(sample_rate: int) -> bool:
     )
 
 
-def _check_dependencies() -> None:
+def _check_dependencies(config: ServerConfig) -> None:
     if PYRTLSDR_IMPORT_ERROR is not None:
         raise ImportError(f"pyrtlsdr compatibility layer could not load librtlsdr: {PYRTLSDR_IMPORT_ERROR}")
     if shutil.which("csdr") is None:
         raise FileNotFoundError("required command(s) not found in PATH: csdr")
+    if config.audio_support and config.wfm_enabled and config.enable_wfm_stereo and shutil.which("demux") is None:
+        raise FileNotFoundError(
+            "Please install Stereo Demux for WFM stereo support"
+        )
 
 
 def parse_client_request(conn: socket.socket) -> dict[str, Any]:
@@ -2133,13 +2420,16 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
-        _check_dependencies()
         config = load_config(args.config)
+        _check_dependencies(config)
         return serve(args.config, config)
     except SystemExit:
         raise
-    except FileNotFoundError:
-        LOGGER.error("config file not found: %s", args.config)
+    except FileNotFoundError as exc:
+        if exc.filename and Path(exc.filename) == args.config:
+            LOGGER.error("config file not found: %s", args.config)
+        else:
+            LOGGER.error("%s", exc)
         return 1
     except json.JSONDecodeError as exc:
         LOGGER.error("invalid json in %s: %s", args.config, exc)

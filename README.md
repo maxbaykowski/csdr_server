@@ -48,6 +48,11 @@ You must still install the external DSP dependency yourself:
 
 - [jketterl/csdr](https://github.com/jketterl/csdr)
 
+If you enable WFM stereo, you must also install Stereo Demux and have
+`Demux` available on `PATH`:
+
+- [windytan/stereodemux](https://github.com/windytan/stereodemux)
+
 This project is written against the `jketterl/csdr` fork, not the original
 András Retzler version.
 
@@ -83,45 +88,81 @@ Request AM audio instead of IQ:
 csdr_server_client -a 127.0.0.1 -p 7355 -f 1000K -m audio -M am > audio.s16
 ```
 
+Request WFM stereo:
+
+```bash
+csdr_server_client -a 127.0.0.1 -p 7355 -f 101.1M -m audio -M wfm-stereo > stereo.s16
+```
+
 `-f` and `-s` accept plain integers or `K`, `M`, and `G` suffixes.
 
 ## Configuration
 
 Copy `config.example.json` and adjust it for your system.
 
+The config is grouped into three sections:
+
+- `rtl`
+  - hardware device selection and radio settings
+- `audio`
+  - audio-mode-specific demodulator settings
+- `server`
+  - listener and buffering behavior
+
 Important settings:
 
-- `rtl_serial`
+- `rtl.rtl_serial`
   - preferred way to select a dongle
-- `rtl_device_index`
+- `rtl.rtl_device_index`
   - fallback if you do not want to use serial numbers
-- `center_frequency`
+- `rtl.center_frequency`
   - the RF center frequency captured by the dongle
-- `rtl_sample_rate`
+- `rtl.rtl_sample_rate`
   - the hardware sample rate
-- `automatic_gain_control`
+- `rtl.automatic_gain_control`
   - `true` enables automatic gain control
-  - `false` means `rtl_gain` is used
-- `rtl_gain`
+  - `false` means `rtl.rtl_gain` is used
+- `rtl.rtl_gain`
   - manual gain in dB when AGC is off
-- `ppm_correction`
+- `rtl.ppm_correction`
   - frequency correction in PPM
-- `transition_bandwidth`
-  - alias filter width used during decimation
-- `audio.nfm_deemphasis_tau`
-  - NFM deemphasis time constant in microseconds
-- `audio.wfm_deemphasis_region`
+- `rtl.transition_bandwidth`
+  - alias filter width used during IQ decimation
+- `audio.audio_support`
+  - enables or disables audio mode entirely
+- `audio.am.enabled`
+  - enables or disables AM support
+- `audio.lsb.enabled`
+  - enables or disables LSB support
+- `audio.usb.enabled`
+  - enables or disables USB support
+- `audio.nfm.enabled`
+  - enables or disables NFM support
+- `audio.nfm.deemphasis_tau`
+  - NFM deemphasis time constant in microseconds, or `null` to disable NFM deemphasis
+- `audio.wfm.enabled`
+  - enables or disables WFM support
+- `audio.wfm.stereo_support`
+  - enables or disables WFM stereo support
+- `audio.wfm.deemphasis_region`
   - WFM deemphasis region, either `us` or `europe`
+- `server.listen_host`
+  - address to bind the TCP listener
+- `server.listen_port`
+  - TCP port for client connections
 
 ### Config Limits
 
-- `rtl_sample_rate` must be between `225001` and `300000` S/s, or between
+- `rtl.rtl_sample_rate` must be between `225001` and `300000` S/s, or between
   `900001` and `3200000` S/s
-- `rtl_gain` must be between `1.0` and `49.6` dB when AGC is off
-- `ppm_correction` must be between `-500` and `500`
-- `transition_bandwidth` must be between `0.005` and `0.05`
-- `audio.nfm_deemphasis_tau` must be between `0` and `530`
-- `audio.wfm_deemphasis_region` must be either `us` or `europe`
+- `rtl.rtl_gain` must be between `1.0` and `49.6` dB when AGC is off
+- `rtl.ppm_correction` must be between `-500` and `500`
+- `rtl.transition_bandwidth` must be between `0.005` and `0.05`
+- `audio.audio_support` must be `true` or `false`
+- `audio.am.enabled`, `audio.lsb.enabled`, `audio.usb.enabled`, `audio.nfm.enabled`, and `audio.wfm.enabled` must be `true` or `false`
+- `audio.nfm.deemphasis_tau` must be `null` or between `32` and `530`
+- `audio.wfm.stereo_support` must be `true` or `false`
+- `audio.wfm.deemphasis_region` must be either `us` or `europe`
 
 ## Live Reload
 
@@ -139,35 +180,39 @@ ps -e | grep csdr_server
 
 These settings can be changed live:
 
-- `center_frequency`
-- `rtl_sample_rate`
-- `automatic_gain_control`
-- `rtl_gain`
-- `ppm_correction`
-- `transition_bandwidth`
-- `audio.nfm_deemphasis_tau`
-- `audio.wfm_deemphasis_region`
+- `rtl.center_frequency`
+- `rtl.rtl_sample_rate`
+- `rtl.automatic_gain_control`
+- `rtl.rtl_gain`
+- `rtl.ppm_correction`
+- `rtl.transition_bandwidth`
+- `audio.nfm.deemphasis_tau`
+- `audio.wfm.deemphasis_region`
 
 What live reload does:
 
-- `center_frequency`
+- `rtl.center_frequency`
   - retunes the hardware while preserving each connected client's requested RF frequency
-- `rtl_sample_rate`
+- `rtl.rtl_sample_rate`
   - is only applied if every connected client still remains valid
-- `automatic_gain_control`
+- `rtl.automatic_gain_control`
   - switches between tuner AGC and manual gain
-- `rtl_gain`
+- `rtl.rtl_gain`
   - updates manual gain when AGC is off
-- `ppm_correction`
+- `rtl.ppm_correction`
   - updates frequency correction
-- `transition_bandwidth`
+- `rtl.transition_bandwidth`
   - rebuilds decimation stages
-- `audio.nfm_deemphasis_tau`
+- `audio.nfm.deemphasis_tau`
   - rebuilds active audio demodulation stages so NFM clients pick up the new deemphasis value
-- `audio.wfm_deemphasis_region`
+- `audio.wfm.deemphasis_region`
   - rebuilds active WFM audio stages so clients pick up the new deemphasis curve
 
-If a live `center_frequency` or `rtl_sample_rate` change would put an existing
+If `audio.audio_support`, any `audio.<demod>.enabled` setting, or
+`audio.wfm.stereo_support` changes, restart the server. Those settings are not
+applied live.
+
+If a live `rtl.center_frequency` or `rtl.rtl_sample_rate` change would put an existing
 client out of band, or make its requested sample rate exceed the new RTL sample
 rate, the server keeps the old setting and logs that a restart is required for
 that change.
@@ -204,6 +249,7 @@ Supported audio modes are:
 - `modulation=lsb`
 - `modulation=nfm`
 - `modulation=wfm`
+- `modulation=wfm_stereo`
 
 AM audio uses a fixed internal pipeline:
 
@@ -247,8 +293,9 @@ NFM audio also uses the same 16 kHz / `s16` output:
 - `dcblock`
 - convert to `s16`
 
-The NFM deemphasis time constant comes from `audio.nfm_deemphasis_tau` in the
-server config. The default is `300`.
+The NFM deemphasis time constant comes from `audio.nfm.deemphasis_tau` in the
+server config. The default is `300`. If it is set to `null`, the deemphasis
+stage is omitted entirely.
 
 WFM audio uses a wider demodulation path and a 32 kHz final audio rate:
 
@@ -260,25 +307,42 @@ WFM audio uses a wider demodulation path and a 32 kHz final audio rate:
 - `deemphasis --wfm 32000 <tau>e-6`
 - convert to `s16`
 
-The WFM deemphasis curve comes from `audio.wfm_deemphasis_region`:
+The WFM deemphasis curve comes from `audio.wfm.deemphasis_region`:
 
 - `us`
   - `75` microseconds
 - `europe`
   - `50` microseconds
 
+WFM stereo uses the same 170 kHz RF bandwidth and 32 kHz final audio rate, but
+hands the demodulated PCM to Stereo Demux:
+
+- shift to the requested frequency
+- decimate to `170000` S/s
+- transition bandwidth `0.05`
+- `fmdemod`
+- `convert -i float -o s16`
+- `Demux -r 170000 -R 32000 -d <tau>`
+
+This mode must be enabled by the server administrator with
+`audio.wfm.stereo_support=true`. If it is disabled, clients requesting
+`wfm_stereo` receive: `Error: server does not support WFM stereo`.
+
+On `csdr_server_client`, request this mode with `-M wfm-stereo`. The JSON API
+uses `wfm_stereo`.
+
 ## Operational Notes
 
 ### Device Selection
 
-If `rtl_serial` is set, the server prefers that device and waits for it to
+If `rtl.rtl_serial` is set, the server prefers that device and waits for it to
 appear. This is the recommended setup.
 
-If `rtl_serial` is not set, the server uses `rtl_device_index`.
+If `rtl.rtl_serial` is not set, the server uses `rtl.rtl_device_index`.
 
 If duplicate serial numbers are detected, startup fails. In that case, either:
 
-- set `rtl_serial` to `null` and use `rtl_device_index`
+- set `rtl.rtl_serial` to `null` and use `rtl.rtl_device_index`
 - or assign unique serial numbers with `rtl_eeprom`
 
 Example:
@@ -349,7 +413,7 @@ Request fields:
   - defaults to `f32`
 - `modulation`
   - required in `audio` mode
-  - `am`, `usb`, `lsb`, `nfm`, or `wfm`
+  - `am`, `usb`, `lsb`, `nfm`, `wfm`, or `wfm_stereo`
 
 IQ request example:
 
@@ -373,6 +437,10 @@ Audio request example:
 
 ```json
 {"frequency": 101100000, "mode": "audio", "modulation": "wfm"}
+```
+
+```json
+{"frequency": 101100000, "mode": "audio", "modulation": "wfm_stereo"}
 ```
 
 ### Handshake
@@ -420,7 +488,7 @@ After an `ok` handshake, the server sends either:
 ### Request Rules
 
 - requested frequency must stay within the current sampled RF window
-- in `iq` mode, requested sample rate must be less than or equal to `rtl_sample_rate`
+- in `iq` mode, requested sample rate must be less than or equal to `rtl.rtl_sample_rate`
 - in `iq` mode, decimation must be an integer ratio
 - in `audio` mode, the server must be able to decimate cleanly to `16000` S/s
 
