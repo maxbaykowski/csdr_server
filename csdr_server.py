@@ -1177,7 +1177,8 @@ class StreamGraph:
         modulation: str | None,
     ) -> SharedStream:
         _validate_mode(mode)
-        _validate_request_frequency(self.config, frequency)
+        required_bandwidth = _get_required_bandwidth(mode, output_rate, modulation)
+        _validate_request_frequency(self.config, frequency, required_bandwidth)
 
         root = self.root_stream
         if root is None:
@@ -1670,7 +1671,7 @@ def _validate_audio_modulation_supported(config: ServerConfig, modulation: str) 
     if modulation == "wfm_stereo" and not config.enable_wfm_stereo:
         raise RequestValidationError(
             EXIT_REQUEST_ERROR,
-            "Error: server does not support WFM stereo",
+            "Server does not support WFM stereo",
         )
 
 
@@ -2004,9 +2005,35 @@ def _compute_output_read_size(sample_format: str, output_rate: int) -> int:
     return max(4096, min(DEFAULT_STREAM_OUTPUT_READ_SIZE, size))
 
 
-def _validate_request_frequency(config: ServerConfig, frequency: int) -> None:
-    shift_rate = (config.center_frequency - frequency) / config.rtl_sample_rate
-    if shift_rate < -0.5 or shift_rate > 0.5:
+def _get_required_bandwidth(
+    mode: str,
+    output_rate: int | None,
+    modulation: str | None,
+) -> int:
+    if mode == "iq":
+        if output_rate is None:
+            raise RequestValidationError(
+                EXIT_REQUEST_ERROR,
+                "iq request is missing output sample rate",
+            )
+        return output_rate
+    if modulation is None:
+        raise RequestValidationError(
+            EXIT_REQUEST_ERROR,
+            "audio request is missing modulation",
+        )
+    return _get_audio_iq_rate(modulation)
+
+
+def _validate_request_frequency(
+    config: ServerConfig,
+    frequency: int,
+    required_bandwidth: int,
+) -> None:
+    half_capture_bandwidth = config.rtl_sample_rate / 2.0
+    half_required_bandwidth = required_bandwidth / 2.0
+    center_offset = abs(config.center_frequency - frequency)
+    if center_offset + half_required_bandwidth > half_capture_bandwidth:
         raise RequestValidationError(
             EXIT_OUT_OF_BAND,
             "requested frequency is out of band for the current RTL capture window",
@@ -2014,7 +2041,12 @@ def _validate_request_frequency(config: ServerConfig, frequency: int) -> None:
 
 
 def _validate_session_request(config: ServerConfig, session: "ClientSession") -> None:
-    _validate_request_frequency(config, session.frequency)
+    required_bandwidth = _get_required_bandwidth(
+        session.mode,
+        session.output_rate,
+        session.modulation,
+    )
+    _validate_request_frequency(config, session.frequency, required_bandwidth)
     if session.mode == "iq":
         if session.output_rate is None or session.sample_format is None:
             raise RequestValidationError(

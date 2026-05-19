@@ -367,7 +367,7 @@ letting memory usage grow without bound.
 - `255`
   - connect failure
 - `1`
-  - out of band
+  - out of band, including requests whose needed passband would extend beyond the RTL capture edges
 - `2`
   - bad sample rate
 - `3`
