@@ -17,6 +17,7 @@ import re
 import signal
 import socket
 import sys
+import threading
 import uuid
 from decimal import Decimal, InvalidOperation
 
@@ -50,6 +51,7 @@ SUFFIXES = {
 
 _shutdown_requested = False
 _active_socket: socket.socket | None = None
+_control_socket: socket.socket | None = None
 
 
 def _set_process_name(name: str) -> None:
@@ -67,6 +69,11 @@ def _request_shutdown(signum: int, _frame: object) -> None:
             _active_socket.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
+    if _control_socket is not None:
+        try:
+            _control_socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
 
 def _install_signal_handlers() -> None:
@@ -82,6 +89,11 @@ def _handle_stdout_pipe_closed() -> int:
     if _active_socket is not None:
         try:
             _active_socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    if _control_socket is not None:
+        try:
+            _control_socket.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
     try:
@@ -327,8 +339,6 @@ def _stream_audio_to_soundcard(
                 if aligned_size:
                     stream.write(payload[:aligned_size])
                 remainder = payload[aligned_size:]
-            if remainder:
-                LOGGER = None
     except Exception as exc:
         error_type = type(exc).__name__
         print(f"error: audio playback failed ({error_type}): {exc}", file=sys.stderr)
@@ -338,8 +348,81 @@ def _stream_audio_to_soundcard(
     return 0
 
 
+def _start_interactive_control(
+    control_sock: socket.socket,
+    control_file,
+) -> threading.Thread | None:
+    if not sys.stdin.isatty():
+        return None
+
+    def _interactive_loop() -> None:
+        print(
+            "interactive control enabled; type 'frequency <value>' to retune",
+            file=sys.stderr,
+        )
+        while not _shutdown_requested:
+            line = sys.stdin.readline()
+            if line == "":
+                break
+            text = line.strip()
+            if not text:
+                continue
+            command, _, remainder = text.partition(" ")
+            if command.lower() != "frequency":
+                print("error: unsupported interactive command; use 'frequency <value>'", file=sys.stderr)
+                continue
+            if not remainder.strip():
+                print("error: frequency command requires a value", file=sys.stderr)
+                continue
+            try:
+                frequency = parse_frequency(remainder.strip())
+            except argparse.ArgumentTypeError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                continue
+            try:
+                control_sock.sendall(
+                    json.dumps(
+                        {
+                            "command": "retune",
+                            "frequency": frequency,
+                        }
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+                response_line = control_file.readline(16_384)
+                if not response_line:
+                    print("error: control socket closed by server", file=sys.stderr)
+                    break
+                response = json.loads(response_line.decode("utf-8"))
+                if response.get("status") != "ok":
+                    print(
+                        f"error: {response.get('error', 'retune rejected by server')}",
+                        file=sys.stderr,
+                    )
+                    continue
+                print(
+                    f"retuned to {int(response.get('frequency', frequency))} Hz",
+                    file=sys.stderr,
+                )
+            except OSError as exc:
+                if not _shutdown_requested:
+                    print(f"error: control command failed: {exc}", file=sys.stderr)
+                break
+            except json.JSONDecodeError as exc:
+                print(f"error: invalid control response from server: {exc}", file=sys.stderr)
+                break
+
+    thread = threading.Thread(
+        target=_interactive_loop,
+        name="client-control-input",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def main() -> int:
-    global _active_socket
+    global _active_socket, _control_socket
 
     _set_process_name("csdr_client")
     _install_signal_handlers()
@@ -421,6 +504,7 @@ def main() -> int:
 
     with stream_sock, control_sock:
         _active_socket = stream_sock
+        _control_socket = control_sock
         try:
             control_sock.sendall(json.dumps(request).encode("utf-8") + b"\n")
             control_file = control_sock.makefile("rb")
@@ -437,6 +521,8 @@ def main() -> int:
                 return int(handshake.get("code", EXIT_REQUEST_ERROR))
             for warning in handshake.get("warnings", []):
                 print(f"warning: {warning}", file=sys.stderr)
+
+            _start_interactive_control(control_sock, control_file)
 
             stream_sock.settimeout(None)
             sock_file = stream_sock.makefile("rb")
@@ -465,6 +551,7 @@ def main() -> int:
             return EXIT_REQUEST_ERROR
         finally:
             _active_socket = None
+            _control_socket = None
 
     return 0
 

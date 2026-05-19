@@ -407,6 +407,7 @@ class CaptureManager:
         self.graph = StreamGraph(config)
         self.clients: set[ClientSession] = set()
         self.clients_lock = threading.Lock()
+        self.reconfigure_lock = threading.Lock()
 
     def start(self) -> None:
         self.supervisor_thread = threading.Thread(
@@ -545,39 +546,41 @@ class CaptureManager:
         mode: str,
         output_rate: int | None,
         modulation: str | None,
+        exclude_session: "ClientSession | None" = None,
     ) -> None:
-        required_bandwidth = _get_required_bandwidth(mode, output_rate, modulation)
-        if not self.config.automatic_tuning:
-            _validate_request_frequency(self.config, frequency, required_bandwidth)
-            return
+        with self.reconfigure_lock:
+            required_bandwidth = _get_required_bandwidth(mode, output_rate, modulation)
+            if not self.config.automatic_tuning:
+                _validate_request_frequency(self.config, frequency, required_bandwidth)
+                return
 
-        sessions = self._snapshot_client_requests()
-        desired_center = _compute_automatic_center_frequency(
-            self.config.rtl_sample_rate,
-            [
-                (session.frequency, _get_required_bandwidth(session.mode, session.output_rate, session.modulation))
-                for session in sessions
-            ]
-            + [(frequency, required_bandwidth)],
-        )
-        if desired_center == self.config.center_frequency:
-            return
+            sessions = self._snapshot_client_requests(exclude_session=exclude_session)
+            desired_center = _compute_automatic_center_frequency(
+                self.config.rtl_sample_rate,
+                [
+                    (session.frequency, _get_required_bandwidth(session.mode, session.output_rate, session.modulation))
+                    for session in sessions
+                ]
+                + [(frequency, required_bandwidth)],
+            )
+            if desired_center == self.config.center_frequency:
+                return
 
-        current_config = self.config
-        next_config = replace(current_config, center_frequency=desired_center)
-        self._apply_runtime_radio_config(current_config, next_config)
-        self.graph.apply_runtime_config(
-            new_config=next_config,
-            sessions=sessions,
-            rebuild_decimators=False,
-            rebuild_audio_modulations=set(),
-        )
-        self.config = next_config
-        LOGGER.info(
-            "automatic tuning set center_frequency=%s for %s requested stream(s)",
-            desired_center,
-            len(sessions) + 1,
-        )
+            current_config = self.config
+            next_config = replace(current_config, center_frequency=desired_center)
+            self._apply_runtime_radio_config(current_config, next_config)
+            self.graph.apply_runtime_config(
+                new_config=next_config,
+                sessions=sessions,
+                rebuild_decimators=False,
+                rebuild_audio_modulations=set(),
+            )
+            self.config = next_config
+            LOGGER.info(
+                "automatic tuning set center_frequency=%s for %s requested stream(s)",
+                desired_center,
+                len(sessions) + 1,
+            )
 
     def register_client(self, client: "ClientSession") -> None:
         with self.clients_lock:
@@ -590,138 +593,223 @@ class CaptureManager:
             self._retune_for_active_clients()
 
     def _retune_for_active_clients(self) -> None:
-        sessions = self._snapshot_client_requests()
-        if not sessions:
-            return
-        desired_center = _compute_automatic_center_frequency(
-            self.config.rtl_sample_rate,
-            [
-                (session.frequency, _get_required_bandwidth(session.mode, session.output_rate, session.modulation))
-                for session in sessions
-            ],
-        )
-        if desired_center == self.config.center_frequency:
-            return
-        current_config = self.config
-        next_config = replace(current_config, center_frequency=desired_center)
-        self._apply_runtime_radio_config(current_config, next_config)
-        self.graph.apply_runtime_config(
-            new_config=next_config,
-            sessions=sessions,
-            rebuild_decimators=False,
-            rebuild_audio_modulations=set(),
-        )
-        self.config = next_config
-        LOGGER.info(
-            "automatic tuning retuned center_frequency=%s for %s active client(s)",
-            desired_center,
-            len(sessions),
-        )
+        with self.reconfigure_lock:
+            sessions = self._snapshot_client_requests()
+            if not sessions:
+                return
+            desired_center = _compute_automatic_center_frequency(
+                self.config.rtl_sample_rate,
+                [
+                    (session.frequency, _get_required_bandwidth(session.mode, session.output_rate, session.modulation))
+                    for session in sessions
+                ],
+            )
+            if desired_center == self.config.center_frequency:
+                return
+            current_config = self.config
+            next_config = replace(current_config, center_frequency=desired_center)
+            self._apply_runtime_radio_config(current_config, next_config)
+            self.graph.apply_runtime_config(
+                new_config=next_config,
+                sessions=sessions,
+                rebuild_decimators=False,
+                rebuild_audio_modulations=set(),
+            )
+            self.config = next_config
+            LOGGER.info(
+                "automatic tuning retuned center_frequency=%s for %s active client(s)",
+                desired_center,
+                len(sessions),
+            )
 
     def reload_config(self, path: Path) -> bool:
-        loaded_config = load_config(path)
-        current_config = self.config
-        reloadable_fields = {
-            "automatic_gain_control",
-            "rtl_gain",
-            "ppm_correction",
-            "dc_block",
-            "rtl_sample_rate",
-            "center_frequency",
-            "transition_bandwidth",
-            "nfm_deemphasis_tau",
-            "nfm_lowpass_frequency",
-            "nfm_lowpass_curve",
-            "wfm_deemphasis_region",
-        }
-        ignored_fields = [
-            field_name
-            for field_name in current_config.__dataclass_fields__
-            if field_name not in reloadable_fields
-            and getattr(loaded_config, field_name) != getattr(current_config, field_name)
-        ]
-        if ignored_fields:
-            LOGGER.warning(
-                "config reload ignored non-live settings that still require a restart: %s",
-                ", ".join(sorted(ignored_fields)),
-            )
-        next_config = current_config
-        for field_name in reloadable_fields:
-            next_config = replace(
-                next_config,
-                **{field_name: getattr(loaded_config, field_name)},
-            )
-
-        if current_config.automatic_tuning:
-            next_config = replace(
-                next_config,
-                center_frequency=current_config.center_frequency,
-            )
-
-        center_or_rate_changed = (
-            next_config.center_frequency != current_config.center_frequency
-            or next_config.rtl_sample_rate != current_config.rtl_sample_rate
-        )
-        transition_changed = (
-            next_config.transition_bandwidth != current_config.transition_bandwidth
-        )
-        dc_block_changed = next_config.dc_block != current_config.dc_block
-        rebuild_audio_modulations: set[str] = set()
-        if (
-            next_config.nfm_deemphasis_tau != current_config.nfm_deemphasis_tau
-            or next_config.nfm_lowpass_frequency != current_config.nfm_lowpass_frequency
-            or next_config.nfm_lowpass_curve != current_config.nfm_lowpass_curve
-        ):
-            rebuild_audio_modulations.add("nfm")
-        if next_config.wfm_deemphasis_region != current_config.wfm_deemphasis_region:
-            rebuild_audio_modulations.add("wfm")
-            rebuild_audio_modulations.add("wfm_stereo")
-
-        client_requests = self._snapshot_client_requests()
-        if center_or_rate_changed:
-            incompatible_errors = self._find_incompatible_requests(next_config, client_requests)
-            if incompatible_errors:
-                LOGGER.error(
-                    "config reload requires a server restart: %s",
-                    incompatible_errors[0],
+        with self.reconfigure_lock:
+            loaded_config = load_config(path)
+            current_config = self.config
+            reloadable_fields = {
+                "automatic_gain_control",
+                "rtl_gain",
+                "ppm_correction",
+                "dc_block",
+                "rtl_sample_rate",
+                "center_frequency",
+                "transition_bandwidth",
+                "nfm_deemphasis_tau",
+                "nfm_lowpass_frequency",
+                "nfm_lowpass_curve",
+                "wfm_deemphasis_region",
+            }
+            ignored_fields = [
+                field_name
+                for field_name in current_config.__dataclass_fields__
+                if field_name not in reloadable_fields
+                and getattr(loaded_config, field_name) != getattr(current_config, field_name)
+            ]
+            if ignored_fields:
+                LOGGER.warning(
+                    "config reload ignored non-live settings that still require a restart: %s",
+                    ", ".join(sorted(ignored_fields)),
                 )
-                if len(incompatible_errors) > 1:
-                    LOGGER.error(
-                        "additional incompatible client requests: %s",
-                        "; ".join(incompatible_errors[1:]),
-                    )
+            next_config = current_config
+            for field_name in reloadable_fields:
+                next_config = replace(
+                    next_config,
+                    **{field_name: getattr(loaded_config, field_name)},
+                )
+
+            if current_config.automatic_tuning:
                 next_config = replace(
                     next_config,
                     center_frequency=current_config.center_frequency,
-                    rtl_sample_rate=current_config.rtl_sample_rate,
                 )
-                center_or_rate_changed = False
 
-        self._apply_runtime_radio_config(current_config, next_config)
-        self.graph.apply_runtime_config(
-            new_config=next_config,
-            sessions=client_requests,
-            rebuild_decimators=center_or_rate_changed or transition_changed or dc_block_changed,
-            rebuild_audio_modulations=rebuild_audio_modulations,
-        )
-        self.config = next_config
-        LOGGER.info(
-            "config reload applied: center_frequency=%s rtl_sample_rate=%s automatic_gain_control=%s rtl_gain=%s ppm_correction=%s dc_block=%s transition_bandwidth=%s nfm_deemphasis_tau=%s wfm_deemphasis_region=%s",
-            next_config.center_frequency,
-            next_config.rtl_sample_rate,
-            next_config.automatic_gain_control,
-            next_config.rtl_gain,
-            next_config.ppm_correction,
-            next_config.dc_block,
-            next_config.transition_bandwidth,
-            next_config.nfm_deemphasis_tau,
-            next_config.wfm_deemphasis_region,
-        )
-        return True
+            center_or_rate_changed = (
+                next_config.center_frequency != current_config.center_frequency
+                or next_config.rtl_sample_rate != current_config.rtl_sample_rate
+            )
+            transition_changed = (
+                next_config.transition_bandwidth != current_config.transition_bandwidth
+            )
+            dc_block_changed = next_config.dc_block != current_config.dc_block
+            rebuild_audio_modulations: set[str] = set()
+            if (
+                next_config.nfm_deemphasis_tau != current_config.nfm_deemphasis_tau
+                or next_config.nfm_lowpass_frequency != current_config.nfm_lowpass_frequency
+                or next_config.nfm_lowpass_curve != current_config.nfm_lowpass_curve
+            ):
+                rebuild_audio_modulations.add("nfm")
+            if next_config.wfm_deemphasis_region != current_config.wfm_deemphasis_region:
+                rebuild_audio_modulations.add("wfm")
+                rebuild_audio_modulations.add("wfm_stereo")
 
-    def _snapshot_client_requests(self) -> list["ClientSession"]:
+            client_requests = self._snapshot_client_requests()
+            if center_or_rate_changed:
+                incompatible_errors = self._find_incompatible_requests(next_config, client_requests)
+                if incompatible_errors:
+                    LOGGER.error(
+                        "config reload requires a server restart: %s",
+                        incompatible_errors[0],
+                    )
+                    if len(incompatible_errors) > 1:
+                        LOGGER.error(
+                            "additional incompatible client requests: %s",
+                            "; ".join(incompatible_errors[1:]),
+                        )
+                    next_config = replace(
+                        next_config,
+                        center_frequency=current_config.center_frequency,
+                        rtl_sample_rate=current_config.rtl_sample_rate,
+                    )
+                    center_or_rate_changed = False
+
+            self._apply_runtime_radio_config(current_config, next_config)
+            self.graph.apply_runtime_config(
+                new_config=next_config,
+                sessions=client_requests,
+                rebuild_decimators=center_or_rate_changed or transition_changed or dc_block_changed,
+                rebuild_audio_modulations=rebuild_audio_modulations,
+            )
+            self.config = next_config
+            LOGGER.info(
+                "config reload applied: center_frequency=%s rtl_sample_rate=%s automatic_gain_control=%s rtl_gain=%s ppm_correction=%s dc_block=%s transition_bandwidth=%s nfm_deemphasis_tau=%s wfm_deemphasis_region=%s",
+                next_config.center_frequency,
+                next_config.rtl_sample_rate,
+                next_config.automatic_gain_control,
+                next_config.rtl_gain,
+                next_config.ppm_correction,
+                next_config.dc_block,
+                next_config.transition_bandwidth,
+                next_config.nfm_deemphasis_tau,
+                next_config.wfm_deemphasis_region,
+            )
+            return True
+
+    def _snapshot_client_requests(
+        self,
+        exclude_session: "ClientSession | None" = None,
+    ) -> list["ClientSession"]:
         with self.clients_lock:
-            return [client for client in self.clients if not client.closed.is_set()]
+            return [
+                client
+                for client in self.clients
+                if not client.closed.is_set() and client is not exclude_session
+            ]
+
+    def retune_client(self, session: "ClientSession", frequency: int) -> None:
+        with self.reconfigure_lock:
+            required_bandwidth = _get_required_bandwidth(
+                session.mode,
+                session.output_rate,
+                session.modulation,
+            )
+            if not self.config.automatic_tuning:
+                _validate_request_frequency(self.config, frequency, required_bandwidth)
+                source_stream = self.graph.get_output_stream(
+                    frequency,
+                    session.mode,
+                    session.output_rate,
+                    session.sample_format,
+                    session.modulation,
+                )
+                session.frequency = frequency
+                session.switch_source_stream(source_stream)
+                LOGGER.info(
+                    "retuned client %s:%s to frequency=%s",
+                    session.address[0],
+                    session.address[1],
+                    frequency,
+                )
+                return
+
+            remaining_sessions = self._snapshot_client_requests(exclude_session=session)
+            desired_center = _compute_automatic_center_frequency(
+                self.config.rtl_sample_rate,
+                [
+                    (client.frequency, _get_required_bandwidth(client.mode, client.output_rate, client.modulation))
+                    for client in remaining_sessions
+                ] + [(frequency, required_bandwidth)],
+            )
+            current_config = self.config
+            next_config = replace(current_config, center_frequency=desired_center)
+            source_stream = self.graph.get_output_stream(
+                frequency,
+                session.mode,
+                session.output_rate,
+                session.sample_format,
+                session.modulation,
+            ) if desired_center == current_config.center_frequency else None
+
+            old_frequency = session.frequency
+            session.frequency = frequency
+            try:
+                if desired_center != current_config.center_frequency:
+                    self._apply_runtime_radio_config(current_config, next_config)
+                    self.graph.apply_runtime_config(
+                        new_config=next_config,
+                        sessions=remaining_sessions + [session],
+                        rebuild_decimators=False,
+                        rebuild_audio_modulations=set(),
+                    )
+                    self.config = next_config
+                    LOGGER.info(
+                        "automatic tuning retuned center_frequency=%s after client %s:%s requested frequency=%s",
+                        desired_center,
+                        session.address[0],
+                        session.address[1],
+                        frequency,
+                    )
+                else:
+                    assert source_stream is not None
+                    session.switch_source_stream(source_stream)
+            except Exception:
+                session.frequency = old_frequency
+                raise
+            LOGGER.info(
+                "retuned client %s:%s to frequency=%s",
+                session.address[0],
+                session.address[1],
+                frequency,
+            )
 
     def _find_incompatible_requests(
         self,
@@ -1628,6 +1716,9 @@ class ClientSession:
         )
         self.closed = threading.Event()
         self.output_thread: threading.Thread | None = None
+        self.control_conn: socket.socket | None = None
+        self.control_reader: Any = None
+        self.control_thread: threading.Thread | None = None
 
     def start(self) -> None:
         self.source_stream.add_subscriber(self)
@@ -1649,6 +1740,16 @@ class ClientSession:
             self.sample_format,
             self.modulation,
         )
+
+    def attach_control(self, conn: socket.socket, reader: Any) -> None:
+        self.control_conn = conn
+        self.control_reader = reader
+        self.control_thread = threading.Thread(
+            target=self._control_loop,
+            name=f"client-control-{self.address[0]}:{self.address[1]}",
+            daemon=True,
+        )
+        self.control_thread.start()
 
     def enqueue(self, chunk: bytes) -> None:
         if self.closed.is_set():
@@ -1679,6 +1780,15 @@ class ClientSession:
         except OSError:
             pass
         self.conn.close()
+        if self.control_conn is not None:
+            try:
+                self.control_conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                self.control_conn.close()
+            except OSError:
+                pass
 
     def _output_loop(self) -> None:
         try:
@@ -1711,6 +1821,63 @@ class ClientSession:
             self.address[1],
             new_stream.name,
         )
+
+    def _control_loop(self) -> None:
+        if self.control_conn is None or self.control_reader is None:
+            return
+        try:
+            while not self.closed.is_set():
+                message = parse_control_command(self.control_reader)
+                if message is None:
+                    break
+                command = message.get("command")
+                if command == "retune":
+                    frequency = _parse_request_frequency(message)
+                    self.manager.retune_client(self, frequency)
+                    send_handshake(
+                        self.control_conn,
+                        {
+                            "status": "ok",
+                            "command": "retune",
+                            "frequency": frequency,
+                        },
+                    )
+                else:
+                    raise RequestValidationError(
+                        EXIT_REQUEST_ERROR,
+                        f"unsupported control command {command!r}",
+                    )
+        except RequestValidationError as exc:
+            LOGGER.warning(
+                "rejecting control command from client %s:%s: %s",
+                self.address[0],
+                self.address[1],
+                exc,
+            )
+            try:
+                send_handshake(
+                    self.control_conn,
+                    {
+                        "status": "error",
+                        "code": exc.code,
+                        "error": exc.message,
+                    },
+                )
+            except OSError:
+                pass
+        except OSError:
+            if not self.closed.is_set():
+                LOGGER.info(
+                    "control connection closed for client %s:%s",
+                    self.address[0],
+                    self.address[1],
+                )
+        except Exception:
+            LOGGER.exception(
+                "control loop failed for client %s:%s",
+                self.address[0],
+                self.address[1],
+            )
 
 
 def _validate_output_rate(input_rate: int, output_rate: int) -> None:
@@ -2495,11 +2662,25 @@ def _check_dependencies(config: ServerConfig) -> None:
         )
 
 
-def parse_client_request(conn: socket.socket) -> dict[str, Any]:
-    conn.settimeout(10.0)
-    reader = conn.makefile("rb")
+def _read_json_message_line(reader: Any) -> bytes | None:
     line = reader.readline(16_384)
     if not line:
+        return None
+    return line
+
+
+def _parse_request_frequency(request: dict[str, Any]) -> int:
+    if "frequency" not in request:
+        raise RequestValidationError(EXIT_REQUEST_ERROR, "request must include frequency")
+    try:
+        return int(request["frequency"])
+    except (TypeError, ValueError) as exc:
+        raise RequestValidationError(EXIT_REQUEST_ERROR, f"invalid frequency: {request['frequency']!r}") from exc
+
+
+def parse_client_request(reader: Any) -> dict[str, Any]:
+    line = _read_json_message_line(reader)
+    if line is None:
         raise RequestValidationError(EXIT_REQUEST_ERROR, "client did not send a request line")
     try:
         request = json.loads(line.decode("utf-8"))
@@ -2511,8 +2692,7 @@ def parse_client_request(conn: socket.socket) -> dict[str, Any]:
     request["stream_token"] = str(request["stream_token"]).strip()
     if not request["stream_token"]:
         raise RequestValidationError(EXIT_REQUEST_ERROR, "stream_token must not be empty")
-    if "frequency" not in request:
-        raise RequestValidationError(EXIT_REQUEST_ERROR, "request must include frequency")
+    _parse_request_frequency(request)
     request["mode"] = _normalize_mode(request.get("mode", DEFAULT_MODE))
     _validate_mode(request["mode"])
     if request["mode"] == "iq":
@@ -2540,8 +2720,22 @@ def parse_client_request(conn: socket.socket) -> dict[str, Any]:
         _validate_audio_modulation(request["modulation"])
         request["format"] = None
     request["warnings"] = warnings
-    conn.settimeout(None)
     return request
+
+
+def parse_control_command(reader: Any) -> dict[str, Any] | None:
+    line = _read_json_message_line(reader)
+    if line is None:
+        return None
+    try:
+        message = json.loads(line.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RequestValidationError(EXIT_REQUEST_ERROR, f"invalid control json: {exc}") from exc
+    command = str(message.get("command", "")).strip().lower()
+    if not command:
+        raise RequestValidationError(EXIT_REQUEST_ERROR, "control command must include command")
+    message["command"] = command
+    return message
 
 
 def send_handshake(conn: socket.socket, payload: dict[str, Any]) -> None:
@@ -2651,8 +2845,12 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                     else:
                         conn, address = control_server.accept()
                         pending: PendingStreamConnection | None = None
+                        keep_control_open = False
                         try:
-                            request = parse_client_request(conn)
+                            conn.settimeout(10.0)
+                            control_reader = conn.makefile("rb")
+                            request = parse_client_request(control_reader)
+                            conn.settimeout(None)
                             token = request["stream_token"]
                             pending = pending_streams.pop(token, None)
                             if pending is None:
@@ -2716,6 +2914,8 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                                     )
                             send_handshake(conn, handshake)
                             session.activate()
+                            session.attach_control(conn, control_reader)
+                            keep_control_open = True
                         except RequestValidationError as exc:
                             LOGGER.warning(
                                 "rejecting control client %s:%s: %s",
@@ -2763,10 +2963,11 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                             except OSError:
                                 pass
                         finally:
-                            try:
-                                conn.close()
-                            except OSError:
-                                pass
+                            if not keep_control_open:
+                                try:
+                                    conn.close()
+                                except OSError:
+                                    pass
         finally:
             for pending in pending_streams.values():
                 try:

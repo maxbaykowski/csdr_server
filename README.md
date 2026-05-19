@@ -106,6 +106,8 @@ In audio mode, it plays audio through the default sound device by default. Use
 `--stdout` in audio mode if you want raw `s16` audio samples on stdout instead.
 You can tune playback smoothing with `-B` / `--audio-prebuffer` and `-L` /
 `--audio-latency`, both in seconds.
+If the client is running with an interactive stdin, you can type
+`frequency <value>` to retune the active stream without reconnecting.
 
 ## Configuration
 
@@ -434,6 +436,7 @@ This section is only needed if you want to write your own client.
 - client sends a `stream_token` line on the stream socket
 - client sends one UTF-8 JSON request line on the control socket
 - server sends one UTF-8 JSON handshake line on the control socket
+- the control socket stays open after a successful handshake for optional live commands
 - raw binary stream is sent on the stream socket after a successful control handshake
 
 ### Request
@@ -533,6 +536,26 @@ Handshake fields:
   - present on error
 - `error`
   - present on error
+
+### Live Control Commands
+
+After a successful handshake, a client may continue sending one JSON command
+per line on the control socket.
+
+Retune command:
+
+```json
+{"command": "retune", "frequency": 162550000}
+```
+
+Retune success:
+
+```json
+{"status": "ok", "command": "retune", "frequency": 162550000}
+```
+
+Retune errors use the same `status=error`, `code`, and `error` fields as the
+initial handshake.
 
 ### Stream Payload
 
