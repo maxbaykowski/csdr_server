@@ -117,6 +117,9 @@ Important settings:
   - fallback if you do not want to use serial numbers
 - `rtl.center_frequency`
   - the RF center frequency captured by the dongle
+- `rtl.automatic_tuning`
+  - when `true`, the server automatically retunes the SDR based on connected clients
+  - when enabled, manual `rtl.center_frequency` changes are ignored
 - `rtl.rtl_sample_rate`
   - the hardware sample rate
 - `rtl.automatic_gain_control`
@@ -158,6 +161,7 @@ Important settings:
 - `rtl.rtl_gain` must be between `1.0` and `49.6` dB when AGC is off
 - `rtl.ppm_correction` must be between `-500` and `500`
 - `rtl.transition_bandwidth` must be between `0.005` and `0.5`
+- `rtl.automatic_tuning` must be `true` or `false`
 - `audio.audio_support` must be `true` or `false`
 - `audio.am.enabled`, `audio.lsb.enabled`, `audio.usb.enabled`, `audio.nfm.enabled`, and `audio.wfm.enabled` must be `true` or `false`
 - `audio.nfm.deemphasis_tau` must be `null` or between `32` and `530`
@@ -193,6 +197,7 @@ What live reload does:
 
 - `rtl.center_frequency`
   - retunes the hardware while preserving each connected client's requested RF frequency
+  - ignored when `rtl.automatic_tuning` is enabled
 - `rtl.rtl_sample_rate`
   - is only applied if every connected client still remains valid
 - `rtl.automatic_gain_control`
@@ -210,6 +215,9 @@ What live reload does:
 
 If `audio.audio_support`, any `audio.<demod>.enabled` setting, or
 `audio.wfm.stereo_support` changes, restart the server. Those settings are not
+applied live.
+
+If `rtl.automatic_tuning` changes, restart the server. That setting is not
 applied live.
 
 If a live `rtl.center_frequency` or `rtl.rtl_sample_rate` change would put an existing

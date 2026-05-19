@@ -70,6 +70,7 @@ class ServerConfig:
     rtl_device_index: int = 0
     rtl_serial: str | None = None
     center_frequency: int = 100_000_000
+    automatic_tuning: bool = False
     rtl_sample_rate: int = 2_400_000
     automatic_gain_control: bool = False
     rtl_gain: float | None = None
@@ -123,6 +124,10 @@ class ServerConfig:
             center_frequency=_parse_int(
                 _config_value(data, rtl_settings, "center_frequency"),
                 "rtl.center_frequency",
+            ),
+            automatic_tuning=_parse_bool(
+                _config_value(data, rtl_settings, "automatic_tuning", False),
+                "rtl.automatic_tuning",
             ),
             rtl_sample_rate=_parse_int(
                 _config_value(data, rtl_settings, "rtl_sample_rate"),
@@ -491,6 +496,46 @@ class CaptureManager:
             modulation,
         )
 
+    def prepare_request(
+        self,
+        frequency: int,
+        mode: str,
+        output_rate: int | None,
+        modulation: str | None,
+    ) -> None:
+        required_bandwidth = _get_required_bandwidth(mode, output_rate, modulation)
+        if not self.config.automatic_tuning:
+            _validate_request_frequency(self.config, frequency, required_bandwidth)
+            return
+
+        sessions = self._snapshot_client_requests()
+        desired_center = _compute_automatic_center_frequency(
+            self.config.rtl_sample_rate,
+            [
+                (session.frequency, _get_required_bandwidth(session.mode, session.output_rate, session.modulation))
+                for session in sessions
+            ]
+            + [(frequency, required_bandwidth)],
+        )
+        if desired_center == self.config.center_frequency:
+            return
+
+        current_config = self.config
+        next_config = replace(current_config, center_frequency=desired_center)
+        self._apply_runtime_radio_config(current_config, next_config)
+        self.graph.apply_runtime_config(
+            new_config=next_config,
+            sessions=sessions,
+            rebuild_decimators=False,
+            rebuild_audio_modulations=set(),
+        )
+        self.config = next_config
+        LOGGER.info(
+            "automatic tuning set center_frequency=%s for %s requested stream(s)",
+            desired_center,
+            len(sessions) + 1,
+        )
+
     def register_client(self, client: "ClientSession") -> None:
         with self.clients_lock:
             self.clients.add(client)
@@ -498,6 +543,37 @@ class CaptureManager:
     def unregister_client(self, client: "ClientSession") -> None:
         with self.clients_lock:
             self.clients.discard(client)
+        if self.config.automatic_tuning and not self.stop_event.is_set():
+            self._retune_for_active_clients()
+
+    def _retune_for_active_clients(self) -> None:
+        sessions = self._snapshot_client_requests()
+        if not sessions:
+            return
+        desired_center = _compute_automatic_center_frequency(
+            self.config.rtl_sample_rate,
+            [
+                (session.frequency, _get_required_bandwidth(session.mode, session.output_rate, session.modulation))
+                for session in sessions
+            ],
+        )
+        if desired_center == self.config.center_frequency:
+            return
+        current_config = self.config
+        next_config = replace(current_config, center_frequency=desired_center)
+        self._apply_runtime_radio_config(current_config, next_config)
+        self.graph.apply_runtime_config(
+            new_config=next_config,
+            sessions=sessions,
+            rebuild_decimators=False,
+            rebuild_audio_modulations=set(),
+        )
+        self.config = next_config
+        LOGGER.info(
+            "automatic tuning retuned center_frequency=%s for %s active client(s)",
+            desired_center,
+            len(sessions),
+        )
 
     def reload_config(self, path: Path) -> bool:
         loaded_config = load_config(path)
@@ -528,6 +604,12 @@ class CaptureManager:
             next_config = replace(
                 next_config,
                 **{field_name: getattr(loaded_config, field_name)},
+            )
+
+        if current_config.automatic_tuning:
+            next_config = replace(
+                next_config,
+                center_frequency=current_config.center_frequency,
             )
 
         center_or_rate_changed = (
@@ -2025,6 +2107,40 @@ def _get_required_bandwidth(
     return _get_audio_iq_rate(modulation)
 
 
+def _requested_passband_edges(
+    frequency: int,
+    required_bandwidth: int,
+) -> tuple[float, float]:
+    half_required_bandwidth = required_bandwidth / 2.0
+    return frequency - half_required_bandwidth, frequency + half_required_bandwidth
+
+
+def _compute_automatic_center_frequency(
+    rtl_sample_rate: int,
+    requests: list[tuple[int, int]],
+) -> int:
+    if not requests:
+        raise ValueError("at least one request is required to compute automatic center frequency")
+    if len(requests) == 1:
+        frequency, required_bandwidth = requests[0]
+        _validate_output_rate(rtl_sample_rate, required_bandwidth)
+        return frequency
+    lower_edges: list[float] = []
+    upper_edges: list[float] = []
+    for frequency, required_bandwidth in requests:
+        lower_edge, upper_edge = _requested_passband_edges(frequency, required_bandwidth)
+        lower_edges.append(lower_edge)
+        upper_edges.append(upper_edge)
+    min_lower_edge = min(lower_edges)
+    max_upper_edge = max(upper_edges)
+    if max_upper_edge - min_lower_edge > rtl_sample_rate:
+        raise RequestValidationError(
+            EXIT_OUT_OF_BAND,
+            "requested frequency is out of band for the current RTL capture window",
+        )
+    return int(round((min_lower_edge + max_upper_edge) / 2.0))
+
+
 def _validate_request_frequency(
     config: ServerConfig,
     frequency: int,
@@ -2081,6 +2197,7 @@ def _validate_config(config: ServerConfig) -> None:
     _validate_rtl_device_index(config.rtl_device_index)
     _validate_rtl_serial(config.rtl_serial)
     _validate_center_frequency(config.center_frequency)
+    _validate_automatic_tuning(config.automatic_tuning)
     _validate_rtl_sample_rate(config.rtl_sample_rate)
     _validate_automatic_gain_control(config.automatic_gain_control)
     _validate_rtl_gain(config.automatic_gain_control, config.rtl_gain)
@@ -2121,6 +2238,11 @@ def _validate_rtl_serial(value: str | None) -> None:
 def _validate_center_frequency(value: int) -> None:
     if value <= 0:
         raise ValueError("center_frequency must be positive")
+
+
+def _validate_automatic_tuning(value: bool) -> None:
+    if not isinstance(value, bool):
+        raise ValueError("rtl.automatic_tuning must be true or false")
 
 
 def _validate_rtl_sample_rate(value: int) -> None:
@@ -2340,6 +2462,12 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                     sample_format = request["format"]
                     modulation = request["modulation"]
                     request_warnings = request["warnings"]
+                    capture.prepare_request(
+                        frequency,
+                        mode,
+                        output_rate,
+                        modulation,
+                    )
                     source_stream = capture.get_output_stream(
                         frequency,
                         mode,

@@ -3,6 +3,7 @@
     "rtl_device_index": 0,
     "rtl_serial": "00000001",
     "center_frequency": 162475000,
+    "automatic_tuning": false,
     "rtl_sample_rate": 2400000,
     "automatic_gain_control": false,
     "rtl_gain": 35.0,
