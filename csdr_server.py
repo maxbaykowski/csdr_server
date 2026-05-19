@@ -1827,44 +1827,42 @@ class ClientSession:
             return
         try:
             while not self.closed.is_set():
-                message = parse_control_command(self.control_reader)
-                if message is None:
-                    break
-                command = message.get("command")
-                if command == "retune":
-                    frequency = _parse_request_frequency(message)
-                    self.manager.retune_client(self, frequency)
+                try:
+                    message = parse_control_command(self.control_reader)
+                    if message is None:
+                        break
+                    command = message.get("command")
+                    if command == "retune":
+                        frequency = _parse_request_frequency(message)
+                        self.manager.retune_client(self, frequency)
+                        send_handshake(
+                            self.control_conn,
+                            {
+                                "status": "ok",
+                                "command": "retune",
+                                "frequency": frequency,
+                            },
+                        )
+                    else:
+                        raise RequestValidationError(
+                            EXIT_REQUEST_ERROR,
+                            f"unsupported control command {command!r}",
+                        )
+                except RequestValidationError as exc:
+                    LOGGER.warning(
+                        "rejecting control command from client %s:%s: %s",
+                        self.address[0],
+                        self.address[1],
+                        exc,
+                    )
                     send_handshake(
                         self.control_conn,
                         {
-                            "status": "ok",
-                            "command": "retune",
-                            "frequency": frequency,
+                            "status": "error",
+                            "code": exc.code,
+                            "error": exc.message,
                         },
                     )
-                else:
-                    raise RequestValidationError(
-                        EXIT_REQUEST_ERROR,
-                        f"unsupported control command {command!r}",
-                    )
-        except RequestValidationError as exc:
-            LOGGER.warning(
-                "rejecting control command from client %s:%s: %s",
-                self.address[0],
-                self.address[1],
-                exc,
-            )
-            try:
-                send_handshake(
-                    self.control_conn,
-                    {
-                        "status": "error",
-                        "code": exc.code,
-                        "error": exc.message,
-                    },
-                )
-            except OSError:
-                pass
         except OSError:
             if not self.closed.is_set():
                 LOGGER.info(
