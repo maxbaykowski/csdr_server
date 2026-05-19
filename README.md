@@ -43,6 +43,11 @@ Python dependencies are installed automatically:
 
 - `pyrtlsdr`
 - `pyrtlsdrlib`
+- `sounddevice`
+
+`csdr_server_client` uses `sounddevice` for local audio playback. On Linux,
+that means PortAudio support must exist on the system, and the PortAudio build
+must have a usable backend such as ALSA.
 
 You must still install the external DSP dependency yourself:
 
@@ -85,16 +90,22 @@ csdr_server_client -a 127.0.0.1 -p 7355 -f 162.475M -s 16K -F s16 > iq.s16
 Request AM audio instead of IQ:
 
 ```bash
-csdr_server_client -a 127.0.0.1 -p 7355 -f 1000K -m audio -M am > audio.s16
+csdr_server_client -a 127.0.0.1 -p 7355 -f 1000K -m audio -M am
 ```
 
 Request WFM stereo:
 
 ```bash
-csdr_server_client -a 127.0.0.1 -p 7355 -f 101.1M -m audio -M wfm-stereo > stereo.s16
+csdr_server_client -a 127.0.0.1 -p 7355 -f 101.1M -m audio -M wfm-stereo
 ```
 
 `-f` and `-s` accept plain integers or `K`, `M`, and `G` suffixes.
+
+In IQ mode, `csdr_server_client` writes binary samples to stdout by default.
+In audio mode, it plays audio through the default sound device by default. Use
+`--stdout` in audio mode if you want raw `s16` audio samples on stdout instead.
+You can tune playback smoothing with `-B` / `--audio-prebuffer` and `-L` /
+`--audio-latency`, both in seconds.
 
 ## Configuration
 
@@ -491,7 +502,7 @@ IQ success:
 Audio success:
 
 ```json
-{"status": "ok", "mode": "audio", "format": "s16", "modulation": "am", "sample_rate": 16000}
+{"status": "ok", "mode": "audio", "format": "s16", "modulation": "am", "sample_rate": 16000, "channels": 1}
 ```
 
 Error:
@@ -509,6 +520,8 @@ Handshake fields:
 - `modulation`
   - present on audio success
 - `sample_rate`
+  - present on audio success
+- `channels`
   - present on audio success
 - `code`
   - present on error

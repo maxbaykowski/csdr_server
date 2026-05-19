@@ -3,13 +3,14 @@
 Minimal client for csdr_server.py.
 
 The client sends one JSON request to the server, then writes the returned raw
-IQ stream to stdout.
+IQ stream to stdout or plays demodulated audio through the default soundcard.
 """
 
 from __future__ import annotations
 
 import argparse
 import ctypes
+import importlib
 import json
 import os
 import re
@@ -32,6 +33,12 @@ DEFAULT_MODULATION = "am"
 VALID_AUDIO_MODULATIONS = (DEFAULT_MODULATION, "lsb", "nfm", "usb", "wfm", "wfm-stereo")
 DEFAULT_SAMPLE_FORMAT = "f32"
 VALID_SAMPLE_FORMATS = (DEFAULT_SAMPLE_FORMAT, "s16")
+DEFAULT_AUDIO_SAMPLE_FORMAT = "s16"
+DEFAULT_AUDIO_CHANNELS = 1
+PCM_SAMPLE_WIDTH_BYTES = 2
+AUDIO_STREAM_READ_SIZE = 65_536
+DEFAULT_AUDIO_PLAYBACK_PREBUFFER_SECONDS = 0.35
+DEFAULT_AUDIO_PLAYBACK_LATENCY_SECONDS = 0.25
 
 
 SUFFIXES = {
@@ -147,6 +154,24 @@ def normalize_audio_modulation(value: str) -> str:
     return value.strip().lower().replace("-", "_")
 
 
+def parse_nonnegative_float(value: str, label: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid {label}: {value!r}") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"{label} must be greater than or equal to 0")
+    return parsed
+
+
+def parse_audio_prebuffer(value: str) -> float:
+    return parse_nonnegative_float(value, "audio prebuffer")
+
+
+def parse_audio_latency(value: str) -> float:
+    return parse_nonnegative_float(value, "audio latency")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal client for csdr_server.py")
     parser.add_argument("-a", "--address", required=True, help="Server IP address or hostname")
@@ -179,7 +204,138 @@ def parse_args() -> argparse.Namespace:
         choices=VALID_AUDIO_MODULATIONS,
         help="Audio modulation type",
     )
+    parser.add_argument(
+        "--stdout",
+        action="store_true",
+        help="Write received stream to stdout instead of playing audio locally in audio mode",
+    )
+    parser.add_argument(
+        "-B",
+        "--audio-prebuffer",
+        type=parse_audio_prebuffer,
+        default=DEFAULT_AUDIO_PLAYBACK_PREBUFFER_SECONDS,
+        help="Audio playback prebuffer in seconds",
+    )
+    parser.add_argument(
+        "-L",
+        "--audio-latency",
+        type=parse_audio_latency,
+        default=DEFAULT_AUDIO_PLAYBACK_LATENCY_SECONDS,
+        help="Requested audio device latency in seconds",
+    )
     return parser.parse_args()
+
+
+def _should_play_audio(args: argparse.Namespace) -> bool:
+    return args.mode == "audio" and not args.stdout
+
+
+def _load_sounddevice_module():
+    try:
+        return importlib.import_module("sounddevice")
+    except ModuleNotFoundError:
+        print(
+            "error: audio playback requires the Python package 'sounddevice'; "
+            "reinstall csdr_server_client or run 'python3 -m pip install sounddevice'",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _stream_to_stdout(sock_file) -> int:
+    while True:
+        chunk = sock_file.read1(AUDIO_STREAM_READ_SIZE)
+        if not chunk:
+            break
+        if _shutdown_requested:
+            return SHUTDOWN_SIGNAL_EXIT
+        _write_stdout_unbuffered(chunk)
+    if _shutdown_requested:
+        return SHUTDOWN_SIGNAL_EXIT
+    return 0
+
+
+def _stream_audio_to_soundcard(
+    sock_file,
+    handshake: dict[str, object],
+    prebuffer_seconds: float,
+    latency_seconds: float,
+) -> int:
+    sample_rate = int(handshake.get("sample_rate", 0))
+    channels = int(handshake.get("channels", DEFAULT_AUDIO_CHANNELS))
+    sample_format = str(handshake.get("format", "")).lower()
+    if sample_rate <= 0:
+        print("error: server audio handshake is missing a valid sample_rate", file=sys.stderr)
+        return EXIT_REQUEST_ERROR
+    if channels <= 0:
+        print("error: server audio handshake is missing a valid channel count", file=sys.stderr)
+        return EXIT_REQUEST_ERROR
+    if sample_format != DEFAULT_AUDIO_SAMPLE_FORMAT:
+        print(
+            f"error: audio playback only supports {DEFAULT_AUDIO_SAMPLE_FORMAT}; server sent {sample_format!r}",
+            file=sys.stderr,
+        )
+        return EXIT_REQUEST_ERROR
+
+    sounddevice = _load_sounddevice_module()
+    if sounddevice is None:
+        return EXIT_REQUEST_ERROR
+
+    bytes_per_frame = PCM_SAMPLE_WIDTH_BYTES * channels
+    bytes_per_second = sample_rate * bytes_per_frame
+    prebuffer_target = max(
+        bytes_per_frame,
+        int(bytes_per_second * prebuffer_seconds),
+    )
+    prebuffer_target -= prebuffer_target % bytes_per_frame
+    if prebuffer_target <= 0:
+        prebuffer_target = bytes_per_frame
+    prebuffer = bytearray()
+    remainder = b""
+    try:
+        while len(prebuffer) < prebuffer_target:
+            chunk = sock_file.read1(AUDIO_STREAM_READ_SIZE)
+            if not chunk:
+                break
+            if _shutdown_requested:
+                return SHUTDOWN_SIGNAL_EXIT
+            prebuffer.extend(chunk)
+
+        aligned_prebuffer_size = len(prebuffer) - (len(prebuffer) % bytes_per_frame)
+        prebuffer_remainder = b""
+        if aligned_prebuffer_size < len(prebuffer):
+            prebuffer_remainder = bytes(prebuffer[aligned_prebuffer_size:])
+        initial_audio = bytes(prebuffer[:aligned_prebuffer_size])
+
+        with sounddevice.RawOutputStream(
+            samplerate=sample_rate,
+            channels=channels,
+            dtype="int16",
+            latency=latency_seconds,
+        ) as stream:
+            if initial_audio:
+                stream.write(initial_audio)
+            remainder = prebuffer_remainder
+            while True:
+                chunk = sock_file.read1(AUDIO_STREAM_READ_SIZE)
+                if not chunk:
+                    break
+                if _shutdown_requested:
+                    return SHUTDOWN_SIGNAL_EXIT
+                payload = remainder + chunk
+                aligned_size = len(payload) - (len(payload) % bytes_per_frame)
+                if aligned_size:
+                    stream.write(payload[:aligned_size])
+                remainder = payload[aligned_size:]
+            if remainder:
+                LOGGER = None
+    except Exception as exc:
+        error_type = type(exc).__name__
+        print(f"error: audio playback failed ({error_type}): {exc}", file=sys.stderr)
+        return EXIT_REQUEST_ERROR
+    if _shutdown_requested:
+        return SHUTDOWN_SIGNAL_EXIT
+    return 0
 
 
 def main() -> int:
@@ -284,15 +440,14 @@ def main() -> int:
 
             stream_sock.settimeout(None)
             sock_file = stream_sock.makefile("rb")
-            while True:
-                chunk = sock_file.read1(65_536)
-                if not chunk:
-                    break
-                if _shutdown_requested:
-                    return SHUTDOWN_SIGNAL_EXIT
-                _write_stdout_unbuffered(chunk)
-            if _shutdown_requested:
-                return SHUTDOWN_SIGNAL_EXIT
+            if _should_play_audio(args):
+                return _stream_audio_to_soundcard(
+                    sock_file,
+                    handshake,
+                    args.audio_prebuffer,
+                    args.audio_latency,
+                )
+            return _stream_to_stdout(sock_file)
         except BrokenPipeError:
             _exit_after_stdout_pipe_closed()
         except json.JSONDecodeError as exc:

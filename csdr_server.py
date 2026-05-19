@@ -1751,6 +1751,12 @@ def _get_audio_output_rate(modulation: str) -> int:
     return AM_AUDIO_OUTPUT_RATE
 
 
+def _get_audio_channels(modulation: str) -> int:
+    if modulation == "wfm_stereo":
+        return 2
+    return 1
+
+
 def _get_audio_iq_rate(modulation: str) -> int:
     if modulation in {"wfm", "wfm_stereo"}:
         return WFM_IQ_RATE
@@ -2647,6 +2653,7 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                                 handshake["format"] = DEFAULT_AUDIO_OUTPUT_FORMAT
                                 handshake["modulation"] = modulation
                                 handshake["sample_rate"] = _get_audio_output_rate(modulation)
+                                handshake["channels"] = _get_audio_channels(modulation)
                             if request_warnings:
                                 handshake["warnings"] = request_warnings
                                 for warning in request_warnings:

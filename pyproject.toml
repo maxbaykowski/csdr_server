@@ -16,6 +16,7 @@ dependencies = [
   "json5",
   "pyrtlsdr",
   "pyrtlsdrlib",
+  "sounddevice",
 ]
 keywords = ["rtl-sdr", "sdr", "csdr", "radio", "iq"]
 classifiers = [
