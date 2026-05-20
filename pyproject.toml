@@ -14,9 +14,9 @@ authors = [
 ]
 dependencies = [
   "json5",
-  "pyrtlsdr",
-  "pyrtlsdrlib",
   "sounddevice",
+  "pyrtlsdr; sys_platform == 'linux'",
+  "pyrtlsdrlib; sys_platform == 'linux'",
 ]
 keywords = ["rtl-sdr", "sdr", "csdr", "radio", "iq"]
 classifiers = [

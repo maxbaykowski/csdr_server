@@ -233,7 +233,7 @@ def _handle_stdout_pipe_closed() -> int:
     _shutdown_requested = True
     _shutdown_sockets()
     try:
-        devnull = open("/dev/null", "wb")
+        devnull = open(os.devnull, "wb")
         os.dup2(devnull.fileno(), sys.stdout.fileno())
     except OSError:
         pass
@@ -251,6 +251,17 @@ def _write_stdout_unbuffered(data: bytes) -> None:
     while view:
         written = os.write(stdout_fd, view)
         view = view[written:]
+
+
+def _set_stdout_binary_mode() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import msvcrt
+
+        msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+    except (ImportError, OSError, AttributeError):
+        pass
 
 
 def _option_was_provided(options: tuple[str, ...]) -> bool:
@@ -405,6 +416,23 @@ def _load_sounddevice_module():
         return None
 
 
+def _audio_platform_hint() -> str:
+    if sys.platform == "win32":
+        return (
+            " Check that a usable Windows output device exists and is not busy, "
+            "and that PortAudio support is available to python-sounddevice."
+        )
+    if sys.platform == "darwin":
+        return (
+            " Check that a usable macOS output device exists and that PortAudio/CoreAudio "
+            "support is available to python-sounddevice."
+        )
+    return (
+        " Check that a usable output device exists and that PortAudio support is installed "
+        "for python-sounddevice."
+    )
+
+
 def _stream_to_stdout(sock_file) -> int:
     while True:
         chunk = sock_file.read1(AUDIO_STREAM_READ_SIZE)
@@ -509,7 +537,10 @@ def _stream_audio_to_soundcard(
                 break
     except Exception as exc:
         error_type = type(exc).__name__
-        print(f"error: audio playback failed ({error_type}): {exc}", file=sys.stderr)
+        print(
+            f"error: audio playback failed ({error_type}): {exc}.{_audio_platform_hint()}",
+            file=sys.stderr,
+        )
         return EXIT_REQUEST_ERROR
     if _shutdown_requested:
         return EXIT_REQUEST_ERROR if _fatal_control_failure else SHUTDOWN_SIGNAL_EXIT
@@ -664,6 +695,8 @@ def main() -> int:
     _set_process_name("csdr_client")
     _install_signal_handlers()
     args = parse_args()
+    if args.mode == "iq" or args.stdout:
+        _set_stdout_binary_mode()
     if args.port >= 65535:
         print("error: stream port must be between 1 and 65534 so the control socket can use port+1", file=sys.stderr)
         return EXIT_CONNECT_FAILED

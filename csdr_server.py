@@ -3469,6 +3469,9 @@ def main() -> int:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if not sys.platform.startswith("linux"):
+        LOGGER.error("csdr_server is supported on Linux only")
+        return 1
     try:
         config = load_config(args.config)
         _check_dependencies(config)

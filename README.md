@@ -41,13 +41,21 @@ This installs two commands:
 
 Python dependencies are installed automatically:
 
-- `pyrtlsdr`
-- `pyrtlsdrlib`
 - `sounddevice`
 
-`csdr_server_client` uses `sounddevice` for local audio playback. On Linux,
-that means PortAudio support must exist on the system, and the PortAudio build
-must have a usable backend such as ALSA.
+On Linux, server dependencies are also installed automatically:
+
+- `pyrtlsdr`
+- `pyrtlsdrlib`
+
+On Windows and macOS, those Linux-only server dependencies are not installed,
+so `csdr_server_client` can still be installed without pulling in RTL-SDR
+server components. If `csdr_server` is launched on a non-Linux platform, it
+will exit immediately with a clear runtime error.
+
+`csdr_server_client` uses `sounddevice` for local audio playback. That means
+PortAudio support must exist on the system and the PortAudio build must have a
+usable backend for the platform.
 
 You must still install the external DSP dependency yourself:
 
