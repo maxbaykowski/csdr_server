@@ -89,6 +89,9 @@
 
       // Enable FM stereo support (requires Stereo Demux's demux binary to be on PATH).
       stereo_support: false,
+
+      // Enable RDS support (requires redsea to be on PATH).
+      rds_support: false,
     },
   },
 

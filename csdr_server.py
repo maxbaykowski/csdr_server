@@ -62,7 +62,7 @@ AM_AUDIO_OUTPUT_RATE = 16_000
 AM_AUDIO_TRANSITION_BANDWIDTH = 0.005
 AM_AUDIO_AGC_REFERENCE = 0.2
 NFM_AUDIO_DEEMPHASIS_TAU = 300
-WFM_IQ_RATE = 170_000
+WFM_IQ_RATE = 240_000
 WFM_AUDIO_OUTPUT_RATE = 32_000
 WFM_AUDIO_TRANSITION_BANDWIDTH = 0.05
 WFM_DEEMPHASIS_REGION = "us"
@@ -90,6 +90,7 @@ class ServerConfig:
     nfm_lowpass_curve: float = 0.5
     wfm_enabled: bool = True
     enable_wfm_stereo: bool = False
+    enable_wfm_rds: bool = False
     wfm_deemphasis_region: str = WFM_DEEMPHASIS_REGION
     listen_host: str = "0.0.0.0"
     listen_port: int = 7355
@@ -209,6 +210,15 @@ class ServerConfig:
                     audio_settings.get("enable_wfm_stereo", False),
                 ),
                 "audio.wfm.stereo_support",
+            ),
+            enable_wfm_rds=_parse_bool(
+                _config_value(
+                    audio_settings,
+                    wfm_settings,
+                    "rds_support",
+                    False,
+                ),
+                "audio.wfm.rds_support",
             ),
             wfm_deemphasis_region=(
                 _normalize_wfm_deemphasis_region(
@@ -710,6 +720,8 @@ class CaptureManager:
                 rebuild_audio_modulations=rebuild_audio_modulations,
             )
             self.config = next_config
+            for session in client_requests:
+                self._refresh_rds_subscription_locked(session)
             LOGGER.info(
                 "config reload applied: center_frequency=%s rtl_sample_rate=%s automatic_gain_control=%s rtl_gain=%s ppm_correction=%s dc_block=%s transition_bandwidth=%s nfm_deemphasis_tau=%s wfm_deemphasis_region=%s",
                 next_config.center_frequency,
@@ -735,29 +747,57 @@ class CaptureManager:
                 if not client.closed.is_set() and client is not exclude_session
             ]
 
-    def retune_client(self, session: "ClientSession", frequency: int) -> None:
+    def reconfigure_client(
+        self,
+        session: "ClientSession",
+        *,
+        frequency: int | None = None,
+        modulation: str | None = None,
+    ) -> None:
         with self.reconfigure_lock:
+            next_frequency = session.frequency if frequency is None else frequency
+            next_modulation = session.modulation
+            next_output_rate = session.output_rate
+            next_sample_format = session.sample_format
+
+            if modulation is not None:
+                if session.mode != "audio":
+                    raise RequestValidationError(
+                        EXIT_REQUEST_ERROR,
+                        "demod command is only supported in audio mode",
+                    )
+                _validate_audio_modulation(modulation)
+                _validate_audio_modulation_supported(self.config, modulation)
+                next_modulation = modulation
+                next_output_rate = _get_audio_output_rate(modulation)
+                next_sample_format = None
+
             required_bandwidth = _get_required_bandwidth(
                 session.mode,
-                session.output_rate,
-                session.modulation,
+                next_output_rate,
+                next_modulation,
             )
             if not self.config.automatic_tuning:
-                _validate_request_frequency(self.config, frequency, required_bandwidth)
+                _validate_request_frequency(self.config, next_frequency, required_bandwidth)
                 source_stream = self.graph.get_output_stream(
-                    frequency,
+                    next_frequency,
                     session.mode,
-                    session.output_rate,
-                    session.sample_format,
-                    session.modulation,
+                    next_output_rate,
+                    next_sample_format,
+                    next_modulation,
                 )
-                session.frequency = frequency
+                session.frequency = next_frequency
+                session.modulation = next_modulation
+                session.output_rate = next_output_rate
+                session.sample_format = next_sample_format
                 session.switch_source_stream(source_stream)
+                self._refresh_rds_subscription_locked(session)
                 LOGGER.info(
-                    "retuned client %s:%s to frequency=%s",
+                    "reconfigured client %s:%s to frequency=%s modulation=%s",
                     session.address[0],
                     session.address[1],
-                    frequency,
+                    next_frequency,
+                    next_modulation,
                 )
                 return
 
@@ -767,20 +807,26 @@ class CaptureManager:
                 [
                     (client.frequency, _get_required_bandwidth(client.mode, client.output_rate, client.modulation))
                     for client in remaining_sessions
-                ] + [(frequency, required_bandwidth)],
+                ] + [(next_frequency, required_bandwidth)],
             )
             current_config = self.config
             next_config = replace(current_config, center_frequency=desired_center)
             source_stream = self.graph.get_output_stream(
-                frequency,
+                next_frequency,
                 session.mode,
-                session.output_rate,
-                session.sample_format,
-                session.modulation,
+                next_output_rate,
+                next_sample_format,
+                next_modulation,
             ) if desired_center == current_config.center_frequency else None
 
             old_frequency = session.frequency
-            session.frequency = frequency
+            old_modulation = session.modulation
+            old_output_rate = session.output_rate
+            old_sample_format = session.sample_format
+            session.frequency = next_frequency
+            session.modulation = next_modulation
+            session.output_rate = next_output_rate
+            session.sample_format = next_sample_format
             try:
                 if desired_center != current_config.center_frequency:
                     self._apply_runtime_radio_config(current_config, next_config)
@@ -792,24 +838,72 @@ class CaptureManager:
                     )
                     self.config = next_config
                     LOGGER.info(
-                        "automatic tuning retuned center_frequency=%s after client %s:%s requested frequency=%s",
+                        "automatic tuning retuned center_frequency=%s after client %s:%s requested frequency=%s modulation=%s",
                         desired_center,
                         session.address[0],
                         session.address[1],
-                        frequency,
+                        next_frequency,
+                        next_modulation,
                     )
                 else:
                     assert source_stream is not None
                     session.switch_source_stream(source_stream)
+                self._refresh_rds_subscription_locked(session)
             except Exception:
                 session.frequency = old_frequency
+                session.modulation = old_modulation
+                session.output_rate = old_output_rate
+                session.sample_format = old_sample_format
                 raise
             LOGGER.info(
-                "retuned client %s:%s to frequency=%s",
+                "reconfigured client %s:%s to frequency=%s modulation=%s",
                 session.address[0],
                 session.address[1],
-                frequency,
+                next_frequency,
+                next_modulation,
             )
+
+    def set_rds_subscription(self, session: "ClientSession", enabled: bool) -> None:
+        with self.reconfigure_lock:
+            if enabled:
+                if session.mode != "audio" or session.modulation not in {"wfm", "wfm_stereo"}:
+                    raise RequestValidationError(
+                        EXIT_REQUEST_ERROR,
+                        "RDS is only available in WFM mode",
+                    )
+                if not self.config.enable_wfm_rds:
+                    raise RequestValidationError(
+                        EXIT_REQUEST_ERROR,
+                        "Error: server does not support RDS",
+                    )
+                decoder = self.graph.get_rds_decoder(session.frequency)
+                if session.rds_decoder is not None and session.rds_decoder is not decoder:
+                    session.rds_decoder.remove_subscriber(session)
+                session.rds_decoder = decoder
+                session.rds_subscribed = True
+                decoder.add_subscriber(session)
+            else:
+                if session.rds_decoder is not None:
+                    session.rds_decoder.remove_subscriber(session)
+                session.rds_decoder = None
+                session.rds_subscribed = False
+
+    def _refresh_rds_subscription_locked(self, session: "ClientSession") -> None:
+        if not session.rds_subscribed:
+            return
+        if session.mode != "audio" or session.modulation not in {"wfm", "wfm_stereo"} or not self.config.enable_wfm_rds:
+            if session.rds_decoder is not None:
+                session.rds_decoder.remove_subscriber(session)
+            session.rds_decoder = None
+            session.rds_subscribed = False
+            return
+        decoder = self.graph.get_rds_decoder(session.frequency)
+        if session.rds_decoder is decoder:
+            return
+        if session.rds_decoder is not None:
+            session.rds_decoder.remove_subscriber(session)
+        session.rds_decoder = decoder
+        decoder.add_subscriber(session)
 
     def _find_incompatible_requests(
         self,
@@ -1267,6 +1361,185 @@ class SharedStream:
             self.control_fifo_path = None
 
 
+class RdsDecoder:
+    def __init__(
+        self,
+        config: ServerConfig,
+        frequency: int,
+        manager: "StreamGraph",
+        parent: SharedStream,
+    ) -> None:
+        self.config = config
+        self.frequency = frequency
+        self.manager = manager
+        self.parent = parent
+        self.process: subprocess.Popen[bytes] | None = None
+        self.input_queue: queue.Queue[bytes | None] = queue.Queue(
+            maxsize=config.stream_queue_chunks
+        )
+        self.closed = threading.Event()
+        self.subscribers: set[ClientSession] = set()
+        self.subscribers_lock = threading.Lock()
+        self.input_thread: threading.Thread | None = None
+        self.output_thread: threading.Thread | None = None
+        self.stderr_thread: threading.Thread | None = None
+        self.snapshot: dict[str, Any] = {}
+
+    @property
+    def name(self) -> str:
+        return f"rds-{self.frequency}"
+
+    def start(self) -> None:
+        self.process = subprocess.Popen(
+            [
+                "redsea",
+                "-i",
+                "mpx",
+                "-r",
+                str(WFM_IQ_RATE),
+                "-u",
+                "-t",
+                "%c",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            start_new_session=True,
+        )
+        self.input_thread = threading.Thread(
+            target=self._input_loop,
+            name=f"{self.name}-input",
+            daemon=True,
+        )
+        self.output_thread = threading.Thread(
+            target=self._output_loop,
+            name=f"{self.name}-output",
+            daemon=True,
+        )
+        self.stderr_thread = threading.Thread(
+            target=self._stderr_loop,
+            name=f"{self.name}-stderr",
+            daemon=True,
+        )
+        self.input_thread.start()
+        self.output_thread.start()
+        self.stderr_thread.start()
+        self.parent.add_subscriber(self)
+        LOGGER.info("started shared RDS decoder %s", self.name)
+
+    def add_subscriber(self, subscriber: "ClientSession") -> None:
+        with self.subscribers_lock:
+            self.subscribers.add(subscriber)
+            snapshot = dict(self.snapshot)
+        if snapshot:
+            subscriber.send_control(
+                {
+                    "event": "rds",
+                    "frequency": self.frequency,
+                    "fields": snapshot,
+                }
+            )
+
+    def remove_subscriber(self, subscriber: "ClientSession") -> None:
+        should_close = False
+        with self.subscribers_lock:
+            self.subscribers.discard(subscriber)
+            should_close = not self.subscribers and not self.closed.is_set()
+        if should_close:
+            self.close("unused shared RDS decoder")
+
+    def enqueue(self, chunk: bytes) -> bool:
+        if self.closed.is_set():
+            return False
+        try:
+            self.input_queue.put(chunk, timeout=self.config.enqueue_timeout_seconds)
+            return True
+        except queue.Full:
+            LOGGER.warning("%s fell behind upstream input; closing branch", self.name)
+            self.close("stream backlog")
+            return False
+
+    def close(self, reason: str) -> None:
+        if self.closed.is_set():
+            return
+        LOGGER.info("closing shared RDS decoder %s: %s", self.name, reason)
+        self.closed.set()
+        self.parent.remove_subscriber(self)
+        self.manager.on_rds_decoder_closed(self)
+        try:
+            self.input_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if self.process is not None:
+            CaptureManager._terminate_process(self.process, "redsea")
+
+    def _input_loop(self) -> None:
+        try:
+            assert self.process is not None
+            assert self.process.stdin is not None
+            while not self.closed.is_set():
+                chunk = self.input_queue.get()
+                if chunk is None:
+                    break
+                self.process.stdin.write(chunk)
+        except BrokenPipeError:
+            LOGGER.info("%s stdin closed", self.name)
+        except Exception:
+            LOGGER.exception("%s input loop failed", self.name)
+        finally:
+            if self.process is not None and self.process.stdin is not None and not self.process.stdin.closed:
+                try:
+                    self.process.stdin.close()
+                except OSError:
+                    pass
+
+    def _output_loop(self) -> None:
+        try:
+            assert self.process is not None
+            assert self.process.stdout is not None
+            while not self.closed.is_set():
+                line = self.process.stdout.readline()
+                if not line:
+                    break
+                message = json.loads(line.decode("utf-8"))
+                fields = _extract_rds_fields(message)
+                changed: dict[str, Any] = {}
+                with self.subscribers_lock:
+                    for key, value in fields.items():
+                        if self.snapshot.get(key) != value:
+                            self.snapshot[key] = value
+                            changed[key] = value
+                    subscribers = list(self.subscribers)
+                if not changed:
+                    continue
+                payload = {
+                    "event": "rds",
+                    "frequency": self.frequency,
+                    "fields": changed,
+                }
+                for subscriber in subscribers:
+                    subscriber.send_control(payload)
+        except Exception:
+            LOGGER.exception("%s output loop failed", self.name)
+        finally:
+            if not self.closed.is_set():
+                self.close("process output ended")
+
+    def _stderr_loop(self) -> None:
+        assert self.process is not None
+        if self.process.stderr is None:
+            return
+        for line in iter(self.process.stderr.readline, b""):
+            if not line:
+                break
+            LOGGER.info(
+                "%s: %s",
+                self.name,
+                line.decode("utf-8", errors="replace").rstrip(),
+            )
+
+
 class StreamGraph:
     def __init__(self, config: ServerConfig) -> None:
         self.config = config
@@ -1276,19 +1549,24 @@ class StreamGraph:
         self.decimation_streams: dict[tuple[int, int, float, str], SharedStream] = {}
         self.format_streams: dict[tuple[int, int, str], Any] = {}
         self.audio_streams: dict[tuple[int, str], SharedStream] = {}
+        self.rds_decoders: dict[int, RdsDecoder] = {}
 
     def stop(self, reason: str) -> None:
         with self.lock:
             root = self.root_stream
             audio = list(self.audio_streams.values())
+            rds_decoders = list(self.rds_decoders.values())
             formats = list(self.format_streams.values())
             shifts = list(self.shift_streams.values())
             decimations = list(self.decimation_streams.values())
             self.root_stream = None
             self.audio_streams = {}
+            self.rds_decoders = {}
             self.format_streams = {}
             self.shift_streams = {}
             self.decimation_streams = {}
+        for decoder in rds_decoders:
+            decoder.close(reason)
         for stream in audio:
             stream.close(reason, propagate=True)
         for stream in formats:
@@ -1335,6 +1613,7 @@ class StreamGraph:
         old_decimation_streams: list[SharedStream] = []
         old_format_streams: list[Any] = []
         old_audio_streams: list[SharedStream] = []
+        old_rds_decoders: list[RdsDecoder] = []
         stream_switches: list[tuple[ClientSession, SharedStream]] = []
         with self.lock:
             self.config = new_config
@@ -1350,9 +1629,11 @@ class StreamGraph:
                 old_decimation_streams = list(self.decimation_streams.values())
                 old_format_streams = list(self.format_streams.values())
                 old_audio_streams = list(self.audio_streams.values())
+                old_rds_decoders = list(self.rds_decoders.values())
                 self.decimation_streams = {}
                 self.format_streams = {}
                 self.audio_streams = {}
+                self.rds_decoders = {}
             elif rebuild_audio_modulations:
                 old_audio_streams = [
                     stream
@@ -1383,6 +1664,8 @@ class StreamGraph:
         for session, desired_stream in stream_switches:
             session.switch_source_stream(desired_stream)
 
+        for decoder in old_rds_decoders:
+            decoder.close("reconfigured rds decoder")
         for stream in old_audio_streams:
             stream.close("reconfigured audio stream", propagate=False)
         for stream in old_format_streams:
@@ -1419,31 +1702,7 @@ class StreamGraph:
             root.config = self.config
             LOGGER.debug("reusing shared root stream convert")
 
-        shift_stream = self.shift_streams.get(frequency)
-        if shift_stream is None:
-            shift_rate = (self.config.center_frequency - frequency) / self.config.rtl_sample_rate
-            shift_name = f"shift-{frequency}"
-            shift_fifo_path = Path("/run/user") / str(os.getuid()) / f"csdr_server_{shift_name}_{os.getpid()}.fifo"
-            shift_stream = SharedStream(
-                config=self.config,
-                name=shift_name,
-                command=["csdr", "shift", "--fifo", str(shift_fifo_path)],
-                manager=self,
-                parent=root,
-                close_when_unused=True,
-                control_fifo_value=str(shift_rate),
-                control_fifo_path=shift_fifo_path,
-            )
-            shift_stream.start()
-            self.shift_streams[frequency] = shift_stream
-            LOGGER.debug(
-                "created shared shift stream for frequency=%s shift_rate=%s",
-                frequency,
-                shift_rate,
-            )
-        else:
-            shift_stream.config = self.config
-            LOGGER.debug("reusing shared shift stream for frequency=%s", frequency)
+        shift_stream = self._get_shift_stream_locked(frequency, root)
 
         if mode == "iq":
             assert output_rate is not None
@@ -1501,12 +1760,15 @@ class StreamGraph:
         audio_key = (frequency, modulation)
         audio_stream = self.audio_streams.get(audio_key)
         if audio_stream is None:
+            audio_parent = self._get_audio_demod_parent_locked(frequency, modulation, base_stream)
+            if modulation == "wfm_stereo":
+                audio_parent = self._get_wfm_shared_s16_mpx_locked(frequency, audio_parent)
             audio_stream = _build_audio_stream(
                 config=self.config,
                 frequency=frequency,
                 modulation=modulation,
                 manager=self,
-                parent=self._get_audio_demod_parent_locked(frequency, modulation, base_stream),
+                parent=audio_parent,
             )
             self.audio_streams[audio_key] = audio_stream
             LOGGER.debug(
@@ -1522,6 +1784,38 @@ class StreamGraph:
                 modulation,
             )
         return audio_stream
+
+    def _get_shift_stream_locked(
+        self,
+        frequency: int,
+        root: SharedStream,
+    ) -> SharedStream:
+        shift_stream = self.shift_streams.get(frequency)
+        if shift_stream is None:
+            shift_rate = (self.config.center_frequency - frequency) / self.config.rtl_sample_rate
+            shift_name = f"shift-{frequency}"
+            shift_fifo_path = Path("/run/user") / str(os.getuid()) / f"csdr_server_{shift_name}_{os.getpid()}.fifo"
+            shift_stream = SharedStream(
+                config=self.config,
+                name=shift_name,
+                command=["csdr", "shift", "--fifo", str(shift_fifo_path)],
+                manager=self,
+                parent=root,
+                close_when_unused=True,
+                control_fifo_value=str(shift_rate),
+                control_fifo_path=shift_fifo_path,
+            )
+            shift_stream.start()
+            self.shift_streams[frequency] = shift_stream
+            LOGGER.debug(
+                "created shared shift stream for frequency=%s shift_rate=%s",
+                frequency,
+                shift_rate,
+            )
+        else:
+            shift_stream.config = self.config
+            LOGGER.debug("reusing shared shift stream for frequency=%s", frequency)
+        return shift_stream
 
     def _get_audio_demod_parent_locked(
         self,
@@ -1549,6 +1843,72 @@ class StreamGraph:
             demod_stream.config = self.config
             LOGGER.debug("reusing shared WFM demod stream for frequency=%s", frequency)
         return demod_stream
+
+    def _get_wfm_shared_s16_mpx_locked(
+        self,
+        frequency: int,
+        parent: SharedStream,
+    ) -> SharedStream:
+        pcm_key = (frequency, "wfm_shared_s16_mpx")
+        pcm_stream = self.audio_streams.get(pcm_key)
+        if pcm_stream is None:
+            pcm_stream = SharedStream(
+                config=self.config,
+                name=f"audio-wfm-{frequency}-s16-mpx",
+                command=["csdr", "convert", "-i", "float", "-o", "s16"],
+                manager=self,
+                parent=parent,
+                close_when_unused=True,
+            )
+            pcm_stream.start()
+            self.audio_streams[pcm_key] = pcm_stream
+            LOGGER.debug("created shared WFM s16 MPX stream for frequency=%s", frequency)
+        else:
+            pcm_stream.config = self.config
+            LOGGER.debug("reusing shared WFM s16 MPX stream for frequency=%s", frequency)
+        return pcm_stream
+
+    def get_rds_decoder(self, frequency: int) -> RdsDecoder:
+        with self.lock:
+            root = self.root_stream
+            if root is None:
+                root = SharedStream(
+                    config=self.config,
+                    name="convert",
+                    command=["csdr", "convert", "-i", "char", "-o", "float"],
+                    manager=self,
+                    parent=None,
+                    close_when_unused=True,
+                )
+                root.start()
+                self.root_stream = root
+                LOGGER.debug("created shared root stream convert")
+            else:
+                root.config = self.config
+            shift_stream = self._get_shift_stream_locked(frequency, root)
+            base_stream = self._get_decimation_stream_locked(
+                frequency,
+                WFM_IQ_RATE,
+                WFM_AUDIO_TRANSITION_BANDWIDTH,
+                shift_stream,
+            )
+            demod_stream = self._get_audio_demod_parent_locked(frequency, "wfm", base_stream)
+            pcm_stream = self._get_wfm_shared_s16_mpx_locked(frequency, demod_stream)
+            decoder = self.rds_decoders.get(frequency)
+            if decoder is None:
+                decoder = RdsDecoder(
+                    config=self.config,
+                    frequency=frequency,
+                    manager=self,
+                    parent=pcm_stream,
+                )
+                decoder.start()
+                self.rds_decoders[frequency] = decoder
+                LOGGER.debug("created shared RDS decoder for frequency=%s", frequency)
+            else:
+                decoder.config = self.config
+                LOGGER.debug("reusing shared RDS decoder for frequency=%s", frequency)
+            return decoder
 
     def _get_decimation_stream_locked(
         self,
@@ -1686,6 +2046,12 @@ class StreamGraph:
                 if candidate is stream:
                     del self.decimation_streams[key]
 
+    def on_rds_decoder_closed(self, decoder: RdsDecoder) -> None:
+        with self.lock:
+            for frequency, candidate in list(self.rds_decoders.items()):
+                if candidate is decoder:
+                    del self.rds_decoders[frequency]
+
 
 class ClientSession:
     def __init__(
@@ -1719,6 +2085,9 @@ class ClientSession:
         self.control_conn: socket.socket | None = None
         self.control_reader: Any = None
         self.control_thread: threading.Thread | None = None
+        self.control_send_lock = threading.Lock()
+        self.rds_subscribed = False
+        self.rds_decoder: RdsDecoder | None = None
 
     def start(self) -> None:
         self.source_stream.add_subscriber(self)
@@ -1770,6 +2139,10 @@ class ClientSession:
         LOGGER.info("closing client %s:%s: %s", self.address[0], self.address[1], reason)
         self.closed.set()
         self.manager.unregister_client(self)
+        if self.rds_decoder is not None:
+            self.rds_decoder.remove_subscriber(self)
+            self.rds_decoder = None
+            self.rds_subscribed = False
         self.source_stream.remove_subscriber(self)
         try:
             self.chunk_queue.put_nowait(None)
@@ -1834,15 +2207,29 @@ class ClientSession:
                     command = message.get("command")
                     if command == "retune":
                         frequency = _parse_request_frequency(message)
-                        self.manager.retune_client(self, frequency)
-                        send_handshake(
-                            self.control_conn,
-                            {
-                                "status": "ok",
-                                "command": "retune",
-                                "frequency": frequency,
-                            },
+                        self.manager.reconfigure_client(self, frequency=frequency)
+                        self.send_control(_build_session_status_payload(self, command="retune"))
+                    elif command == "demod":
+                        modulation = message.get("modulation")
+                        if modulation is None:
+                            raise RequestValidationError(
+                                EXIT_REQUEST_ERROR,
+                                "demod command must include modulation",
+                            )
+                        self.manager.reconfigure_client(
+                            self,
+                            modulation=_normalize_audio_modulation(modulation),
                         )
+                        self.send_control(_build_session_status_payload(self, command="demod"))
+                    elif command == "rds":
+                        action = str(message.get("action", "")).strip().lower()
+                        if action not in {"start", "stop"}:
+                            raise RequestValidationError(
+                                EXIT_REQUEST_ERROR,
+                                "rds command must include action 'start' or 'stop'",
+                            )
+                        self.manager.set_rds_subscription(self, enabled=(action == "start"))
+                        self.send_control(_build_session_status_payload(self, command="rds"))
                     else:
                         raise RequestValidationError(
                             EXIT_REQUEST_ERROR,
@@ -1855,8 +2242,7 @@ class ClientSession:
                         self.address[1],
                         exc,
                     )
-                    send_handshake(
-                        self.control_conn,
+                    self.send_control(
                         {
                             "status": "error",
                             "code": exc.code,
@@ -1876,6 +2262,12 @@ class ClientSession:
                 self.address[0],
                 self.address[1],
             )
+
+    def send_control(self, payload: dict[str, Any]) -> None:
+        if self.control_conn is None:
+            raise OSError("control connection is not attached")
+        with self.control_send_lock:
+            send_handshake(self.control_conn, payload)
 
 
 def _validate_output_rate(input_rate: int, output_rate: int) -> None:
@@ -1965,6 +2357,71 @@ def _get_audio_channels(modulation: str) -> int:
     if modulation == "wfm_stereo":
         return 2
     return 1
+
+
+def _build_session_status_payload(
+    session: "ClientSession",
+    *,
+    command: str,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "status": "ok",
+        "command": command,
+        "frequency": session.frequency,
+        "mode": session.mode,
+        "rds_active": session.rds_subscribed,
+    }
+    if session.mode == "iq":
+        payload["format"] = session.sample_format
+        payload["sample_rate"] = session.output_rate
+    else:
+        assert session.modulation is not None
+        payload["format"] = DEFAULT_AUDIO_OUTPUT_FORMAT
+        payload["modulation"] = session.modulation
+        payload["sample_rate"] = _get_audio_output_rate(session.modulation)
+        payload["channels"] = _get_audio_channels(session.modulation)
+    return payload
+
+
+def _normalize_rds_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _extract_rds_fields(message: dict[str, Any]) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    callsign = _normalize_rds_text(message.get("callsign"))
+    if callsign is None:
+        callsign = _normalize_rds_text(message.get("callsign_uncertain"))
+    if callsign is not None:
+        fields["callsign"] = callsign
+    program_service = _normalize_rds_text(message.get("ps"))
+    if program_service is not None:
+        fields["program_service"] = program_service
+    radiotext = _normalize_rds_text(message.get("radiotext"))
+    if radiotext is not None:
+        fields["radiotext"] = radiotext
+    program_type = _normalize_rds_text(message.get("prog_type"))
+    if program_type is not None:
+        fields["program_type"] = program_type
+    radiotext_plus = message.get("radiotext_plus")
+    if isinstance(radiotext_plus, dict):
+        tags = radiotext_plus.get("tags")
+        if isinstance(tags, list):
+            for tag in tags:
+                if not isinstance(tag, dict):
+                    continue
+                content_type = tag.get("content-type")
+                data = _normalize_rds_text(tag.get("data"))
+                if data is None:
+                    continue
+                if content_type == "item.artist":
+                    fields["artist"] = data
+                elif content_type == "item.title":
+                    fields["title"] = data
+    return fields
 
 
 def _get_audio_iq_rate(modulation: str) -> int:
@@ -2319,14 +2776,6 @@ def _build_audio_stream(
         return output_stream
 
     if modulation == "wfm_stereo":
-        pcm_stream = SharedStream(
-            config=config,
-            name=f"audio-{modulation}-{frequency}-s16",
-            command=["csdr", "convert", "-i", "float", "-o", "s16"],
-            manager=manager,
-            parent=parent,
-            close_when_unused=True,
-        )
         deemphasis_tau = _get_wfm_deemphasis_tau(config.wfm_deemphasis_region)
         output_stream = SharedStream(
             config=config,
@@ -2341,13 +2790,11 @@ def _build_audio_stream(
                 str(deemphasis_tau),
             ],
             manager=manager,
-            parent=pcm_stream,
+            parent=parent,
             close_when_unused=True,
             output_read_size=_compute_output_read_size("s16", _get_audio_output_rate(modulation)),
         )
         try:
-            pcm_stream.start()
-            started_streams.append(pcm_stream)
             output_stream.start()
             started_streams.append(output_stream)
         except Exception:
@@ -2432,9 +2879,16 @@ def _validate_request_frequency(
     half_required_bandwidth = required_bandwidth / 2.0
     center_offset = abs(config.center_frequency - frequency)
     if center_offset + half_required_bandwidth > half_capture_bandwidth:
+        if required_bandwidth != config.rtl_sample_rate:
+            message = (
+                "requested frequency is out of band for the current RTL capture window "
+                f"at required bandwidth {required_bandwidth} S/s"
+            )
+        else:
+            message = "requested frequency is out of band for the current RTL capture window"
         raise RequestValidationError(
             EXIT_OUT_OF_BAND,
-            "requested frequency is out of band for the current RTL capture window",
+            message,
         )
 
 
@@ -2500,6 +2954,7 @@ def _validate_config(config: ServerConfig) -> None:
     _validate_demodulator_enabled("audio.nfm.enabled", config.nfm_enabled)
     _validate_demodulator_enabled("audio.wfm.enabled", config.wfm_enabled)
     _validate_enable_wfm_stereo(config.enable_wfm_stereo)
+    _validate_enable_wfm_rds(config.enable_wfm_rds)
     if not config.audio_support:
         return
     if config.nfm_enabled:
@@ -2593,6 +3048,11 @@ def _validate_enable_wfm_stereo(value: bool) -> None:
         raise ValueError("audio.wfm.stereo_support must be true or false")
 
 
+def _validate_enable_wfm_rds(value: bool) -> None:
+    if not isinstance(value, bool):
+        raise ValueError("audio.wfm.rds_support must be true or false")
+
+
 def _validate_wfm_deemphasis_region(value: str) -> None:
     _get_wfm_deemphasis_tau(value)
 
@@ -2657,6 +3117,10 @@ def _check_dependencies(config: ServerConfig) -> None:
     if config.audio_support and config.wfm_enabled and config.enable_wfm_stereo and shutil.which("demux") is None:
         raise FileNotFoundError(
             "Please install Stereo Demux for WFM stereo support"
+        )
+    if config.audio_support and config.wfm_enabled and config.enable_wfm_rds and shutil.which("redsea") is None:
+        raise FileNotFoundError(
+            "Please install redsea for WFM RDS support"
         )
 
 

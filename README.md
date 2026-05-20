@@ -54,9 +54,14 @@ You must still install the external DSP dependency yourself:
 - [jketterl/csdr](https://github.com/jketterl/csdr)
 
 If you enable WFM stereo, you must also install Stereo Demux and have
-`Demux` available on `PATH`:
+`demux` available on `PATH`:
 
 - [windytan/stereodemux](https://github.com/windytan/stereodemux)
+
+If you enable WFM RDS support, you must also install `redsea` and have
+`redsea` available on `PATH`:
+
+- [windytan/redsea](https://github.com/windytan/redsea)
 
 This project is written against the `jketterl/csdr` fork, not the original
 András Retzler version.
@@ -107,7 +112,11 @@ In audio mode, it plays audio through the default sound device by default. Use
 You can tune playback smoothing with `-B` / `--audio-prebuffer` and `-L` /
 `--audio-latency`, both in seconds.
 If the client is running with an interactive stdin, you can type
-`frequency <value>` to retune the active stream without reconnecting.
+`frequency <value>` to retune the active stream without reconnecting. In audio
+mode, you can also type `demod <mode>` to switch demodulators live. In IQ
+mode, `frequency` is the only accepted interactive command. Multiple commands
+can be entered on one line by separating them with semicolons, for example:
+`frequency 95.7M; demod wfm-stereo; rds start`.
 
 ## Configuration
 
@@ -169,6 +178,8 @@ Important settings:
   - enables or disables WFM support
 - `audio.wfm.stereo_support`
   - enables or disables WFM stereo support
+- `audio.wfm.rds_support`
+  - enables or disables WFM RDS support
 - `audio.wfm.deemphasis_region`
   - WFM deemphasis region, either `us` or `europe`
 - `server.listen_host`
@@ -192,6 +203,7 @@ Important settings:
 - `audio.nfm.lowpass_frequency` must be `null` or between `3000` and `8000`
 - `audio.nfm.lowpass_curve` must be between `0.005` and `0.5` when `audio.nfm.lowpass_frequency` is set
 - `audio.wfm.stereo_support` must be `true` or `false`
+- `audio.wfm.rds_support` must be `true` or `false`
 - `audio.wfm.deemphasis_region` must be either `us` or `europe`
 
 ## Live Reload
@@ -350,10 +362,10 @@ is `null`, the lowpass stage is omitted entirely.
 WFM audio uses a wider demodulation path and a 32 kHz final audio rate:
 
 - shift to the requested frequency
-- decimate to `170000` S/s
+- decimate to `240000` S/s
 - transition bandwidth `0.05`
 - `fmdemod`
-- `fractionaldecimator --format float 170000/32000 --prefilter`
+- `fractionaldecimator --format float 240000/32000 --prefilter`
 - `deemphasis --wfm 32000 <tau>e-6`
 - convert to `s16`
 
@@ -364,15 +376,15 @@ The WFM deemphasis curve comes from `audio.wfm.deemphasis_region`:
 - `europe`
   - `50` microseconds
 
-WFM stereo uses the same 170 kHz RF bandwidth and 32 kHz final audio rate, but
+WFM stereo uses the same 240 kHz RF bandwidth and 32 kHz final audio rate, but
 hands the demodulated PCM to Stereo Demux:
 
 - shift to the requested frequency
-- decimate to `170000` S/s
+- decimate to `240000` S/s
 - transition bandwidth `0.05`
 - `fmdemod`
 - `convert -i float -o s16`
-- `Demux -r 170000 -R 32000 -d <tau>`
+- `demux -r 240000 -R 32000 -d <tau>`
 
 This mode must be enabled by the server administrator with
 `audio.wfm.stereo_support=true`. If it is disabled, clients requesting
@@ -380,6 +392,36 @@ This mode must be enabled by the server administrator with
 
 On `csdr_server_client`, request this mode with `-M wfm-stereo`. The JSON API
 uses `wfm_stereo`.
+
+### WFM RDS
+
+RDS is only available in WFM mode and is delivered over the control socket, not
+the main stream socket.
+
+It must be enabled by the server administrator with `audio.wfm.rds_support=true`.
+If it is enabled, the server uses `redsea` on a shared WFM MPX `s16` branch.
+That branch is also shared with WFM stereo where possible, so the server does
+not duplicate the WFM MPX `float -> s16` conversion just to decode RDS.
+
+Interactive audio-mode clients can subscribe and unsubscribe with:
+
+```text
+rds start
+rds stop
+```
+
+They can also subscribe immediately on connect with:
+
+```bash
+csdr_server_client -a 127.0.0.1 -p 7355 -f 95.7M -m audio -M wfm --rds
+```
+
+If the server does not support RDS, or if the selected mode is not `wfm` or
+`wfm_stereo`, the client prints the server error and exits instead of silently
+starting without RDS.
+
+RDS updates are only sent when fields change. The stock client updates the
+display in place instead of printing a new line for every group.
 
 ## Operational Notes
 
@@ -556,6 +598,40 @@ Retune success:
 
 Retune errors use the same `status=error`, `code`, and `error` fields as the
 initial handshake.
+
+Audio clients may also switch demodulators live:
+
+```json
+{"command": "demod", "modulation": "wfm_stereo"}
+```
+
+Example success response:
+
+```json
+{"status": "ok", "command": "demod", "frequency": 95700000, "mode": "audio", "format": "s16", "modulation": "wfm_stereo", "sample_rate": 32000, "channels": 2}
+```
+
+WFM audio clients may also toggle RDS subscriptions live:
+
+```json
+{"command": "rds", "action": "start"}
+```
+
+```json
+{"command": "rds", "action": "stop"}
+```
+
+Example success response:
+
+```json
+{"status": "ok", "command": "rds", "frequency": 95700000, "mode": "audio", "format": "s16", "modulation": "wfm", "sample_rate": 32000, "channels": 1, "rds_active": true}
+```
+
+RDS event example:
+
+```json
+{"event": "rds", "frequency": 95700000, "fields": {"callsign": "WLHT", "program_service": "FEATHER", "radiotext": "Billie Eilish - Birds Of A Feather"}}
+```
 
 ### Stream Payload
 
