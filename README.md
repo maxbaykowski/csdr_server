@@ -50,14 +50,122 @@ will exit immediately with a clear runtime error.
 PortAudio support must exist on the system and the PortAudio build must have a
 usable backend for the platform.
 
+### Install for system-wide use
+
+If you want `csdr_server` to run like a normal system service, the safest
+approach is to install it into a Python virtual environment , as `pip` will complain if you try to install the package as root.
+
+Create a place for the program and its virtual environment:
+
+```bash
+sudo mkdir -p /opt/csdr_server
+sudo python3 -m venv /opt/csdr_server/venv
+```
+
+Install the project into that virtual environment from your local checkout:
+
+```bash
+sudo /opt/csdr_server/venv/bin/pip install /path/to/csdr_server
+```
+
+`/path/to/csdr_server` is the directory where you cloned this repository.
+
+Create a place for the server config and copy the example config there:
+
+```bash
+sudo mkdir -p /etc/csdr_server
+sudo cp config.example.json5 /etc/csdr_server/config.json5
+```
+
+At this point, you should be able to start the server manually with:
+
+```bash
+sudo /opt/csdr_server/venv/bin/csdr_server --config /etc/csdr_server/config.json5
+```
+
+### Make the commands available to all users
+
+If you want `csdr_server` and `csdr_server_client` to be available from anywhere
+on the system, including other users, create symlinks under `/usr/local/bin`:
+
+```bash
+sudo ln -sf /opt/csdr_server/venv/bin/csdr_server /usr/local/bin/csdr_server
+sudo ln -sf /opt/csdr_server/venv/bin/csdr_server_client /usr/local/bin/csdr_server_client
+```
+
+After that, any user can run:
+
+```bash
+csdr_server --help
+csdr_server_client --help
+```
+
+### Running the server with systemd
+
+Create a service file:
+
+```bash
+sudo tee /etc/systemd/system/csdr_server.service >/dev/null <<'EOF'
+[Unit]
+Description=csdr_server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+Group=YOUR_USERNAME
+WorkingDirectory=/opt/csdr_server
+ExecStart=/opt/csdr_server/venv/bin/csdr_server --config /etc/csdr_server/config.json5
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+Environment=PATH=/opt/csdr_server/venv/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+Replace `YOUR_USERNAME` with the name of the user account that already has
+confirmed RTL-SDR access on your system.
+
+Then load the unit and start it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now csdr_server
+```
+
+Useful commands:
+
+```bash
+sudo systemctl status csdr_server
+sudo systemctl restart csdr_server
+sudo systemctl reload csdr_server
+journalctl -u csdr_server -f
+```
+
+`systemctl reload csdr_server` sends `SIGHUP` to the running server, which
+makes it reload the config from disk.
+
+### Why the service should usually run as your existing SDR user
+
+Linux distributions do not grant RTL-SDR access the same way. Some distributions, such as Fedora, use `rtlsdr`, others, like Debian, use `plugdev`, and some use different `udev` or
+ACL rules, which makes it difficult to provide instructions that will work across every distro. Therefore, we recommend using the user account you already have set up for RTL dongles. This is most likely the user account you use to do everyday tasks on your system.
+
+If you want a more locked-down setup later, you can create a dedicated service
+useruser for csdr_server, however you'll need to give that user whatever RTL-SDR device
+access your distribution expects.
+
 ### External dependencies
 
-The SDR server requires [my fork of csdr](https://github.com/maxbaykowski/csdr) to be installed. My fork is based on the version of `csdr` that was made by [Jakob Ketterl](https://github.com/jketterl/csdr), however this version contains bugs that affect performance of `csdr_server`. I have also added additional features to my `csdr` fork that `csdr_server` makes use of.
+The SDR server requires my fork of [csdr](https://github.com/maxbaykowski/csdr) to be installed. My fork is based on the version of `csdr` that was made by [Jakob Ketterl](https://github.com/jketterl/csdr), however this version contains bugs that affect performance of `csdr_server`. I have also added additional features to my `csdr` fork that `csdr_server` makes use of.
 
-If you enable server side WFM stereo demodulation, you must also install [Stereo Demux](https://github.com/windytan/stereodemux) and have
-`demux` available on `PATH`. We use `Stereo Demux` to decode FM stereo.
+If you enable server side WFM stereo demodulation, you must also install [Stereo Demux](https://github.com/windytan/stereodemux) and have the `demux` binary available on `PATH`.
 
-If you enable WFM RDS support, you must also install [redsea](https://github.com/windytan/redsea) and have `redsea` binary available on `PATH`. We use `redsea` to decode RDS data for clients.
+If you enable WFM RDS support, you must also install [redsea](https://github.com/windytan/redsea) and have the `redsea` binary available on `PATH` as well.
 
 ## Quick Start
 
