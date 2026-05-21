@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 from ctypes import c_ubyte
+import errno
 import json
 import json5
 import logging
@@ -29,6 +30,7 @@ import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+import tempfile
 from typing import Any
 
 try:
@@ -66,6 +68,8 @@ WFM_IQ_RATE = 240_000
 WFM_AUDIO_OUTPUT_RATE = 32_000
 WFM_AUDIO_TRANSITION_BANDWIDTH = 0.05
 WFM_DEEMPHASIS_REGION = "us"
+
+_RUNTIME_DIR_CACHE: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -1329,7 +1333,7 @@ class SharedStream:
     def _setup_control_fifo(self) -> None:
         if self.control_fifo_value is None:
             return
-        runtime_dir = Path("/run/user") / str(os.getuid())
+        runtime_dir = _get_runtime_dir()
         runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         fifo_path = self.control_fifo_path or (runtime_dir / f"csdr_server_{self.name}_{os.getpid()}.fifo")
         if fifo_path.exists():
@@ -1838,7 +1842,7 @@ class StreamGraph:
         if shift_stream is None:
             shift_rate = (self.config.center_frequency - frequency) / self.config.rtl_sample_rate
             shift_name = f"shift-{frequency}"
-            shift_fifo_path = Path("/run/user") / str(os.getuid()) / f"csdr_server_{shift_name}_{os.getpid()}.fifo"
+            shift_fifo_path = _get_runtime_dir() / f"csdr_server_{shift_name}_{os.getpid()}.fifo"
             shift_stream = SharedStream(
                 config=self.config,
                 name=shift_name,
@@ -3152,6 +3156,57 @@ def _validate_audio_support(value: bool) -> None:
 def _validate_demodulator_enabled(name: str, value: bool) -> None:
     if not isinstance(value, bool):
         raise ValueError(f"{name} must be true or false")
+
+
+def _ensure_runtime_subdir(parent: Path, name: str) -> Path | None:
+    try:
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError:
+        return None
+    candidate = parent / name
+    try:
+        candidate.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(candidate, 0o700)
+    except OSError:
+        return None
+    if not os.access(candidate, os.W_OK | os.X_OK):
+        return None
+    return candidate
+
+
+def _get_runtime_dir() -> Path:
+    global _RUNTIME_DIR_CACHE
+    if _RUNTIME_DIR_CACHE is not None:
+        return _RUNTIME_DIR_CACHE
+
+    candidates: list[Path] = []
+    explicit_runtime_dir = os.environ.get("CSDR_SERVER_RUNTIME_DIR")
+    if explicit_runtime_dir:
+        candidates.append(Path(explicit_runtime_dir))
+
+    xdg_runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg_runtime_dir:
+        candidates.append(Path(xdg_runtime_dir) / "csdr_server")
+
+    candidates.append(Path("/run/csdr_server"))
+
+    home = Path.home()
+    if str(home) not in {"", "."}:
+        candidates.append(home / ".cache" / "csdr_server" / "runtime")
+
+    candidates.append(Path(tempfile.gettempdir()) / f"csdr_server-{os.getuid()}")
+
+    for candidate in candidates:
+        runtime_dir = _ensure_runtime_subdir(candidate.parent, candidate.name)
+        if runtime_dir is not None:
+            _RUNTIME_DIR_CACHE = runtime_dir
+            return runtime_dir
+
+    raise OSError(
+        errno.EACCES,
+        "could not create a writable runtime directory for csdr_server; "
+        "set CSDR_SERVER_RUNTIME_DIR or XDG_RUNTIME_DIR to a writable path",
+    )
 
 
 def _validate_listen_host(value: str) -> None:

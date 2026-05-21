@@ -116,6 +116,9 @@ Type=simple
 User=YOUR_USERNAME
 Group=YOUR_USERNAME
 WorkingDirectory=/opt/csdr_server
+RuntimeDirectory=csdr_server
+RuntimeDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=/run/csdr_server
 ExecStart=/opt/csdr_server/venv/bin/csdr_server --config /etc/csdr_server/config.json5
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
@@ -150,10 +153,14 @@ journalctl -u csdr_server -f
 `systemctl reload csdr_server` sends `SIGHUP` to the running server, which
 makes it reload the config from disk.
 
+The `RuntimeDirectory=` line tells systemd to create `/run/csdr_server` with
+the correct ownership before the service starts. `csdr_server` uses that
+directory for FIFOs, which `csdr` relys upon for certain tasks, and to store other temporary runtime files.
+
 ### Why the service should usually run as your existing SDR user
 
-Linux distributions do not grant RTL-SDR access the same way. Some distributions, such as Fedora, use `rtlsdr`, others, like Debian, use `plugdev`, and some use different `udev` or
-ACL rules, which makes it difficult to provide instructions that will work across every distro. Therefore, we recommend using the user account you already have set up for RTL dongles. This is most likely the user account you use to do everyday tasks on your system.
+Linux distributions do not grant RTL-SDR access the same way, so we can't give instructions on how to create a dedicated user account that will work across all distros, since the user account needs USB access to the RTL-SDR.  Some distributions, such as Fedora, use `rtlsdr`, others, like Debian, use `plugdev`, and some use different `udev` or
+ACL rules. Therefore, we recommend using the user account you already have set up for RTL dongles. This is most likely your user account that you use on your system to perform everyday tasks.
 
 If you want a more locked-down setup later, you can create a dedicated service
 useruser for csdr_server, however you'll need to give that user whatever RTL-SDR device
