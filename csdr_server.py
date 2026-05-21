@@ -716,6 +716,7 @@ class CaptureManager:
             self.graph.apply_runtime_config(
                 new_config=next_config,
                 sessions=client_requests,
+                rebuild_shift_path=center_or_rate_changed or dc_block_changed,
                 rebuild_decimators=center_or_rate_changed or transition_changed or dc_block_changed,
                 rebuild_audio_modulations=rebuild_audio_modulations,
             )
@@ -1545,6 +1546,7 @@ class StreamGraph:
         self.config = config
         self.lock = threading.Lock()
         self.root_stream: SharedStream | None = None
+        self.root_dcblock_stream: SharedStream | None = None
         self.shift_streams: dict[int, SharedStream] = {}
         self.decimation_streams: dict[tuple[int, int, float, str], SharedStream] = {}
         self.format_streams: dict[tuple[int, int, str], Any] = {}
@@ -1554,12 +1556,14 @@ class StreamGraph:
     def stop(self, reason: str) -> None:
         with self.lock:
             root = self.root_stream
+            root_dcblock = self.root_dcblock_stream
             audio = list(self.audio_streams.values())
             rds_decoders = list(self.rds_decoders.values())
             formats = list(self.format_streams.values())
             shifts = list(self.shift_streams.values())
             decimations = list(self.decimation_streams.values())
             self.root_stream = None
+            self.root_dcblock_stream = None
             self.audio_streams = {}
             self.rds_decoders = {}
             self.format_streams = {}
@@ -1575,6 +1579,8 @@ class StreamGraph:
             stream.close(reason, propagate=True)
         for stream in shifts:
             stream.close(reason, propagate=True)
+        if root_dcblock is not None:
+            root_dcblock.close(reason, propagate=True)
         if root is not None:
             root.close(reason, propagate=True)
 
@@ -1607,25 +1613,43 @@ class StreamGraph:
         self,
         new_config: ServerConfig,
         sessions: list["ClientSession"],
+        rebuild_shift_path: bool,
         rebuild_decimators: bool,
         rebuild_audio_modulations: set[str],
     ) -> None:
+        old_shift_streams: list[SharedStream] = []
         old_decimation_streams: list[SharedStream] = []
         old_format_streams: list[Any] = []
         old_audio_streams: list[SharedStream] = []
         old_rds_decoders: list[RdsDecoder] = []
+        old_root_dcblock_stream: SharedStream | None = None
         stream_switches: list[tuple[ClientSession, SharedStream]] = []
         with self.lock:
             self.config = new_config
             if self.root_stream is not None:
                 self.root_stream.config = new_config
+            if self.root_dcblock_stream is not None:
+                self.root_dcblock_stream.config = new_config
             for frequency, stream in self.shift_streams.items():
                 stream.config = new_config
                 stream.send_control_value(
                     str((new_config.center_frequency - frequency) / new_config.rtl_sample_rate)
                 )
 
-            if rebuild_decimators:
+            if rebuild_shift_path:
+                old_shift_streams = list(self.shift_streams.values())
+                old_decimation_streams = list(self.decimation_streams.values())
+                old_format_streams = list(self.format_streams.values())
+                old_audio_streams = list(self.audio_streams.values())
+                old_rds_decoders = list(self.rds_decoders.values())
+                old_root_dcblock_stream = self.root_dcblock_stream
+                self.shift_streams = {}
+                self.decimation_streams = {}
+                self.format_streams = {}
+                self.audio_streams = {}
+                self.rds_decoders = {}
+                self.root_dcblock_stream = None
+            elif rebuild_decimators:
                 old_decimation_streams = list(self.decimation_streams.values())
                 old_format_streams = list(self.format_streams.values())
                 old_audio_streams = list(self.audio_streams.values())
@@ -1672,6 +1696,10 @@ class StreamGraph:
             stream.close("reconfigured output format", propagate=False)
         for stream in old_decimation_streams:
             stream.close("reconfigured decimator", propagate=False)
+        for stream in old_shift_streams:
+            stream.close("reconfigured shift stream", propagate=False)
+        if old_root_dcblock_stream is not None:
+            old_root_dcblock_stream.close("reconfigured root dcblock", propagate=False)
 
     def _get_output_stream_locked(
         self,
@@ -1702,7 +1730,8 @@ class StreamGraph:
             root.config = self.config
             LOGGER.debug("reusing shared root stream convert")
 
-        shift_stream = self._get_shift_stream_locked(frequency, root)
+        shift_parent = self._get_root_shift_parent_locked(root)
+        shift_stream = self._get_shift_stream_locked(frequency, shift_parent)
 
         if mode == "iq":
             assert output_rate is not None
@@ -1817,6 +1846,41 @@ class StreamGraph:
             LOGGER.debug("reusing shared shift stream for frequency=%s", frequency)
         return shift_stream
 
+    def _get_root_shift_parent_locked(self, root: SharedStream) -> SharedStream:
+        if not self.config.dc_block:
+            return root
+        root_dcblock = self.root_dcblock_stream
+        if root_dcblock is None:
+            root_dcblock = SharedStream(
+                config=self.config,
+                name="iq-root-dcblock",
+                command=[
+                    "csdr",
+                    "dcblock",
+                    str(self.config.rtl_sample_rate),
+                    "--cutoff",
+                    "15",
+                    "--fade",
+                    "0.5",
+                ],
+                manager=self,
+                parent=root,
+                close_when_unused=True,
+            )
+            root_dcblock.start()
+            self.root_dcblock_stream = root_dcblock
+            LOGGER.debug(
+                "created shared root IQ dcblock stream rtl_sample_rate=%s",
+                self.config.rtl_sample_rate,
+            )
+        else:
+            root_dcblock.config = self.config
+            LOGGER.debug(
+                "reusing shared root IQ dcblock stream rtl_sample_rate=%s",
+                self.config.rtl_sample_rate,
+            )
+        return root_dcblock
+
     def _get_audio_demod_parent_locked(
         self,
         frequency: int,
@@ -1885,7 +1949,8 @@ class StreamGraph:
                 LOGGER.debug("created shared root stream convert")
             else:
                 root.config = self.config
-            shift_stream = self._get_shift_stream_locked(frequency, root)
+            shift_parent = self._get_root_shift_parent_locked(root)
+            shift_stream = self._get_shift_stream_locked(frequency, shift_parent)
             base_stream = self._get_decimation_stream_locked(
                 frequency,
                 WFM_IQ_RATE,
@@ -1919,24 +1984,22 @@ class StreamGraph:
     ) -> SharedStream:
         _validate_output_rate(self.config.rtl_sample_rate, output_rate)
         strategy = _get_decimation_strategy(self.config.rtl_sample_rate, output_rate)
-        if strategy == "identity" and not self.config.dc_block:
+        if strategy == "identity":
             LOGGER.debug(
-                "using identity IQ stream frequency=%s output_rate=%s dc_block=%s",
+                "using identity IQ stream frequency=%s output_rate=%s",
                 frequency,
                 output_rate,
-                self.config.dc_block,
             )
             return parent
-        key = (frequency, output_rate, transition_bandwidth, strategy, self.config.dc_block)
+        key = (frequency, output_rate, transition_bandwidth, strategy)
         decimation_stream = self.decimation_streams.get(key)
         if decimation_stream is None:
-            rate_stream = parent
             if strategy == "integer":
                 decimation = _compute_integer_decimation(
                     self.config.rtl_sample_rate,
                     output_rate,
                 )
-                rate_stream = SharedStream(
+                decimation_stream = SharedStream(
                     config=self.config,
                     name=f"firdecimate-{frequency}-{output_rate}-{transition_bandwidth}",
                     command=[
@@ -1949,7 +2012,7 @@ class StreamGraph:
                     parent=parent,
                     close_when_unused=True,
                 )
-                rate_stream.start()
+                decimation_stream.start()
                 LOGGER.debug(
                     "created shared integer decimation stream frequency=%s output_rate=%s transition_bandwidth=%s decimation=%s",
                     frequency,
@@ -1962,7 +2025,7 @@ class StreamGraph:
                     self.config.rtl_sample_rate,
                     output_rate,
                 )
-                rate_stream = SharedStream(
+                decimation_stream = SharedStream(
                     config=self.config,
                     name=f"fractionaldecimator-{frequency}-{output_rate}-{transition_bandwidth}",
                     command=[
@@ -1979,7 +2042,7 @@ class StreamGraph:
                     parent=parent,
                     close_when_unused=True,
                 )
-                rate_stream.start()
+                decimation_stream.start()
                 LOGGER.debug(
                     "created shared fractional decimation stream frequency=%s output_rate=%s transition_bandwidth=%s decimation_ratio=%s",
                     frequency,
@@ -1989,43 +2052,22 @@ class StreamGraph:
                 )
             elif strategy == "identity":
                 LOGGER.debug(
-                    "using identity IQ stream frequency=%s output_rate=%s dc_block=%s",
+                    "using identity IQ stream frequency=%s output_rate=%s",
                     frequency,
                     output_rate,
-                    self.config.dc_block,
                 )
+                decimation_stream = parent
             else:
                 raise ValueError(f"unsupported decimation strategy {strategy!r}")
-
-            if self.config.dc_block:
-                decimation_stream = SharedStream(
-                    config=self.config,
-                    name=f"iq-dcblock-{frequency}-{output_rate}-{transition_bandwidth}-{strategy}",
-                    command=["csdr", "dcblock"],
-                    manager=self,
-                    parent=rate_stream,
-                    close_when_unused=True,
-                )
-                decimation_stream.start()
-                LOGGER.debug(
-                    "created shared IQ dcblock stream frequency=%s output_rate=%s transition_bandwidth=%s strategy=%s",
-                    frequency,
-                    output_rate,
-                    transition_bandwidth,
-                    strategy,
-                )
-            else:
-                decimation_stream = rate_stream
             self.decimation_streams[key] = decimation_stream
         else:
             decimation_stream.config = self.config
             LOGGER.debug(
-                "reusing shared %s decimation stream frequency=%s output_rate=%s transition_bandwidth=%s dc_block=%s",
+                "reusing shared %s decimation stream frequency=%s output_rate=%s transition_bandwidth=%s",
                 strategy,
                 frequency,
                 output_rate,
                 transition_bandwidth,
-                self.config.dc_block,
             )
         return decimation_stream
 
@@ -2033,6 +2075,8 @@ class StreamGraph:
         with self.lock:
             if self.root_stream is stream:
                 self.root_stream = None
+            if self.root_dcblock_stream is stream:
+                self.root_dcblock_stream = None
             for key, candidate in list(self.audio_streams.items()):
                 if candidate is stream:
                     del self.audio_streams[key]

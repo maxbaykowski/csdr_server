@@ -254,7 +254,7 @@ What live reload does:
 - `rtl.ppm_correction`
   - updates frequency correction
 - `rtl.dc_block`
-  - rebuilds shared IQ-rate stages so both IQ and audio clients pick up the new IQ-level DC blocker
+  - rebuilds the shared full-band IQ path so both IQ and audio clients pick up the new IQ-level DC blocker
 - `rtl.transition_bandwidth`
   - rebuilds decimation stages
 - `audio.nfm.deemphasis_tau`
