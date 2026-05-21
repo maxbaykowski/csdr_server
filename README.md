@@ -57,7 +57,7 @@ The SDR server requires [my fork of csdr](https://github.com/maxbaykowski/csdr) 
 If you enable server side WFM stereo demodulation, you must also install [Stereo Demux](https://github.com/windytan/stereodemux) and have
 `demux` available on `PATH`. We use `Stereo Demux` to decode FM stereo.
 
-If you enable WFM RDS support, you must also install [redsea](https://github.com/windytan/redsea) and have `redsea` binary available on `PATH`. we use `Redsea` for sending RDS data to clients.
+If you enable WFM RDS support, you must also install [redsea](https://github.com/windytan/redsea) and have `redsea` binary available on `PATH`. We use `redsea` to decode RDS data for clients.
 
 ## Quick Start
 
@@ -194,8 +194,9 @@ The config is grouped into three sections:
   - enables or disables WFM stereo support
 - `rds_support`
   - enables or disables WFM RDS support
-- `deemphasis_region`
-  - WFM deemphasis region, either `us` or `europe`
+- `region`
+  - WFM regional setting, either `us` or `europe`
+  - affects WFM deemphasis and whether RBDS callsign decoding is enabled for RDS
 
 #### Server
 
@@ -221,7 +222,7 @@ The config is grouped into three sections:
 - `audio.nfm.lowpass_curve` must be between `0.005` and `0.5` when `audio.nfm.lowpass_frequency` is set
 - `audio.wfm.stereo_support` must be `true` or `false`
 - `audio.wfm.rds_support` must be `true` or `false`
-- `audio.wfm.deemphasis_region` must be either `us` or `europe`
+- `audio.wfm.region` must be either `us` or `europe`
 
 ## Live Reload
 
@@ -247,7 +248,8 @@ These settings can be changed live:
 - `rtl.dc_block`
 - `rtl.transition_bandwidth`
 - `audio.nfm.deemphasis_tau`
-- `audio.wfm.deemphasis_region`
+- `audio.nfm.lowpass_frequency`
+- `audio.nfm.lowpass_curve`
 
 What live reload does:
 
@@ -272,12 +274,10 @@ What live reload does:
   - rebuilds active NFM audio stages so clients pick up the new lowpass setting
 - `audio.nfm.lowpass_curve`
   - rebuilds active NFM audio stages so clients pick up the new lowpass curve
-- `audio.wfm.deemphasis_region`
-  - rebuilds active WFM audio stages so clients pick up the new deemphasis curve
 
 If `audio.audio_support`, any `audio.<demod>.enabled` setting, or
-`audio.wfm.stereo_support` changes, restart the server. Those settings are not
-applied live.
+`audio.wfm.stereo_support`, `audio.wfm.rds_support`, or `audio.wfm.region`
+changes, restart the server. Those settings are not applied live.
 
 If `rtl.automatic_tuning` changes, restart the server. That setting is not
 applied live.
@@ -328,7 +328,7 @@ AM, SSB, and NFM demodulation modes will send 16 KHZ 16 bit PCM mono samples to 
 RDS is only available in WFM mode and is delivered over the control socket, not
 the main stream socket.
 
-It must be enabled by the server administrator by setting `rds_support=true` in the json configuration. If it is enabled, the server uses `redsea` to decode RDS data.
+It must be enabled by the server administrator by setting `audio.wfm.rds_support=true` in the config. If it is enabled, the server uses `redsea` to decode RDS data.
 
 Interactive audio-mode clients can start and stop RDS decoding with:
 

@@ -91,7 +91,7 @@ class ServerConfig:
     wfm_enabled: bool = True
     enable_wfm_stereo: bool = False
     enable_wfm_rds: bool = False
-    wfm_deemphasis_region: str = WFM_DEEMPHASIS_REGION
+    wfm_region: str = WFM_DEEMPHASIS_REGION
     listen_host: str = "0.0.0.0"
     listen_port: int = 7355
     read_chunk_size: int = 262_144
@@ -220,13 +220,16 @@ class ServerConfig:
                 ),
                 "audio.wfm.rds_support",
             ),
-            wfm_deemphasis_region=(
-                _normalize_wfm_deemphasis_region(
+            wfm_region=(
+                _normalize_wfm_region(
                     _config_value(
                         audio_settings,
                         wfm_settings,
-                        "deemphasis_region",
-                        audio_settings.get("wfm_deemphasis_region", WFM_DEEMPHASIS_REGION),
+                        "region",
+                        wfm_settings.get(
+                            "deemphasis_region",
+                            audio_settings.get("wfm_deemphasis_region", WFM_DEEMPHASIS_REGION),
+                        ),
                     )
                 )
                 if audio_support and wfm_enabled
@@ -364,8 +367,8 @@ def _parse_bool(value: Any, name: str) -> bool:
     raise ValueError(f"{name} must be true or false")
 
 
-def _normalize_wfm_deemphasis_region(value: Any) -> str:
-    return _parse_string(value, "audio.wfm.deemphasis_region").strip().lower()
+def _normalize_wfm_region(value: Any) -> str:
+    return _parse_string(value, "audio.wfm.region").strip().lower()
 
 
 def _get_config_section(data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -647,7 +650,6 @@ class CaptureManager:
                 "nfm_deemphasis_tau",
                 "nfm_lowpass_frequency",
                 "nfm_lowpass_curve",
-                "wfm_deemphasis_region",
             }
             ignored_fields = [
                 field_name
@@ -688,10 +690,6 @@ class CaptureManager:
                 or next_config.nfm_lowpass_curve != current_config.nfm_lowpass_curve
             ):
                 rebuild_audio_modulations.add("nfm")
-            if next_config.wfm_deemphasis_region != current_config.wfm_deemphasis_region:
-                rebuild_audio_modulations.add("wfm")
-                rebuild_audio_modulations.add("wfm_stereo")
-
             client_requests = self._snapshot_client_requests()
             if center_or_rate_changed:
                 incompatible_errors = self._find_incompatible_requests(next_config, client_requests)
@@ -724,7 +722,7 @@ class CaptureManager:
             for session in client_requests:
                 self._refresh_rds_subscription_locked(session)
             LOGGER.info(
-                "config reload applied: center_frequency=%s rtl_sample_rate=%s automatic_gain_control=%s rtl_gain=%s ppm_correction=%s dc_block=%s transition_bandwidth=%s nfm_deemphasis_tau=%s wfm_deemphasis_region=%s",
+                "config reload applied: center_frequency=%s rtl_sample_rate=%s automatic_gain_control=%s rtl_gain=%s ppm_correction=%s dc_block=%s transition_bandwidth=%s nfm_deemphasis_tau=%s wfm_region=%s",
                 next_config.center_frequency,
                 next_config.rtl_sample_rate,
                 next_config.automatic_gain_control,
@@ -733,7 +731,7 @@ class CaptureManager:
                 next_config.dc_block,
                 next_config.transition_bandwidth,
                 next_config.nfm_deemphasis_tau,
-                next_config.wfm_deemphasis_region,
+                next_config.wfm_region,
             )
             return True
 
@@ -1392,16 +1390,7 @@ class RdsDecoder:
 
     def start(self) -> None:
         self.process = subprocess.Popen(
-            [
-                "redsea",
-                "-i",
-                "mpx",
-                "-r",
-                str(WFM_IQ_RATE),
-                "-u",
-                "-t",
-                "%c",
-            ],
+            self._build_command(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1428,6 +1417,24 @@ class RdsDecoder:
         self.stderr_thread.start()
         self.parent.add_subscriber(self)
         LOGGER.info("started shared RDS decoder %s", self.name)
+
+    def _build_command(self) -> list[str]:
+        command = [
+            "redsea",
+            "-i",
+            "mpx",
+            "-r",
+            str(WFM_IQ_RATE),
+        ]
+        if self.config.wfm_region == "us":
+            command.append("-u")
+        command.extend(
+            [
+                "-t",
+                "%c",
+            ]
+        )
+        return command
 
     def add_subscriber(self, subscriber: "ClientSession") -> None:
         with self.subscribers_lock:
@@ -2525,7 +2532,7 @@ def _get_wfm_deemphasis_tau(region: str) -> int:
     if normalized_region == "europe":
         return 50
     raise ValueError(
-        "audio.wfm.deemphasis_region must be either 'us' or 'europe'"
+        "audio.wfm.region must be either 'us' or 'europe'"
     )
 
 
@@ -2782,7 +2789,7 @@ def _build_audio_stream(
             parent=parent,
             close_when_unused=True,
         )
-        deemphasis_tau = _get_wfm_deemphasis_tau(config.wfm_deemphasis_region)
+        deemphasis_tau = _get_wfm_deemphasis_tau(config.wfm_region)
         deemphasis_stream = SharedStream(
             config=config,
             name=f"audio-{modulation}-{frequency}-deemphasis",
@@ -2820,7 +2827,7 @@ def _build_audio_stream(
         return output_stream
 
     if modulation == "wfm_stereo":
-        deemphasis_tau = _get_wfm_deemphasis_tau(config.wfm_deemphasis_region)
+        deemphasis_tau = _get_wfm_deemphasis_tau(config.wfm_region)
         output_stream = SharedStream(
             config=config,
             name=f"audio-{modulation}-{frequency}",
@@ -3007,7 +3014,7 @@ def _validate_config(config: ServerConfig) -> None:
         if config.nfm_lowpass_frequency is not None:
             _validate_nfm_lowpass_curve(config.nfm_lowpass_curve)
     if config.wfm_enabled:
-        _validate_wfm_deemphasis_region(config.wfm_deemphasis_region)
+        _validate_wfm_region(config.wfm_region)
 
 
 def _validate_rtl_device_index(value: int) -> None:
@@ -3097,7 +3104,7 @@ def _validate_enable_wfm_rds(value: bool) -> None:
         raise ValueError("audio.wfm.rds_support must be true or false")
 
 
-def _validate_wfm_deemphasis_region(value: str) -> None:
+def _validate_wfm_region(value: str) -> None:
     _get_wfm_deemphasis_tau(value)
 
 
