@@ -120,6 +120,19 @@ class ServerConfig:
         usb_enabled = _parse_bool(usb_settings.get("enabled", True), "audio.usb.enabled")
         nfm_enabled = _parse_bool(nfm_settings.get("enabled", True), "audio.nfm.enabled")
         wfm_enabled = _parse_bool(wfm_settings.get("enabled", True), "audio.wfm.enabled")
+        nfm_lowpass_frequency = (
+            _optional_int(
+                _config_value(
+                    audio_settings,
+                    nfm_settings,
+                    "lowpass_frequency",
+                    3200,
+                ),
+                "audio.nfm.lowpass_frequency",
+            )
+            if audio_support and nfm_enabled
+            else 3200
+        )
         config = cls(
             rtl_device_index=_parse_int(
                 _config_value(data, rtl_settings, "rtl_device_index", 0),
@@ -175,19 +188,7 @@ class ServerConfig:
                 if audio_support and nfm_enabled
                 else NFM_AUDIO_DEEMPHASIS_TAU
             ),
-            nfm_lowpass_frequency=(
-                _optional_int(
-                    _config_value(
-                        audio_settings,
-                        nfm_settings,
-                        "lowpass_frequency",
-                        3200,
-                    ),
-                    "audio.nfm.lowpass_frequency",
-                )
-                if audio_support and nfm_enabled
-                else 3200
-            ),
+            nfm_lowpass_frequency=nfm_lowpass_frequency,
             nfm_lowpass_curve=(
                 _parse_float(
                     _config_value(
@@ -198,7 +199,7 @@ class ServerConfig:
                     ),
                     "audio.nfm.lowpass_curve",
                 )
-                if audio_support and nfm_enabled
+                if audio_support and nfm_enabled and nfm_lowpass_frequency is not None
                 else 0.5
             ),
             wfm_enabled=wfm_enabled,
@@ -562,6 +563,7 @@ class CaptureManager:
         exclude_session: "ClientSession | None" = None,
     ) -> None:
         with self.reconfigure_lock:
+            _validate_requested_mode_supported(self.config, mode, modulation)
             required_bandwidth = _get_required_bandwidth(mode, output_rate, modulation)
             if not self.config.automatic_tuning:
                 _validate_request_frequency(self.config, frequency, required_bandwidth)
@@ -585,6 +587,7 @@ class CaptureManager:
             self.graph.apply_runtime_config(
                 new_config=next_config,
                 sessions=sessions,
+                rebuild_shift_path=False,
                 rebuild_decimators=False,
                 rebuild_audio_modulations=set(),
             )
@@ -625,6 +628,7 @@ class CaptureManager:
             self.graph.apply_runtime_config(
                 new_config=next_config,
                 sessions=sessions,
+                rebuild_shift_path=False,
                 rebuild_decimators=False,
                 rebuild_audio_modulations=set(),
             )
@@ -832,6 +836,7 @@ class CaptureManager:
                     self.graph.apply_runtime_config(
                         new_config=next_config,
                         sessions=remaining_sessions + [session],
+                        rebuild_shift_path=False,
                         rebuild_decimators=False,
                         rebuild_audio_modulations=set(),
                     )
@@ -873,7 +878,7 @@ class CaptureManager:
                 if not self.config.enable_wfm_rds:
                     raise RequestValidationError(
                         EXIT_REQUEST_ERROR,
-                        "Error: server does not support RDS",
+                        "Server does not support decoding of RDS data",
                     )
                 decoder = self.graph.get_rds_decoder(session.frequency)
                 if session.rds_decoder is not None and session.rds_decoder is not decoder:
@@ -1676,6 +1681,9 @@ class StreamGraph:
                     for key, stream in self.audio_streams.items()
                     if key[1] not in rebuild_audio_modulations
                 }
+                if {"wfm", "wfm_stereo"} & rebuild_audio_modulations:
+                    old_rds_decoders = list(self.rds_decoders.values())
+                    self.rds_decoders = {}
 
             for session in sessions:
                 session.config = new_config
@@ -2487,6 +2495,20 @@ def _get_audio_transition_bandwidth(modulation: str) -> float:
     return AM_AUDIO_TRANSITION_BANDWIDTH
 
 
+def _validate_requested_mode_supported(
+    config: ServerConfig,
+    mode: str,
+    modulation: str | None,
+) -> None:
+    if mode == "audio":
+        if modulation is None:
+            raise RequestValidationError(
+                EXIT_REQUEST_ERROR,
+                "audio mode request must include modulation",
+            )
+        _validate_audio_modulation_supported(config, modulation)
+
+
 def _validate_audio_modulation_supported(config: ServerConfig, modulation: str) -> None:
     if not config.audio_support:
         raise RequestValidationError(
@@ -3008,6 +3030,20 @@ def _validate_config(config: ServerConfig) -> None:
     _validate_enable_wfm_rds(config.enable_wfm_rds)
     if not config.audio_support:
         return
+    if not any(
+        (
+            config.am_enabled,
+            config.lsb_enabled,
+            config.usb_enabled,
+            config.nfm_enabled,
+            config.wfm_enabled,
+        )
+    ):
+        raise ValueError(
+            "audio.audio_support is true, but all audio demodulators are disabled; "
+            "enable at least one of audio.am.enabled, audio.lsb.enabled, "
+            "audio.usb.enabled, audio.nfm.enabled, or audio.wfm.enabled"
+        )
     if config.nfm_enabled:
         _validate_nfm_deemphasis_tau(config.nfm_deemphasis_tau)
         _validate_nfm_lowpass_frequency(config.nfm_lowpass_frequency)
