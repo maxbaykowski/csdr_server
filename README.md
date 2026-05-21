@@ -2,14 +2,7 @@
 
 `csdr_server` is a network RTL-SDR server written in Python. It reads IQ data
 from an RTL-SDR dongle with `pyrtlsdr`, uses `csdr` for shifting and
-decimation, and serves IQ streams to one or more clients over TCP.
-
-The main goal is to be boring and reliable:
-
-- multiple clients can connect at the same time
-- each client can request its own frequency and sample rate within the captured bandwidth
-- the server can retune and apply several radio settings live without a restart
-- if the dongle disappears and comes back, the server will try to recover
+decimation, and serves IQ or audio streams to one or more clients over TCP.
 
 ## What Users Will Care About
 
@@ -20,7 +13,7 @@ The main goal is to be boring and reliable:
 - Two output formats are supported:
   - `f32`
   - `s16`
-- Repeated requests are shared where possible:
+- Repeated requests are shared where possible to save CPU:
   - same frequency: shared shift stage
   - same frequency and sample rate: shared decimation stage
   - same frequency, sample rate, and format: shared final output stage
@@ -57,22 +50,14 @@ will exit immediately with a clear runtime error.
 PortAudio support must exist on the system and the PortAudio build must have a
 usable backend for the platform.
 
-You must still install the external DSP dependency yourself:
+### External dependencies
 
-- [jketterl/csdr](https://github.com/jketterl/csdr)
+The SDR server requires [my fork of csdr](https://github.com/maxbaykowski/csdr) to be installed. My fork is based on the version of `csdr` that was made by [Jakob Ketterl](https://github.com/jketterl/csdr), however this version contains bugs that affect performance of `csdr_server`. I have also added additional features to my `csdr` fork that `csdr_server` makes use of.
 
-If you enable WFM stereo, you must also install Stereo Demux and have
-`demux` available on `PATH`:
+If you enable server side WFM stereo demodulation, you must also install [Stereo Demux](https://github.com/windytan/stereodemux) and have
+`demux` available on `PATH`. We use `Stereo Demux` to decode FM stereo.
 
-- [windytan/stereodemux](https://github.com/windytan/stereodemux)
-
-If you enable WFM RDS support, you must also install `redsea` and have
-`redsea` available on `PATH`:
-
-- [windytan/redsea](https://github.com/windytan/redsea)
-
-This project is written against the `jketterl/csdr` fork, not the original
-András Retzler version.
+If you enable WFM RDS support, you must also install [redsea](https://github.com/windytan/redsea) and have `redsea` binary available on `PATH`. we use `Redsea` for sending RDS data to clients.
 
 ## Quick Start
 
@@ -112,6 +97,7 @@ Request WFM stereo:
 csdr_server_client -a 127.0.0.1 -p 7355 -f 101.1M -m audio -M wfm-stereo
 ```
 
+*Note*: WFM stereo will only be available if `Stereo Demux` is available on the server.
 `-f` and `-s` accept plain integers or `K`, `M`, and `G` suffixes.
 
 In IQ mode, `csdr_server_client` writes binary samples to stdout by default.
@@ -142,57 +128,80 @@ The config is grouped into three sections:
 - `server`
   - listener and buffering behavior
 
-Important settings:
+### Important settings
 
-- `rtl.rtl_serial`
+#### RTL specific settings
+
+- `rtl_serial`
   - preferred way to select a dongle
-- `rtl.rtl_device_index`
+- `rtl_device_index`
   - fallback if you do not want to use serial numbers
-- `rtl.center_frequency`
+- `center_frequency`
   - the RF center frequency captured by the dongle
-- `rtl.automatic_tuning`
+- `automatic_tuning`
   - when `true`, the server automatically retunes the SDR based on connected clients
   - when enabled, manual `rtl.center_frequency` changes are ignored
-- `rtl.rtl_sample_rate`
+- `rtl_sample_rate`
   - the hardware sample rate
-- `rtl.automatic_gain_control`
+- `automatic_gain_control`
   - `true` enables automatic gain control
-  - `false` means `rtl.rtl_gain` is used
-- `rtl.rtl_gain`
+  - `false` means `rtl_gain` is used
+- `rtl_gain`
   - manual gain in dB when AGC is off
-- `rtl.ppm_correction`
+- `ppm_correction`
   - frequency correction in PPM
-- `rtl.dc_block`
-  - enables or disables IQ-level DC blocking after shared decimation
+- `dc_block`
+  - enables or disables IQ-level DC blocking
 - `rtl.transition_bandwidth`
   - alias filter width used during IQ decimation
-- `audio.audio_support`
+
+#### Audio
+
+- `audio_support`
   - enables or disables audio mode entirely
-- `audio.am.enabled`
+
+##### AM
+
+- `enabled`
   - enables or disables AM support
-- `audio.lsb.enabled`
+
+##### LSB
+
+- `enabled`
   - enables or disables LSB support
-- `audio.usb.enabled`
+
+##### USB
+
+- `enabled`
   - enables or disables USB support
-- `audio.nfm.enabled`
+
+##### NFM
+
+- `enabled`
   - enables or disables NFM support
-- `audio.nfm.deemphasis_tau`
+- `deemphasis_tau`
   - NFM deemphasis time constant in microseconds, or `null` to disable NFM deemphasis
-- `audio.nfm.lowpass_frequency`
+- `lowpass_frequency`
   - optional post-deemphasis NFM audio lowpass frequency in Hz, or `null` to disable the lowpass stage
-- `audio.nfm.lowpass_curve`
+- `lowpass_curve`
   - NFM audio lowpass filter curve/steepness
-- `audio.wfm.enabled`
+
+##### WFM
+
+- `enabled`
   - enables or disables WFM support
-- `audio.wfm.stereo_support`
+- `stereo_support`
   - enables or disables WFM stereo support
-- `audio.wfm.rds_support`
+- `rds_support`
   - enables or disables WFM RDS support
-- `audio.wfm.deemphasis_region`
+- `deemphasis_region`
   - WFM deemphasis region, either `us` or `europe`
-- `server.listen_host`
+
+#### Server
+
+- `listen_host`
   - address to bind the TCP listener
-- `server.listen_port`
+- `listen_port`
   - TCP port for stream connections
   - the control socket uses `server.listen_port + 1`
 
@@ -293,143 +302,49 @@ The server supports two IQ output formats:
   - little-endian
   - layout: `I0, Q0, I1, Q1, ...`
 
-For IQ resampling, the server prefers `firdecimate` when the requested sample
+For IQ resampling, the server will use integer decimate when the requested sample
 rate is an integer ratio of the RTL sample rate. If not, it falls back to
-`fractionaldecimator --prefilter`.
+fractional decimation.
 
 ## Audio Mode
 
-Audio mode is separate from IQ mode. Instead of returning IQ data, the server
-demodulates the signal and sends audio.
+This program has the ability to stream already demodulated audio to clients rather than IQ data. This is useful, for example, if your LAN isn't fast enough to transport IQ, or you're using a VPN to access the server.
 
 Supported audio modes are:
 
-- `mode=audio`
-- `modulation=am`
-- `modulation=usb`
-- `modulation=lsb`
-- `modulation=nfm`
-- `modulation=wfm`
-- `modulation=wfm_stereo`
+- AM (Amplitude modulation)
+- USB (upper sideband modulation)
+- LSB (lower sideband modulation)
+- NFM (narrowband frequency modulation)
+- WFM (wideband frequency modulation)
 
-AM audio uses a fixed internal pipeline:
 
-- shift to the requested frequency
-- decimate to `16000` S/s
-- transition bandwidth `0.005`
-- `amdemod`
-- `dcblock`
-- `agc -r 0.2`
-- convert to `s16`
+WFM supports both mono and stereo, though the server needs to be configured for WFM stereo (see above).
 
-So AM audio clients always receive 16 kHz signed 16-bit mono audio.
-
-USB audio uses the same 16 kHz / `s16` output, but demodulates with:
-
-- shift to the requested frequency
-- decimate to `16000` S/s
-- transition bandwidth `0.005`
-- `bandpass --fft --low 0 --high 0.3 0.05`
-- `realpart`
-- `agc -r 0.2`
-- convert to `s16`
-
-LSB audio uses the same fixed output, with the sideband filter reversed:
-
-- shift to the requested frequency
-- decimate to `16000` S/s
-- transition bandwidth `0.005`
-- `bandpass --fft --low 0.3 --high 0 0.05`
-- `realpart`
-- `agc -r 0.2`
-- convert to `s16`
-
-NFM audio also uses the same 16 kHz / `s16` output:
-
-- shift to the requested frequency
-- decimate to `16000` S/s
-- transition bandwidth `0.005`
-- `fmdemod`
-- `deemphasis --wfm 16000 <tau>e-6`
-- `dcblock`
-- convert to `s16`
-
-The NFM deemphasis time constant comes from `audio.nfm.deemphasis_tau` in the
-server config. The default is `300`. If it is set to `null`, the deemphasis
-stage is omitted entirely.
-
-If `audio.nfm.lowpass_frequency` is set, the server inserts:
-
-- `lowpass --format float <cutoff_rate> <curve>`
-
-after the NFM deemphasis stage. The cutoff rate is computed as
-`lowpass_frequency / 16000`. The default lowpass frequency is `3200` and the
-default `audio.nfm.lowpass_curve` is `0.5`. If `audio.nfm.lowpass_frequency`
-is `null`, the lowpass stage is omitted entirely.
-
-WFM audio uses a wider demodulation path and a 32 kHz final audio rate:
-
-- shift to the requested frequency
-- decimate to `240000` S/s
-- transition bandwidth `0.05`
-- `fmdemod`
-- `fractionaldecimator --format float 240000/32000 --prefilter`
-- `deemphasis --wfm 32000 <tau>e-6`
-- convert to `s16`
-
-The WFM deemphasis curve comes from `audio.wfm.deemphasis_region`:
-
-- `us`
-  - `75` microseconds
-- `europe`
-  - `50` microseconds
-
-WFM stereo uses the same 240 kHz RF bandwidth and 32 kHz final audio rate, but
-hands the demodulated PCM to Stereo Demux:
-
-- shift to the requested frequency
-- decimate to `240000` S/s
-- transition bandwidth `0.05`
-- `fmdemod`
-- `convert -i float -o s16`
-- `demux -r 240000 -R 32000 -d <tau>`
-
-This mode must be enabled by the server administrator with
-`audio.wfm.stereo_support=true`. If it is disabled, clients requesting
-`wfm_stereo` receive: `Error: server does not support WFM stereo`.
-
-On `csdr_server_client`, request this mode with `-M wfm-stereo`. The JSON API
-uses `wfm_stereo`.
+AM, SSB, and NFM demodulation modes will send 16 KHZ 16 bit PCM mono samples to the client. WFM uses 32 KHZ 16 bit mono or stereo, depending on whether stereo is being used or not.
 
 ### WFM RDS
 
 RDS is only available in WFM mode and is delivered over the control socket, not
 the main stream socket.
 
-It must be enabled by the server administrator with `audio.wfm.rds_support=true`.
-If it is enabled, the server uses `redsea` on a shared WFM MPX `s16` branch.
-That branch is also shared with WFM stereo where possible, so the server does
-not duplicate the WFM MPX `float -> s16` conversion just to decode RDS.
+It must be enabled by the server administrator by setting `rds_support=true` in the json configuration. If it is enabled, the server uses `redsea` to decode RDS data.
 
-Interactive audio-mode clients can subscribe and unsubscribe with:
+Interactive audio-mode clients can start and stop RDS decoding with:
 
 ```text
 rds start
 rds stop
 ```
 
-They can also subscribe immediately on connect with:
+They can also start RDS decoding immediately on connect with:
 
 ```bash
 csdr_server_client -a 127.0.0.1 -p 7355 -f 95.7M -m audio -M wfm --rds
 ```
 
 If the server does not support RDS, or if the selected mode is not `wfm` or
-`wfm_stereo`, the client prints the server error and exits instead of silently
-starting without RDS.
-
-RDS updates are only sent when fields change. The stock client updates the
-display in place instead of printing a new line for every group.
+`wfm_stereo`, the client prints an error message sent by the server, and exits.
 
 ## Operational Notes
 
@@ -475,7 +390,7 @@ letting memory usage grow without bound.
 
 ## Protocol Reference
 
-This section is only needed if you want to write your own client.
+This section is only needed if you want to write your own client. If you just want to use the server, you can stop here. Otherwise, keep reading.
 
 ### Transport
 
