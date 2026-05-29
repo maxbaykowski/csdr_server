@@ -41,6 +41,8 @@ DEFAULT_AUDIO_CHANNELS = 1
 PCM_SAMPLE_WIDTH_BYTES = 2
 AUDIO_STREAM_READ_SIZE = 65_536
 MAX_AUDIO_RECONFIGURE_DRAIN_BYTES = 4 * 1024 * 1024
+FALLBACK_AUDIO_PLAYBACK_SAMPLE_RATE = 48_000
+PLAYBACK_CHANNELS = 2
 DEFAULT_AUDIO_PLAYBACK_PREBUFFER_SECONDS = 0.35
 DEFAULT_AUDIO_PLAYBACK_LATENCY_SECONDS = 0.25
 DEFAULT_WINDOWS_AUDIO_PLAYBACK_LATENCY_SECONDS = 0.05
@@ -473,6 +475,27 @@ def _load_sounddevice_module():
         return None
 
 
+def _load_audio_resampler_modules():
+    try:
+        soxr = importlib.import_module("soxr")
+    except ModuleNotFoundError:
+        print(
+            "error: audio playback requires the Python package 'soxr'; "
+            "reinstall csdr_server_client or run 'python3 -m pip install soxr'",
+            file=sys.stderr,
+        )
+        return None, None
+    try:
+        numpy = importlib.import_module("numpy")
+    except ModuleNotFoundError:
+        print(
+            "error: audio playback requires the Python package 'numpy', which should be installed with soxr",
+            file=sys.stderr,
+        )
+        return None, None
+    return soxr, numpy
+
+
 def _audio_platform_hint() -> str:
     if sys.platform == "win32":
         return (
@@ -558,6 +581,104 @@ def _resolve_audio_output_device(sounddevice, requested_device: int | str | None
     return matches[0]
 
 
+def _get_default_output_device_index(sounddevice) -> int | None:
+    default_device = sounddevice.default.device
+    if isinstance(default_device, (list, tuple)):
+        if len(default_device) >= 2 and int(default_device[1]) >= 0:
+            return int(default_device[1])
+        return None
+    try:
+        device_index = int(default_device)
+    except (TypeError, ValueError):
+        return None
+    return device_index if device_index >= 0 else None
+
+
+def _get_audio_device_info(sounddevice, audio_device: int | str | None) -> dict[str, object] | None:
+    device_index = audio_device if isinstance(audio_device, int) else _get_default_output_device_index(sounddevice)
+    if device_index is None:
+        return None
+    return sounddevice.query_devices()[device_index]
+
+
+def _get_audio_playback_sample_rate(sounddevice, audio_device: int | str | None) -> int:
+    device_info = _get_audio_device_info(sounddevice, audio_device)
+    if device_info is not None:
+        try:
+            sample_rate = int(round(float(device_info.get("default_samplerate", 0))))
+        except (TypeError, ValueError):
+            sample_rate = 0
+        if sample_rate > 0:
+            return sample_rate
+    return FALLBACK_AUDIO_PLAYBACK_SAMPLE_RATE
+
+
+def _validate_audio_playback_config(audio_config: AudioPlaybackConfig) -> bool:
+    if audio_config.sample_rate <= 0:
+        print("error: server audio handshake is missing a valid sample_rate", file=sys.stderr)
+        return False
+    if audio_config.channels <= 0:
+        print("error: server audio handshake is missing a valid channel count", file=sys.stderr)
+        return False
+    if audio_config.sample_format != DEFAULT_AUDIO_SAMPLE_FORMAT:
+        print(
+            f"error: audio playback only supports {DEFAULT_AUDIO_SAMPLE_FORMAT}; server sent {audio_config.sample_format!r}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+class AudioPlaybackResampler:
+    def __init__(self, soxr, numpy, audio_config: AudioPlaybackConfig, playback_sample_rate: int) -> None:
+        self.soxr = soxr
+        self.np = numpy
+        self.config = audio_config
+        self.playback_sample_rate = playback_sample_rate
+        self.bytes_per_frame = PCM_SAMPLE_WIDTH_BYTES * audio_config.channels
+        self.remainder = b""
+        self.stream = soxr.ResampleStream(
+            audio_config.sample_rate,
+            playback_sample_rate,
+            audio_config.channels,
+            dtype="int16",
+            quality="HQ",
+        )
+
+    def process(self, chunk: bytes) -> bytes:
+        payload = self.remainder + chunk
+        aligned_size = len(payload) - (len(payload) % self.bytes_per_frame)
+        if aligned_size <= 0:
+            self.remainder = payload
+            return b""
+
+        aligned = payload[:aligned_size]
+        self.remainder = payload[aligned_size:]
+
+        samples = self.np.frombuffer(aligned, dtype=self.np.int16)
+        if self.config.channels > 1:
+            samples = samples.reshape(-1, self.config.channels)
+
+        resampled = self.stream.resample_chunk(samples, last=False)
+        if self.config.channels == 1:
+            resampled = self.np.repeat(resampled.reshape(-1, 1), PLAYBACK_CHANNELS, axis=1)
+        elif self.config.channels != PLAYBACK_CHANNELS:
+            resampled = self._fit_channels(resampled)
+        return self.np.ascontiguousarray(resampled, dtype=self.np.int16).tobytes()
+
+    def _fit_channels(self, samples):
+        if samples.ndim == 1:
+            samples = samples.reshape(-1, 1)
+        source_channels = samples.shape[1]
+        if source_channels == PLAYBACK_CHANNELS:
+            return samples
+        if source_channels > PLAYBACK_CHANNELS:
+            return samples[:, :PLAYBACK_CHANNELS]
+        missing_channels = PLAYBACK_CHANNELS - source_channels
+        padding = self.np.repeat(samples[:, -1:], missing_channels, axis=1)
+        return self.np.concatenate((samples, padding), axis=1)
+
+
 def _stream_to_stdout(sock_file) -> int:
     while True:
         chunk = sock_file.read1(AUDIO_STREAM_READ_SIZE)
@@ -582,6 +703,9 @@ def _stream_audio_to_soundcard(
     sounddevice = _load_sounddevice_module()
     if sounddevice is None:
         return EXIT_REQUEST_ERROR
+    soxr, numpy = _load_audio_resampler_modules()
+    if soxr is None or numpy is None:
+        return EXIT_REQUEST_ERROR
     try:
         audio_device = _resolve_audio_output_device(
             sounddevice,
@@ -593,95 +717,85 @@ def _stream_audio_to_soundcard(
         return EXIT_REQUEST_ERROR
 
     try:
-        drain_before_prebuffer = False
-        while not _shutdown_requested:
-            audio_config = playback_state.active_config()
-            if audio_config.sample_rate <= 0:
-                print("error: server audio handshake is missing a valid sample_rate", file=sys.stderr)
-                return EXIT_REQUEST_ERROR
-            if audio_config.channels <= 0:
-                print("error: server audio handshake is missing a valid channel count", file=sys.stderr)
-                return EXIT_REQUEST_ERROR
-            if audio_config.sample_format != DEFAULT_AUDIO_SAMPLE_FORMAT:
-                print(
-                    f"error: audio playback only supports {DEFAULT_AUDIO_SAMPLE_FORMAT}; server sent {audio_config.sample_format!r}",
-                    file=sys.stderr,
+        playback_sample_rate = _get_audio_playback_sample_rate(sounddevice, audio_device)
+        audio_config = playback_state.active_config()
+        if not _validate_audio_playback_config(audio_config):
+            return EXIT_REQUEST_ERROR
+
+        source_bytes_per_frame = PCM_SAMPLE_WIDTH_BYTES * audio_config.channels
+        source_bytes_per_second = audio_config.sample_rate * source_bytes_per_frame
+        prebuffer_target = max(
+            source_bytes_per_frame,
+            int(source_bytes_per_second * prebuffer_seconds),
+        )
+        prebuffer_target -= prebuffer_target % source_bytes_per_frame
+        if prebuffer_target <= 0:
+            prebuffer_target = source_bytes_per_frame
+
+        prebuffer = bytearray()
+        while len(prebuffer) < prebuffer_target:
+            pending_config = playback_state.take_pending_for(audio_config)
+            if pending_config is not None:
+                audio_config = pending_config
+                if not _validate_audio_playback_config(audio_config):
+                    return EXIT_REQUEST_ERROR
+                source_bytes_per_frame = PCM_SAMPLE_WIDTH_BYTES * audio_config.channels
+                source_bytes_per_second = audio_config.sample_rate * source_bytes_per_frame
+                prebuffer_target = max(
+                    source_bytes_per_frame,
+                    int(source_bytes_per_second * prebuffer_seconds),
                 )
-                return EXIT_REQUEST_ERROR
-
-            bytes_per_frame = PCM_SAMPLE_WIDTH_BYTES * audio_config.channels
-            bytes_per_second = audio_config.sample_rate * bytes_per_frame
-            prebuffer_target = max(
-                bytes_per_frame,
-                int(bytes_per_second * prebuffer_seconds),
-            )
-            prebuffer_target -= prebuffer_target % bytes_per_frame
-            if prebuffer_target <= 0:
-                prebuffer_target = bytes_per_frame
-
-            prebuffer = bytearray()
-            remainder = b""
-            stream_ended = False
-            reconfigure_requested = False
-
-            if drain_before_prebuffer:
+                prebuffer_target -= prebuffer_target % source_bytes_per_frame
+                if prebuffer_target <= 0:
+                    prebuffer_target = source_bytes_per_frame
+                prebuffer.clear()
                 if _drain_audio_stream_after_reconfigure(stream_sock):
-                    stream_ended = True
-                drain_before_prebuffer = False
-                if stream_ended:
-                    break
+                    return 0
+                continue
+            chunk = stream_sock.recv(AUDIO_STREAM_READ_SIZE)
+            if not chunk:
+                break
+            if _shutdown_requested:
+                return EXIT_REQUEST_ERROR if _fatal_control_failure else SHUTDOWN_SIGNAL_EXIT
+            prebuffer.extend(chunk)
 
-            while len(prebuffer) < prebuffer_target:
-                if playback_state.take_pending_for(audio_config) is not None:
-                    reconfigure_requested = True
-                    drain_before_prebuffer = True
-                    break
+        if not prebuffer:
+            if _shutdown_requested:
+                return EXIT_REQUEST_ERROR if _fatal_control_failure else SHUTDOWN_SIGNAL_EXIT
+            return 0
+
+        resampler = AudioPlaybackResampler(soxr, numpy, audio_config, playback_sample_rate)
+        initial_audio = resampler.process(bytes(prebuffer))
+
+        with sounddevice.RawOutputStream(
+            samplerate=playback_sample_rate,
+            channels=PLAYBACK_CHANNELS,
+            dtype="int16",
+            latency=latency_seconds,
+            device=audio_device,
+        ) as stream:
+            if initial_audio:
+                stream.write(initial_audio)
+
+            while not _shutdown_requested:
+                pending_config = playback_state.take_pending_for(audio_config)
+                if pending_config is not None:
+                    audio_config = pending_config
+                    if not _validate_audio_playback_config(audio_config):
+                        return EXIT_REQUEST_ERROR
+                    resampler = AudioPlaybackResampler(soxr, numpy, audio_config, playback_sample_rate)
+                    if _drain_audio_stream_after_reconfigure(stream_sock):
+                        break
+                    continue
+
                 chunk = stream_sock.recv(AUDIO_STREAM_READ_SIZE)
                 if not chunk:
-                    stream_ended = True
                     break
                 if _shutdown_requested:
                     return EXIT_REQUEST_ERROR if _fatal_control_failure else SHUTDOWN_SIGNAL_EXIT
-                prebuffer.extend(chunk)
-            if stream_ended:
-                break
-            if reconfigure_requested:
-                continue
-
-            aligned_prebuffer_size = len(prebuffer) - (len(prebuffer) % bytes_per_frame)
-            prebuffer_remainder = b""
-            if aligned_prebuffer_size < len(prebuffer):
-                prebuffer_remainder = bytes(prebuffer[aligned_prebuffer_size:])
-            initial_audio = bytes(prebuffer[:aligned_prebuffer_size])
-
-            with sounddevice.RawOutputStream(
-                samplerate=audio_config.sample_rate,
-                channels=audio_config.channels,
-                dtype="int16",
-                latency=latency_seconds,
-                device=audio_device,
-            ) as stream:
-                if initial_audio:
-                    stream.write(initial_audio)
-                remainder = prebuffer_remainder
-                while True:
-                    if playback_state.take_pending_for(audio_config) is not None:
-                        reconfigure_requested = True
-                        drain_before_prebuffer = True
-                        break
-                    chunk = stream_sock.recv(AUDIO_STREAM_READ_SIZE)
-                    if not chunk:
-                        stream_ended = True
-                        break
-                    if _shutdown_requested:
-                        return EXIT_REQUEST_ERROR if _fatal_control_failure else SHUTDOWN_SIGNAL_EXIT
-                    payload = remainder + chunk
-                    aligned_size = len(payload) - (len(payload) % bytes_per_frame)
-                    if aligned_size:
-                        stream.write(payload[:aligned_size])
-                    remainder = payload[aligned_size:]
-            if stream_ended:
-                break
+                output = resampler.process(chunk)
+                if output:
+                    stream.write(output)
     except Exception as exc:
         error_type = type(exc).__name__
         print(
