@@ -474,7 +474,6 @@ def _stream_to_stdout(sock_file) -> int:
 
 
 def _stream_audio_to_soundcard(
-    sock_file,
     stream_sock: socket.socket,
     playback_state: AudioPlaybackState,
     prebuffer_seconds: float,
@@ -517,7 +516,7 @@ def _stream_audio_to_soundcard(
             reconfigure_requested = False
 
             if drain_before_prebuffer:
-                if _drain_audio_stream_after_reconfigure(sock_file, stream_sock):
+                if _drain_audio_stream_after_reconfigure(stream_sock):
                     stream_ended = True
                 drain_before_prebuffer = False
                 if stream_ended:
@@ -528,7 +527,7 @@ def _stream_audio_to_soundcard(
                     reconfigure_requested = True
                     drain_before_prebuffer = True
                     break
-                chunk = sock_file.read1(AUDIO_STREAM_READ_SIZE)
+                chunk = stream_sock.recv(AUDIO_STREAM_READ_SIZE)
                 if not chunk:
                     stream_ended = True
                     break
@@ -560,7 +559,7 @@ def _stream_audio_to_soundcard(
                         reconfigure_requested = True
                         drain_before_prebuffer = True
                         break
-                    chunk = sock_file.read1(AUDIO_STREAM_READ_SIZE)
+                    chunk = stream_sock.recv(AUDIO_STREAM_READ_SIZE)
                     if not chunk:
                         stream_ended = True
                         break
@@ -585,14 +584,14 @@ def _stream_audio_to_soundcard(
     return 0
 
 
-def _drain_audio_stream_after_reconfigure(sock_file, stream_sock: socket.socket) -> bool:
+def _drain_audio_stream_after_reconfigure(stream_sock: socket.socket) -> bool:
     previous_timeout = stream_sock.gettimeout()
     drained = 0
     try:
         stream_sock.setblocking(False)
         while drained < MAX_AUDIO_RECONFIGURE_DRAIN_BYTES:
             try:
-                chunk = sock_file.read1(AUDIO_STREAM_READ_SIZE)
+                chunk = stream_sock.recv(AUDIO_STREAM_READ_SIZE)
             except (BlockingIOError, InterruptedError):
                 break
             except socket.timeout:
@@ -913,15 +912,14 @@ def main() -> int:
             _start_interactive_control(control_channel, args, playback_state)
 
             stream_sock.settimeout(None)
-            sock_file = stream_sock.makefile("rb")
             if _should_play_audio(args):
                 return _stream_audio_to_soundcard(
-                    sock_file,
                     stream_sock,
                     playback_state,
                     args.audio_prebuffer,
                     args.audio_latency,
                 )
+            sock_file = stream_sock.makefile("rb")
             return _stream_to_stdout(sock_file)
         except BrokenPipeError:
             _exit_after_stdout_pipe_closed()
