@@ -43,6 +43,18 @@ AUDIO_STREAM_READ_SIZE = 65_536
 MAX_AUDIO_RECONFIGURE_DRAIN_BYTES = 4 * 1024 * 1024
 DEFAULT_AUDIO_PLAYBACK_PREBUFFER_SECONDS = 0.35
 DEFAULT_AUDIO_PLAYBACK_LATENCY_SECONDS = 0.25
+DEFAULT_WINDOWS_AUDIO_PLAYBACK_LATENCY_SECONDS = 0.05
+WINDOWS_WASAPI_HOST_API_NAME = "Windows WASAPI"
+PORTAUDIO_HOST_API_ALIASES = {
+    "alsa": ("ALSA",),
+    "jack": ("JACK Audio Connection Kit", "JACK"),
+    "oss": ("OSS",),
+    "wasapi": (WINDOWS_WASAPI_HOST_API_NAME,),
+    "directsound": ("Windows DirectSound",),
+    "mme": ("MME",),
+    "wdmks": ("Windows WDM-KS",),
+    "coreaudio": ("Core Audio",),
+}
 SQUELCH_MIN_LEVEL = 0
 SQUELCH_MAX_LEVEL = 100
 
@@ -349,6 +361,13 @@ def parse_audio_latency(value: str) -> float:
     return parse_nonnegative_float(value, "audio latency")
 
 
+def parse_audio_device(value: str) -> int | str:
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
 def parse_squelch_level(value: str) -> int:
     try:
         level = int(value)
@@ -421,8 +440,19 @@ def parse_args() -> argparse.Namespace:
         "-L",
         "--audio-latency",
         type=parse_audio_latency,
-        default=DEFAULT_AUDIO_PLAYBACK_LATENCY_SECONDS,
+        default=None,
         help="Requested audio device latency in seconds",
+    )
+    parser.add_argument(
+        "--audio-device",
+        type=parse_audio_device,
+        help="Audio output device index or case-insensitive name substring",
+    )
+    parser.add_argument(
+        "--audio-hostapi",
+        choices=("auto", "default", "alsa", "jack", "oss", "wasapi", "directsound", "mme", "wdmks", "coreaudio"),
+        default="auto",
+        help="Audio host API preference; auto uses platform defaults, except Windows prefers WASAPI",
     )
     return parser.parse_args()
 
@@ -460,6 +490,74 @@ def _audio_platform_hint() -> str:
     )
 
 
+def _default_audio_latency() -> float:
+    if sys.platform == "win32":
+        return DEFAULT_WINDOWS_AUDIO_PLAYBACK_LATENCY_SECONDS
+    return DEFAULT_AUDIO_PLAYBACK_LATENCY_SECONDS
+
+
+def _hostapi_matches(hostapi: dict[str, object], requested: str) -> bool:
+    hostapi_name = str(hostapi.get("name", "")).lower()
+    return any(
+        hostapi_name == alias.lower()
+        for alias in PORTAUDIO_HOST_API_ALIASES.get(requested, (requested,))
+    )
+
+
+def _resolve_audio_output_device(sounddevice, requested_device: int | str | None, hostapi_preference: str) -> int | str | None:
+    if hostapi_preference == "auto" and sys.platform != "win32":
+        hostapi_preference = "default"
+    if hostapi_preference == "auto":
+        hostapi_preference = "wasapi"
+    if hostapi_preference == "default" and requested_device is None:
+        return None
+
+    hostapis = sounddevice.query_hostapis()
+    devices = sounddevice.query_devices()
+    allowed_hostapi_indexes = {
+        index
+        for index, hostapi in enumerate(hostapis)
+        if hostapi_preference == "default" or _hostapi_matches(hostapi, hostapi_preference)
+    }
+    if not allowed_hostapi_indexes:
+        raise RuntimeError(f"requested audio host API {hostapi_preference!r} is not available")
+
+    if requested_device is None:
+        for hostapi_index in allowed_hostapi_indexes:
+            default_output = int(hostapis[hostapi_index].get("default_output_device", -1))
+            if default_output >= 0:
+                return default_output
+        raise RuntimeError(f"requested audio host API {hostapi_preference!r} has no default output device")
+
+    if isinstance(requested_device, int):
+        device = devices[requested_device]
+        if int(device.get("max_output_channels", 0)) <= 0:
+            raise RuntimeError(f"audio device {requested_device} has no output channels")
+        if int(device.get("hostapi", -1)) not in allowed_hostapi_indexes:
+            raise RuntimeError(
+                f"audio device {requested_device} is not on requested host API {hostapi_preference!r}"
+            )
+        return requested_device
+
+    requested_text = requested_device.lower()
+    matches = [
+        index
+        for index, device in enumerate(devices)
+        if int(device.get("max_output_channels", 0)) > 0
+        and int(device.get("hostapi", -1)) in allowed_hostapi_indexes
+        and requested_text in str(device.get("name", "")).lower()
+    ]
+    if not matches:
+        raise RuntimeError(
+            f"no output audio device matching {requested_device!r} on host API {hostapi_preference!r}"
+        )
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"audio device name {requested_device!r} matched multiple output devices: {matches}; use a device index"
+        )
+    return matches[0]
+
+
 def _stream_to_stdout(sock_file) -> int:
     while True:
         chunk = sock_file.read1(AUDIO_STREAM_READ_SIZE)
@@ -478,9 +576,20 @@ def _stream_audio_to_soundcard(
     playback_state: AudioPlaybackState,
     prebuffer_seconds: float,
     latency_seconds: float,
+    requested_device: int | str | None,
+    hostapi_preference: str,
 ) -> int:
     sounddevice = _load_sounddevice_module()
     if sounddevice is None:
+        return EXIT_REQUEST_ERROR
+    try:
+        audio_device = _resolve_audio_output_device(
+            sounddevice,
+            requested_device,
+            hostapi_preference,
+        )
+    except Exception as exc:
+        print(f"error: audio device selection failed: {exc}.{_audio_platform_hint()}", file=sys.stderr)
         return EXIT_REQUEST_ERROR
 
     try:
@@ -550,6 +659,7 @@ def _stream_audio_to_soundcard(
                 channels=audio_config.channels,
                 dtype="int16",
                 latency=latency_seconds,
+                device=audio_device,
             ) as stream:
                 if initial_audio:
                     stream.write(initial_audio)
@@ -782,6 +892,10 @@ def main() -> int:
     if args.mode != "audio" and args.squelch:
         print("error: squelch is only supported in audio mode", file=sys.stderr)
         return EXIT_REQUEST_ERROR
+    if args.mode != "audio" and (args.audio_device is not None or args.audio_hostapi != "auto"):
+        print("error: audio device options are only supported in audio mode", file=sys.stderr)
+        return EXIT_REQUEST_ERROR
+    audio_latency = args.audio_latency if args.audio_latency is not None else _default_audio_latency()
     stream_token = uuid.uuid4().hex
     request = {
         "frequency": args.frequency,
@@ -917,7 +1031,9 @@ def main() -> int:
                     stream_sock,
                     playback_state,
                     args.audio_prebuffer,
-                    args.audio_latency,
+                    audio_latency,
+                    args.audio_device,
+                    args.audio_hostapi,
                 )
             sock_file = stream_sock.makefile("rb")
             return _stream_to_stdout(sock_file)
