@@ -42,6 +42,8 @@ PCM_SAMPLE_WIDTH_BYTES = 2
 AUDIO_STREAM_READ_SIZE = 65_536
 DEFAULT_AUDIO_PLAYBACK_PREBUFFER_SECONDS = 0.35
 DEFAULT_AUDIO_PLAYBACK_LATENCY_SECONDS = 0.25
+SQUELCH_MIN_LEVEL = 0
+SQUELCH_MAX_LEVEL = 100
 
 
 SUFFIXES = {
@@ -159,7 +161,12 @@ class ControlChannel:
 
     def send_command(self, payload: dict[str, object]) -> dict[str, object] | None:
         self.sock.sendall(json.dumps(payload).encode("utf-8") + b"\n")
-        return self.response_queue.get()
+        while not _shutdown_requested:
+            try:
+                return self.response_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+        return None
 
     def _reader_loop(self) -> None:
         try:
@@ -341,6 +348,18 @@ def parse_audio_latency(value: str) -> float:
     return parse_nonnegative_float(value, "audio latency")
 
 
+def parse_squelch_level(value: str) -> int:
+    try:
+        level = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid squelch level: {value!r}") from exc
+    if level < SQUELCH_MIN_LEVEL or level > SQUELCH_MAX_LEVEL:
+        raise argparse.ArgumentTypeError(
+            f"squelch level must be between {SQUELCH_MIN_LEVEL} and {SQUELCH_MAX_LEVEL}"
+        )
+    return level
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal client for csdr_server.py")
     parser.add_argument("-a", "--address", required=True, help="Server IP address or hostname")
@@ -382,6 +401,13 @@ def parse_args() -> argparse.Namespace:
         "--rds",
         action="store_true",
         help="Subscribe to WFM RDS events immediately after connect",
+    )
+    parser.add_argument(
+        "-l",
+        "--squelch",
+        type=parse_squelch_level,
+        default=0,
+        help="Audio squelch level from 0 to 100; 0 disables squelch",
     )
     parser.add_argument(
         "-B",
@@ -567,7 +593,7 @@ def _start_interactive_control(
     def _interactive_loop() -> None:
         if args.mode == "audio":
             print(
-                "interactive control enabled; use 'frequency <value>', 'demod <mode>', and 'rds start|stop'",
+                "interactive control enabled; use 'frequency <value>', 'demod <mode>', 'squelch <0-100>', and 'rds start|stop'",
                 file=sys.stderr,
             )
         else:
@@ -625,10 +651,25 @@ def _start_interactive_control(
                         "command": "rds",
                         "action": action,
                     }
+                elif command.lower() == "squelch":
+                    if args.mode != "audio":
+                        print("error: squelch command is only supported in audio mode", file=sys.stderr)
+                        continue
+                    if not remainder.strip():
+                        print("error: squelch command requires a level from 0 to 100", file=sys.stderr)
+                        continue
+                    try:
+                        payload = {
+                            "command": "squelch",
+                            "level": parse_squelch_level(remainder.strip()),
+                        }
+                    except argparse.ArgumentTypeError as exc:
+                        print(f"error: {exc}", file=sys.stderr)
+                        continue
                 else:
                     if args.mode == "audio":
                         print(
-                            "error: unsupported interactive command; use 'frequency <value>', 'demod <mode>', or 'rds start|stop'",
+                            "error: unsupported interactive command; use 'frequency <value>', 'demod <mode>', 'squelch <0-100>', or 'rds start|stop'",
                             file=sys.stderr,
                         )
                     else:
@@ -670,9 +711,14 @@ def _start_interactive_control(
                             f"switched demod to {str(response.get('modulation', payload['modulation'])).replace('_', '-')}",
                             file=sys.stderr,
                         )
-                    else:
+                    elif payload["command"] == "rds":
                         print(
                             f"RDS {'enabled' if response.get('rds_active') else 'disabled'}",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            f"squelch set to {int(response.get('squelch', payload['level']))}",
                             file=sys.stderr,
                         )
                 except OSError as exc:
@@ -700,6 +746,9 @@ def main() -> int:
     if args.port >= 65535:
         print("error: stream port must be between 1 and 65534 so the control socket can use port+1", file=sys.stderr)
         return EXIT_CONNECT_FAILED
+    if args.mode != "audio" and args.squelch:
+        print("error: squelch is only supported in audio mode", file=sys.stderr)
+        return EXIT_REQUEST_ERROR
     stream_token = uuid.uuid4().hex
     request = {
         "frequency": args.frequency,
@@ -718,6 +767,7 @@ def main() -> int:
         if _option_was_provided(("-F", "--format")):
             request["format"] = args.format
         request["modulation"] = normalize_audio_modulation(args.modulation)
+        request["squelch"] = args.squelch
 
     try:
         stream_sock = socket.create_connection((args.address, args.port), timeout=30.0)

@@ -222,10 +222,11 @@ You can tune playback smoothing with `-B` / `--audio-prebuffer` and `-L` /
 `--audio-latency`, both in seconds.
 If the client is running with an interactive stdin, you can type
 `frequency <value>` to retune the active stream without reconnecting. In audio
-mode, you can also type `demod <mode>` to switch demodulators live. In IQ
-mode, `frequency` is the only accepted interactive command. Multiple commands
-can be entered on one line by separating them with semicolons, for example:
-`frequency 95.7M; demod wfm-stereo; rds start`.
+mode, you can also type `demod <mode>` to switch demodulators live, `squelch
+<0-100>` to adjust audio squelch, and `rds start` / `rds stop` for WFM RDS. In
+IQ mode, `frequency` is the only accepted interactive command. Multiple
+commands can be entered on one line by separating them with semicolons, for
+example: `frequency 95.7M; demod wfm-stereo; squelch 25; rds start`.
 
 ## Configuration
 
@@ -438,6 +439,13 @@ WFM supports both mono and stereo, though the server needs to be configured for 
 
 AM, SSB, and NFM demodulation modes will send 16 KHZ 16 bit PCM mono samples to the client. WFM uses 32 KHZ 16 bit mono or stereo, depending on whether stereo is being used or not.
 
+Audio clients can request server-side squelch with `-l` / `--squelch`, using a
+level from `0` to `100`. `0` disables squelch and is the default. The squelch
+measurement is a dBFS-style score based on decimated complex IQ power before audio
+demodulation, so clients with and without squelch can still share the same DSP
+pipeline. When squelch is closed, the server sends silence rather than stopping
+the stream, which keeps local audio playback stable.
+
 ### WFM RDS
 
 RDS is only available in WFM mode and is delivered over the control socket, not
@@ -551,6 +559,10 @@ Request fields:
 - `modulation`
   - required in `audio` mode
   - `am`, `usb`, `lsb`, `nfm`, `wfm`, or `wfm_stereo`
+- `squelch`
+  - optional in `audio` mode
+  - integer from `0` to `100`
+  - `0` disables squelch and is the default
 
 IQ request example:
 
@@ -569,7 +581,7 @@ Audio request example:
 ```
 
 ```json
-{"stream_token": "abc123", "frequency": 162550000, "mode": "audio", "modulation": "nfm"}
+{"stream_token": "abc123", "frequency": 162550000, "mode": "audio", "modulation": "nfm", "squelch": 25}
 ```
 
 ```json
@@ -591,7 +603,7 @@ IQ success:
 Audio success:
 
 ```json
-{"status": "ok", "mode": "audio", "format": "s16", "modulation": "am", "sample_rate": 16000, "channels": 1}
+{"status": "ok", "mode": "audio", "format": "s16", "modulation": "am", "sample_rate": 16000, "channels": 1, "squelch": 0}
 ```
 
 Error:
@@ -647,6 +659,18 @@ Example success response:
 
 ```json
 {"status": "ok", "command": "demod", "frequency": 95700000, "mode": "audio", "format": "s16", "modulation": "wfm_stereo", "sample_rate": 32000, "channels": 2}
+```
+
+Audio clients may adjust squelch live:
+
+```json
+{"command": "squelch", "level": 25}
+```
+
+Example success response:
+
+```json
+{"status": "ok", "command": "squelch", "frequency": 162550000, "mode": "audio", "format": "s16", "modulation": "nfm", "sample_rate": 16000, "channels": 1, "squelch": 25}
 ```
 
 WFM audio clients may also toggle RDS subscriptions live:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "csdr-server"
-version = "0.3.1"
+version = "0.4.0"
 description = "Minimal RTL-SDR network server in Python using pyrtlsdr and csdr"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -32,7 +32,7 @@ classifiers = [
 ]
 
 [project.scripts]
-csdr_server = "csdr_server:main"
+csdr_server = "csdr_server.cli:main"
 csdr_server_client = "csdr_server_client:main"
 
 [project.urls]
@@ -40,5 +40,6 @@ Homepage = "https://github.com/maxbaykowski/csdr_server"
 Repository = "https://github.com/maxbaykowski/csdr_server"
 
 [tool.setuptools]
-py-modules = ["csdr_server", "csdr_server_client"]
+py-modules = ["csdr_server_client"]
+packages = ["csdr_server"]
 include-package-data = true
