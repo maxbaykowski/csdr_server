@@ -40,6 +40,7 @@ DEFAULT_AUDIO_SAMPLE_FORMAT = "s16"
 DEFAULT_AUDIO_CHANNELS = 1
 PCM_SAMPLE_WIDTH_BYTES = 2
 AUDIO_STREAM_READ_SIZE = 65_536
+MAX_AUDIO_RECONFIGURE_DRAIN_BYTES = 4 * 1024 * 1024
 DEFAULT_AUDIO_PLAYBACK_PREBUFFER_SECONDS = 0.35
 DEFAULT_AUDIO_PLAYBACK_LATENCY_SECONDS = 0.25
 SQUELCH_MIN_LEVEL = 0
@@ -474,6 +475,7 @@ def _stream_to_stdout(sock_file) -> int:
 
 def _stream_audio_to_soundcard(
     sock_file,
+    stream_sock: socket.socket,
     playback_state: AudioPlaybackState,
     prebuffer_seconds: float,
     latency_seconds: float,
@@ -483,6 +485,7 @@ def _stream_audio_to_soundcard(
         return EXIT_REQUEST_ERROR
 
     try:
+        drain_before_prebuffer = False
         while not _shutdown_requested:
             audio_config = playback_state.active_config()
             if audio_config.sample_rate <= 0:
@@ -513,9 +516,17 @@ def _stream_audio_to_soundcard(
             stream_ended = False
             reconfigure_requested = False
 
+            if drain_before_prebuffer:
+                if _drain_audio_stream_after_reconfigure(sock_file, stream_sock):
+                    stream_ended = True
+                drain_before_prebuffer = False
+                if stream_ended:
+                    break
+
             while len(prebuffer) < prebuffer_target:
                 if playback_state.take_pending_for(audio_config) is not None:
                     reconfigure_requested = True
+                    drain_before_prebuffer = True
                     break
                 chunk = sock_file.read1(AUDIO_STREAM_READ_SIZE)
                 if not chunk:
@@ -547,6 +558,7 @@ def _stream_audio_to_soundcard(
                 while True:
                     if playback_state.take_pending_for(audio_config) is not None:
                         reconfigure_requested = True
+                        drain_before_prebuffer = True
                         break
                     chunk = sock_file.read1(AUDIO_STREAM_READ_SIZE)
                     if not chunk:
@@ -571,6 +583,28 @@ def _stream_audio_to_soundcard(
     if _shutdown_requested:
         return EXIT_REQUEST_ERROR if _fatal_control_failure else SHUTDOWN_SIGNAL_EXIT
     return 0
+
+
+def _drain_audio_stream_after_reconfigure(sock_file, stream_sock: socket.socket) -> bool:
+    previous_timeout = stream_sock.gettimeout()
+    drained = 0
+    try:
+        stream_sock.setblocking(False)
+        while drained < MAX_AUDIO_RECONFIGURE_DRAIN_BYTES:
+            try:
+                chunk = sock_file.read1(AUDIO_STREAM_READ_SIZE)
+            except (BlockingIOError, InterruptedError):
+                break
+            except socket.timeout:
+                break
+            if chunk is None:
+                break
+            if not chunk:
+                return True
+            drained += len(chunk)
+    finally:
+        stream_sock.settimeout(previous_timeout)
+    return False
 
 
 def _print_interactive_prompt() -> None:
@@ -883,6 +917,7 @@ def main() -> int:
             if _should_play_audio(args):
                 return _stream_audio_to_soundcard(
                     sock_file,
+                    stream_sock,
                     playback_state,
                     args.audio_prebuffer,
                     args.audio_latency,
