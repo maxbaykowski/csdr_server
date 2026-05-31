@@ -7,7 +7,14 @@ import time
 from typing import Any
 
 from .config import ServerConfig
-from .constants import EXIT_REQUEST_ERROR, LOGGER, SQUELCH_HANG_SECONDS, SQUELCH_HYSTERESIS, SQUELCH_MIN_LEVEL
+from .constants import (
+    EXIT_REQUEST_ERROR,
+    LOGGER,
+    SQUELCH_CLOSE_DELAY_SECONDS,
+    SQUELCH_HYSTERESIS,
+    SQUELCH_MIN_LEVEL,
+    SQUELCH_OPEN_DELAY_SECONDS,
+)
 from .dsp import _normalize_audio_modulation, _validate_audio_modulation, _validate_audio_modulation_supported
 from .errors import RequestValidationError
 from .graph import IqPowerMonitor, SharedStream
@@ -50,7 +57,8 @@ class ClientSession:
         self.squelch_level = squelch_level
         self.power_monitor = power_monitor
         self.squelch_open = True
-        self.squelch_last_opened_at = time.monotonic()
+        self.squelch_last_signal_at = time.monotonic()
+        self.squelch_open_candidate_since: float | None = None
         self.chunk_queue: queue.Queue[bytes | None] = queue.Queue(
             maxsize=config.client_queue_chunks
         )
@@ -197,14 +205,16 @@ class ClientSession:
             self.squelch_open = True
         else:
             self.squelch_open = False
-        self.squelch_last_opened_at = time.monotonic()
+        self.squelch_last_signal_at = time.monotonic()
+        self.squelch_open_candidate_since = None
 
     def _reset_squelch_for_stream_change(self) -> None:
         if self.squelch_level > 0:
             self.squelch_open = False
         else:
             self.squelch_open = True
-        self.squelch_last_opened_at = time.monotonic()
+        self.squelch_last_signal_at = time.monotonic()
+        self.squelch_open_candidate_since = None
 
     def _should_squelch_chunk(self) -> bool:
         if self.mode != "audio" or self.squelch_level <= 0 or self.power_monitor is None:
@@ -213,16 +223,24 @@ class ClientSession:
         measured_level = self.power_monitor.current_level()
         if self.squelch_open:
             if measured_level >= max(SQUELCH_MIN_LEVEL, self.squelch_level - SQUELCH_HYSTERESIS):
-                self.squelch_last_opened_at = now
+                self.squelch_last_signal_at = now
+                self.squelch_open_candidate_since = None
                 return False
-            if now - self.squelch_last_opened_at < SQUELCH_HANG_SECONDS:
+            if now - self.squelch_last_signal_at < SQUELCH_CLOSE_DELAY_SECONDS:
                 return False
             self.squelch_open = False
+            self.squelch_open_candidate_since = None
             return True
+
         if measured_level >= self.squelch_level:
-            self.squelch_open = True
-            self.squelch_last_opened_at = now
-            return False
+            if self.squelch_open_candidate_since is None:
+                self.squelch_open_candidate_since = now
+            if now - self.squelch_open_candidate_since >= SQUELCH_OPEN_DELAY_SECONDS:
+                self.squelch_open = True
+                self.squelch_last_signal_at = now
+                return False
+        else:
+            self.squelch_open_candidate_since = None
         return True
 
     def _control_loop(self) -> None:
