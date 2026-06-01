@@ -18,6 +18,7 @@ class ServerConfig:
     automatic_gain_control: bool = False
     rtl_gain: float | None = None
     ppm_correction: int = 0
+    bias_tee: bool = False
     dc_block: bool = False
     transition_bandwidth: float = 0.05
     audio_support: bool = True
@@ -101,6 +102,10 @@ class ServerConfig:
             ppm_correction=_parse_int(
                 _config_value(data, rtl_settings, "ppm_correction", 0),
                 "rtl.ppm_correction",
+            ),
+            bias_tee=_parse_bool(
+                _config_value(data, rtl_settings, "bias_tee", False),
+                "rtl.bias_tee",
             ),
             dc_block=_parse_bool(
                 _config_value(data, rtl_settings, "dc_block", False),
@@ -300,6 +305,7 @@ def _validate_config(config: ServerConfig) -> None:
     _validate_automatic_gain_control(config.automatic_gain_control)
     _validate_rtl_gain(config.automatic_gain_control, config.rtl_gain)
     _validate_ppm_correction(config.ppm_correction)
+    _validate_bias_tee(config.bias_tee)
     _validate_dc_block(config.dc_block)
     _validate_transition_bandwidth(config.transition_bandwidth)
     _validate_listen_host(config.listen_host)
@@ -388,6 +394,11 @@ def _validate_rtl_gain(automatic_gain_control: bool, value: float | None) -> Non
 def _validate_ppm_correction(value: int) -> None:
     if not (-500 <= value <= 500):
         raise ValueError("ppm_correction must be between -500 and 500")
+
+
+def _validate_bias_tee(value: bool) -> None:
+    if not isinstance(value, bool):
+        raise ValueError("rtl.bias_tee must be true or false")
 
 
 def _validate_dc_block(value: bool) -> None:

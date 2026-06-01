@@ -283,6 +283,9 @@ The config is grouped into three sections:
   - manual gain in dB when AGC is off
 - `ppm_correction`
   - frequency correction in PPM
+- `bias_tee`
+  - enables or disables the RTL-SDR bias tee
+  - only enable this when attached hardware expects DC power from the dongle
 - `dc_block`
   - enables or disables IQ-level DC blocking
 - `rtl.transition_bandwidth`
@@ -345,6 +348,7 @@ The config is grouped into three sections:
   `900001` and `3200000` S/s
 - `rtl.rtl_gain` must be between `1.0` and `49.6` dB when AGC is off
 - `rtl.ppm_correction` must be between `-500` and `500`
+- `rtl.bias_tee` must be `true` or `false`
 - `rtl.dc_block` must be `true` or `false`
 - `rtl.transition_bandwidth` must be between `0.005` and `0.5`
 - `rtl.automatic_tuning` must be `true` or `false`
@@ -378,6 +382,7 @@ These settings can be changed live:
 - `rtl.automatic_gain_control`
 - `rtl.rtl_gain`
 - `rtl.ppm_correction`
+- `rtl.bias_tee`
 - `rtl.dc_block`
 - `rtl.transition_bandwidth`
 - `audio.nfm.deemphasis_tau`
@@ -397,6 +402,8 @@ What live reload does:
   - updates manual gain when AGC is off
 - `rtl.ppm_correction`
   - updates frequency correction
+- `rtl.bias_tee`
+  - enables or disables the RTL-SDR bias tee
 - `rtl.dc_block`
   - rebuilds the shared full-band IQ path so both IQ and audio clients pick up the new IQ-level DC blocker
 - `rtl.transition_bandwidth`

@@ -25,6 +25,9 @@
     // Controls hardware frequency correction for dongles that experience frequency drift.
     ppm_correction: 0,
 
+    // Enable the RTL-SDR bias tee. Only enable this if attached hardware expects DC power.
+    bias_tee: false,
+
     // Apply IQ-level DC blocking after shared decimation to suppress the center spike.
     dc_block: false,
 

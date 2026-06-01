@@ -294,6 +294,7 @@ class CaptureManager:
                 "automatic_gain_control",
                 "rtl_gain",
                 "ppm_correction",
+                "bias_tee",
                 "dc_block",
                 "rtl_sample_rate",
                 "center_frequency",
@@ -373,12 +374,13 @@ class CaptureManager:
             for session in client_requests:
                 self._refresh_rds_subscription_locked(session)
             LOGGER.info(
-                "config reload applied: center_frequency=%s rtl_sample_rate=%s automatic_gain_control=%s rtl_gain=%s ppm_correction=%s dc_block=%s transition_bandwidth=%s nfm_deemphasis_tau=%s wfm_region=%s",
+                "config reload applied: center_frequency=%s rtl_sample_rate=%s automatic_gain_control=%s rtl_gain=%s ppm_correction=%s bias_tee=%s dc_block=%s transition_bandwidth=%s nfm_deemphasis_tau=%s wfm_region=%s",
                 next_config.center_frequency,
                 next_config.rtl_sample_rate,
                 next_config.automatic_gain_control,
                 next_config.rtl_gain,
                 next_config.ppm_correction,
+                next_config.bias_tee,
                 next_config.dc_block,
                 next_config.transition_bandwidth,
                 next_config.nfm_deemphasis_tau,
@@ -632,6 +634,8 @@ class CaptureManager:
             sdr = self.sdr
             if sdr is None:
                 return
+            if next_config.bias_tee != current_config.bias_tee:
+                self._set_bias_tee(sdr, next_config.bias_tee)
             gain_mode_changed = (
                 next_config.automatic_gain_control != current_config.automatic_gain_control
             )
@@ -673,6 +677,7 @@ class CaptureManager:
         sdr.center_freq = self.config.center_frequency
         if self.config.ppm_correction != 0:
             sdr.freq_correction = self.config.ppm_correction
+        self._set_bias_tee(sdr, self.config.bias_tee)
         sdr.gain = "auto" if self.config.automatic_gain_control else self.config.rtl_gain
         result = rtlsdr_lib.rtlsdr_reset_buffer(sdr.dev_p)
         if result < 0:
@@ -681,6 +686,18 @@ class CaptureManager:
         with self.sdr_lock:
             self.sdr = sdr
         return sdr
+
+    @staticmethod
+    def _set_bias_tee(sdr: BaseRtlSdr, enabled: bool) -> None:
+        set_bias_tee = getattr(sdr, "set_bias_tee", None)
+        if set_bias_tee is None:
+            if enabled:
+                raise RuntimeError(
+                    "rtl.bias_tee is true, but this pyrtlsdr installation does not support set_bias_tee"
+                )
+            return
+        set_bias_tee(enabled)
+        LOGGER.info("RTL-SDR bias tee %s", "enabled" if enabled else "disabled")
 
     def _close_sdr(self) -> None:
         with self.sdr_lock:
