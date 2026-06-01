@@ -10,6 +10,7 @@ decimation, and serves IQ or audio streams to one or more clients over TCP.
 - Clients can tune anywhere inside the currently sampled RF window.
 - Clients can request decimated IQ at nearly any sample rate up to the RTL sample rate.
 - Clients can also request demodulated audio instead of raw IQ.
+- Audio clients can use raw PCM or Opus-compressed network transport.
 - Two output formats are supported:
   - `f32`
   - `s16`
@@ -34,7 +35,9 @@ This installs two commands:
 
 Python dependencies are installed automatically:
 
+- `PyOgg`
 - `sounddevice`
+- `soxr`
 
 On Linux, server dependencies are also installed automatically:
 
@@ -51,6 +54,17 @@ PortAudio support must exist on the system and the PortAudio build must have a
 usable backend for the platform. For local sound device playback, the client
 uses `soxr` to adapt the server's fixed 48 kHz stereo PCM stream to the selected
 device's required sample rate and channel count.
+
+Audio streams use raw PCM by default. Clients can request Opus compression with
+`--audio-codec opus`; this reduces network bandwidth for audio mode while still
+leaving raw PCM available for local pipes and simple clients. PyOgg needs Opus
+library support on the host platform. On Windows this is usually handled by the
+Python package; on macOS, installing Opus with Homebrew may be required.
+If a client requests Opus but the server cannot initialize an Opus encoder, the
+server logs the problem, accepts the client with raw PCM transport instead, and
+returns a warning in the handshake.
+If the official client cannot initialize a local Opus decoder, it prints a
+warning and requests PCM from the server instead.
 
 ### Install for system-wide use
 
@@ -441,8 +455,9 @@ Supported audio modes are:
 WFM supports both mono and stereo, though the server needs to be configured for WFM stereo (see above).
 
 All audio demodulation modes send 48 kHz, 16-bit signed PCM stereo samples to
-the client. When using `--stdout` in audio mode, stdout receives that same raw
-48 kHz stereo PCM stream.
+the client when raw PCM transport is used. When using `--stdout` in audio mode,
+stdout receives raw 48 kHz stereo PCM samples, even if the network transport is
+Opus. The client decodes Opus before writing audio to stdout or playing it.
 
 Audio clients can request server-side squelch with `-l` / `--squelch`, using a
 level from `0` to `100`. `0` disables squelch and is the default. The squelch
@@ -568,6 +583,14 @@ Request fields:
   - optional in `audio` mode
   - integer from `0` to `100`
   - `0` disables squelch and is the default
+- `audio_codec`
+  - optional in `audio` mode
+  - `pcm` or `opus`
+  - defaults to `pcm`
+- `opus_bitrate`
+  - optional in `audio` mode when `audio_codec` is `opus`
+  - integer bits per second
+  - defaults to `24000`
 
 IQ request example:
 
@@ -597,6 +620,10 @@ Audio request example:
 {"stream_token": "abc123", "frequency": 101100000, "mode": "audio", "modulation": "wfm_stereo"}
 ```
 
+```json
+{"stream_token": "abc123", "frequency": 101100000, "mode": "audio", "modulation": "wfm", "audio_codec": "opus", "opus_bitrate": 24000}
+```
+
 ### Handshake
 
 IQ success:
@@ -608,7 +635,13 @@ IQ success:
 Audio success:
 
 ```json
-{"status": "ok", "mode": "audio", "format": "s16", "modulation": "am", "sample_rate": 48000, "channels": 2, "squelch": 0}
+{"status": "ok", "mode": "audio", "format": "s16", "modulation": "am", "sample_rate": 48000, "channels": 2, "squelch": 0, "audio_codec": "pcm"}
+```
+
+Audio success with Opus transport:
+
+```json
+{"status": "ok", "mode": "audio", "format": "s16", "modulation": "wfm", "sample_rate": 48000, "channels": 2, "squelch": 0, "audio_codec": "opus", "opus_bitrate": 24000, "opus_frame_ms": 20}
 ```
 
 Error:
@@ -629,6 +662,13 @@ Handshake fields:
   - present on audio success
 - `channels`
   - present on audio success
+- `audio_codec`
+  - present on audio success
+  - clients must treat this as authoritative, since the server may fall back from `opus` to `pcm`
+- `opus_bitrate`
+  - present on audio success when `audio_codec` is `opus`
+- `opus_frame_ms`
+  - present on audio success when `audio_codec` is `opus`
 - `code`
   - present on error
 - `error`
@@ -678,6 +718,21 @@ Example success response:
 {"status": "ok", "command": "squelch", "frequency": 162550000, "mode": "audio", "format": "s16", "modulation": "nfm", "sample_rate": 48000, "channels": 2, "squelch": 25}
 ```
 
+Opus audio clients may change bitrate live:
+
+```json
+{"command": "bitrate", "bitrate": 128000}
+```
+
+Example success response:
+
+```json
+{"status": "ok", "command": "bitrate", "frequency": 95700000, "mode": "audio", "format": "s16", "modulation": "wfm", "sample_rate": 48000, "channels": 2, "audio_codec": "opus", "opus_bitrate": 128000}
+```
+
+If the client is using raw PCM audio transport, the server rejects the command
+with `bitrate only applies when using the opus codec`.
+
 WFM audio clients may also toggle RDS subscriptions live:
 
 ```json
@@ -705,7 +760,13 @@ RDS event example:
 After an `ok` handshake, the server sends either:
 
 - raw IQ samples for `iq` mode
-- demodulated audio samples for `audio` mode
+- demodulated 48 kHz stereo s16 PCM samples for `audio` mode with `audio_codec=pcm`
+- length-framed Opus packets for `audio` mode with `audio_codec=opus`
+
+Opus stream framing is intentionally simple: each Opus packet is prefixed by a
+2-byte unsigned big-endian packet length, followed by that many Opus packet
+bytes. Opus packets are encoded as 20 ms frames from 48 kHz, stereo, signed
+16-bit PCM.
 
 ### Request Rules
 

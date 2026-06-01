@@ -16,6 +16,13 @@ from .dsp import (
     _validate_sample_format,
 )
 from .errors import RequestValidationError
+from .opus_codec import (
+    DEFAULT_AUDIO_CODEC,
+    DEFAULT_OPUS_BITRATE,
+    OPUS_FRAME_MS,
+    validate_audio_codec,
+    validate_opus_bitrate,
+)
 
 def _build_session_status_payload(
     session: "ClientSession",
@@ -39,6 +46,10 @@ def _build_session_status_payload(
         payload["modulation"] = session.modulation
         payload["sample_rate"] = _get_audio_output_rate(session.modulation)
         payload["channels"] = _get_audio_channels(session.modulation)
+        payload["audio_codec"] = session.audio_codec
+        if session.audio_codec == "opus":
+            payload["opus_bitrate"] = session.opus_bitrate
+            payload["opus_frame_ms"] = OPUS_FRAME_MS
     return payload
 
 def _read_json_message_line(reader: Any) -> bytes | None:
@@ -72,6 +83,20 @@ def _validate_squelch_level(level: int) -> None:
             EXIT_REQUEST_ERROR,
             f"squelch level must be between {SQUELCH_MIN_LEVEL} and {SQUELCH_MAX_LEVEL}",
         )
+
+
+def _parse_audio_codec(value: Any) -> str:
+    try:
+        return validate_audio_codec(str(value))
+    except ValueError as exc:
+        raise RequestValidationError(EXIT_REQUEST_ERROR, str(exc)) from exc
+
+
+def _parse_opus_bitrate(value: Any) -> int:
+    try:
+        return validate_opus_bitrate(value)
+    except ValueError as exc:
+        raise RequestValidationError(EXIT_REQUEST_ERROR, str(exc)) from exc
 
 
 def parse_client_request(reader: Any) -> dict[str, Any]:
@@ -116,8 +141,17 @@ def parse_client_request(reader: Any) -> dict[str, Any]:
         _validate_audio_modulation(request["modulation"])
         request["format"] = None
         request["squelch"] = _parse_squelch_level(request.get("squelch", 0))
+        opus_bitrate_provided = "opus_bitrate" in request
+        request["audio_codec"] = _parse_audio_codec(
+            request.get("audio_codec", request.get("codec", DEFAULT_AUDIO_CODEC))
+        )
+        request["opus_bitrate"] = _parse_opus_bitrate(request.get("opus_bitrate", DEFAULT_OPUS_BITRATE))
+        if request["audio_codec"] != "opus" and opus_bitrate_provided:
+            warnings.append("opus_bitrate is ignored unless audio_codec is opus")
     if request["mode"] == "iq":
         request["squelch"] = 0
+        request["audio_codec"] = DEFAULT_AUDIO_CODEC
+        request["opus_bitrate"] = DEFAULT_OPUS_BITRATE
     request["warnings"] = warnings
     return request
 

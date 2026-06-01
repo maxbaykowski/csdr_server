@@ -21,6 +21,7 @@ from .dsp import (
     _validate_requested_mode_supported,
     _validate_session_request,
 )
+from .opus_codec import probe_opus_encoder, validate_opus_bitrate
 from .errors import (
     DeviceAccessFatalError,
     DeviceBusyRetryableError,
@@ -180,6 +181,8 @@ class CaptureManager:
         output_rate: int | None,
         sample_format: str | None,
         modulation: str | None,
+        audio_codec: str = "pcm",
+        opus_bitrate: int = 24_000,
     ) -> "SharedStream":
         return self.graph.get_output_stream(
             frequency,
@@ -187,6 +190,8 @@ class CaptureManager:
             output_rate,
             sample_format,
             modulation,
+            audio_codec,
+            opus_bitrate,
         )
 
     def get_audio_power_monitor(
@@ -398,12 +403,35 @@ class CaptureManager:
         *,
         frequency: int | None = None,
         modulation: str | None = None,
+        opus_bitrate: int | None = None,
     ) -> None:
         with self.reconfigure_lock:
             next_frequency = session.frequency if frequency is None else frequency
             next_modulation = session.modulation
             next_output_rate = session.output_rate
             next_sample_format = session.sample_format
+            next_audio_codec = session.audio_codec
+            next_opus_bitrate = session.opus_bitrate
+
+            if opus_bitrate is not None:
+                if session.mode != "audio":
+                    raise RequestValidationError(
+                        EXIT_REQUEST_ERROR,
+                        "bitrate command is only supported in audio mode",
+                    )
+                if session.audio_codec != "opus":
+                    raise RequestValidationError(
+                        EXIT_REQUEST_ERROR,
+                        "bitrate only applies when using the opus codec",
+                    )
+                next_opus_bitrate = validate_opus_bitrate(opus_bitrate)
+                try:
+                    probe_opus_encoder(next_opus_bitrate)
+                except Exception as exc:
+                    raise RequestValidationError(
+                        EXIT_REQUEST_ERROR,
+                        f"Opus transport is unavailable on the server: {exc}",
+                    ) from exc
 
             if modulation is not None:
                 if session.mode != "audio":
@@ -430,6 +458,8 @@ class CaptureManager:
                     next_output_rate,
                     next_sample_format,
                     next_modulation,
+                    next_audio_codec,
+                    next_opus_bitrate,
                 )
                 power_monitor = self.graph.get_audio_power_monitor(
                     next_frequency,
@@ -439,15 +469,19 @@ class CaptureManager:
                 session.modulation = next_modulation
                 session.output_rate = next_output_rate
                 session.sample_format = next_sample_format
+                session.audio_codec = next_audio_codec
+                session.opus_bitrate = next_opus_bitrate
                 session.switch_power_monitor(power_monitor)
                 session.switch_source_stream(source_stream)
                 self._refresh_rds_subscription_locked(session)
                 LOGGER.info(
-                    "reconfigured client %s:%s to frequency=%s modulation=%s",
+                    "reconfigured client %s:%s to frequency=%s modulation=%s audio_codec=%s opus_bitrate=%s",
                     session.address[0],
                     session.address[1],
                     next_frequency,
                     next_modulation,
+                    next_audio_codec,
+                    next_opus_bitrate,
                 )
                 return
 
@@ -467,6 +501,8 @@ class CaptureManager:
                 next_output_rate,
                 next_sample_format,
                 next_modulation,
+                next_audio_codec,
+                next_opus_bitrate,
             ) if desired_center == current_config.center_frequency else None
             power_monitor = self.graph.get_audio_power_monitor(
                 next_frequency,
@@ -477,10 +513,14 @@ class CaptureManager:
             old_modulation = session.modulation
             old_output_rate = session.output_rate
             old_sample_format = session.sample_format
+            old_audio_codec = session.audio_codec
+            old_opus_bitrate = session.opus_bitrate
             session.frequency = next_frequency
             session.modulation = next_modulation
             session.output_rate = next_output_rate
             session.sample_format = next_sample_format
+            session.audio_codec = next_audio_codec
+            session.opus_bitrate = next_opus_bitrate
             try:
                 if desired_center != current_config.center_frequency:
                     self._apply_runtime_radio_config(current_config, next_config)
@@ -510,13 +550,17 @@ class CaptureManager:
                 session.modulation = old_modulation
                 session.output_rate = old_output_rate
                 session.sample_format = old_sample_format
+                session.audio_codec = old_audio_codec
+                session.opus_bitrate = old_opus_bitrate
                 raise
             LOGGER.info(
-                "reconfigured client %s:%s to frequency=%s modulation=%s",
+                "reconfigured client %s:%s to frequency=%s modulation=%s audio_codec=%s opus_bitrate=%s",
                 session.address[0],
                 session.address[1],
                 next_frequency,
                 next_modulation,
+                next_audio_codec,
+                next_opus_bitrate,
             )
 
     def set_rds_subscription(self, session: "ClientSession", enabled: bool) -> None:

@@ -18,6 +18,7 @@ from .constants import (
 from .dsp import _normalize_audio_modulation, _validate_audio_modulation, _validate_audio_modulation_supported
 from .errors import RequestValidationError
 from .graph import IqPowerMonitor, SharedStream
+from .opus_codec import DEFAULT_AUDIO_CODEC, DEFAULT_OPUS_BITRATE, validate_opus_bitrate
 from .protocol import (
     _build_session_status_payload,
     _parse_request_frequency,
@@ -43,6 +44,8 @@ class ClientSession:
         modulation: str | None,
         squelch_level: int = 0,
         power_monitor: IqPowerMonitor | None = None,
+        audio_codec: str = DEFAULT_AUDIO_CODEC,
+        opus_bitrate: int = DEFAULT_OPUS_BITRATE,
     ) -> None:
         self.conn = conn
         self.address = address
@@ -56,6 +59,8 @@ class ClientSession:
         self.modulation = modulation
         self.squelch_level = squelch_level
         self.power_monitor = power_monitor
+        self.audio_codec = audio_codec
+        self.opus_bitrate = opus_bitrate
         self.squelch_open = True
         self.squelch_last_signal_at = time.monotonic()
         self.squelch_open_candidate_since: float | None = None
@@ -84,7 +89,7 @@ class ClientSession:
         )
         self.output_thread.start()
         LOGGER.info(
-            "client %s:%s started mode=%s freq=%s sample_rate=%s format=%s modulation=%s",
+            "client %s:%s started mode=%s freq=%s sample_rate=%s format=%s modulation=%s audio_codec=%s",
             self.address[0],
             self.address[1],
             self.mode,
@@ -92,6 +97,7 @@ class ClientSession:
             self.output_rate,
             self.sample_format,
             self.modulation,
+            self.audio_codec,
         )
 
     def attach_control(self, conn: socket.socket, reader: Any) -> None:
@@ -107,7 +113,7 @@ class ClientSession:
     def enqueue(self, chunk: bytes) -> None:
         if self.closed.is_set():
             return
-        if self._should_squelch_chunk():
+        if self.audio_codec != "opus" and self._should_squelch_chunk():
             chunk = bytes(len(chunk))
         try:
             self.chunk_queue.put(chunk, timeout=self.config.enqueue_timeout_seconds)
@@ -287,6 +293,23 @@ class ClientSession:
                         level = _parse_squelch_level(message.get("level", 0))
                         self.set_squelch_level(level)
                         self.send_control(_build_session_status_payload(self, command="squelch"))
+                    elif command == "bitrate":
+                        if self.mode != "audio":
+                            raise RequestValidationError(
+                                EXIT_REQUEST_ERROR,
+                                "bitrate command is only supported in audio mode",
+                            )
+                        if self.audio_codec != "opus":
+                            raise RequestValidationError(
+                                EXIT_REQUEST_ERROR,
+                                "bitrate only applies when using the opus codec",
+                            )
+                        try:
+                            bitrate = validate_opus_bitrate(message.get("bitrate"))
+                        except ValueError as exc:
+                            raise RequestValidationError(EXIT_REQUEST_ERROR, str(exc)) from exc
+                        self.manager.reconfigure_client(self, opus_bitrate=bitrate)
+                        self.send_control(_build_session_status_payload(self, command="bitrate"))
                     else:
                         raise RequestValidationError(
                             EXIT_REQUEST_ERROR,

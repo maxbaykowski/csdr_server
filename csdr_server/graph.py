@@ -17,6 +17,7 @@ from .constants import (
     WFM_AUDIO_TRANSITION_BANDWIDTH,
     WFM_IQ_RATE,
 )
+from .opus_codec import DEFAULT_AUDIO_CODEC, DEFAULT_OPUS_BITRATE, OpusCodecError, OpusPacketEncoder
 from .dsp import (
     _build_audio_stream,
     _build_output_format_stream,
@@ -332,6 +333,117 @@ class IqPowerMonitor:
                     self.level = (self.level * 0.75) + (level * 0.25)
 
 
+class OpusSharedStream:
+    def __init__(
+        self,
+        config: ServerConfig,
+        name: str,
+        manager: "StreamGraph",
+        parent: SharedStream,
+        bitrate: int,
+        close_when_unused: bool = True,
+    ) -> None:
+        self.config = config
+        self.name = name
+        self.manager = manager
+        self.parent = parent
+        self.bitrate = bitrate
+        self.close_when_unused = close_when_unused
+        self.input_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=config.stream_queue_chunks)
+        self.closed = threading.Event()
+        self.subscribers: set[Any] = set()
+        self.subscribers_lock = threading.Lock()
+        self.thread: threading.Thread | None = None
+        self.output_ready = threading.Event()
+
+    def start(self) -> None:
+        self.thread = threading.Thread(
+            target=self._encode_loop,
+            name=f"{self.name}-opus",
+            daemon=True,
+        )
+        self.thread.start()
+        self.parent.add_subscriber(self)
+        LOGGER.info("started shared Opus stream %s bitrate=%s", self.name, self.bitrate)
+
+    def add_subscriber(self, subscriber: Any) -> None:
+        with self.subscribers_lock:
+            self.subscribers.add(subscriber)
+
+    def remove_subscriber(self, subscriber: Any) -> None:
+        should_close = False
+        with self.subscribers_lock:
+            self.subscribers.discard(subscriber)
+            should_close = (
+                self.close_when_unused
+                and not self.subscribers
+                and not self.closed.is_set()
+            )
+        if should_close:
+            self.close("unused shared Opus stream", propagate=False)
+
+    def enqueue(self, chunk: bytes) -> bool:
+        if self.closed.is_set():
+            return False
+        try:
+            self.input_queue.put(chunk, timeout=self.config.enqueue_timeout_seconds)
+            return True
+        except queue.Full:
+            LOGGER.warning("%s fell behind upstream input; closing branch", self.name)
+            self.close("Opus stream backlog")
+            return False
+
+    def close(self, reason: str, propagate: bool = True) -> None:
+        if self.closed.is_set():
+            return
+        LOGGER.info("closing shared Opus stream %s: %s", self.name, reason)
+        self.closed.set()
+        self.parent.remove_subscriber(self)
+        self.manager.on_stream_closed(self)
+        try:
+            self.input_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        with self.subscribers_lock:
+            subscribers = list(self.subscribers)
+            self.subscribers.clear()
+        if propagate:
+            for subscriber in subscribers:
+                subscriber.close(f"upstream stream closed: {self.name}")
+
+    def wait_for_output(self, timeout: float) -> bool:
+        return self.output_ready.wait(timeout)
+
+    def _encode_loop(self) -> None:
+        encoder: OpusPacketEncoder | None = None
+        try:
+            encoder = OpusPacketEncoder(self.bitrate)
+            while not self.closed.is_set():
+                chunk = self.input_queue.get()
+                if chunk is None:
+                    break
+                packets = encoder.encode(chunk)
+                if not packets:
+                    continue
+                self.output_ready.set()
+                with self.subscribers_lock:
+                    subscribers = list(self.subscribers)
+                for packet in packets:
+                    for subscriber in subscribers:
+                        if getattr(subscriber, "_should_squelch_chunk", lambda: False)():
+                            continue
+                        subscriber.enqueue(packet)
+        except OpusCodecError:
+            LOGGER.exception("%s Opus encode loop failed", self.name)
+        except Exception:
+            LOGGER.exception("%s encode loop failed", self.name)
+        finally:
+            if encoder is not None:
+                encoder.close()
+            if not self.closed.is_set():
+                self.close("Opus encode loop ended")
+
+
 class StreamGraph:
     def __init__(self, config: ServerConfig) -> None:
         self.config = config
@@ -342,6 +454,7 @@ class StreamGraph:
         self.decimation_streams: dict[tuple[int, int, float, str], SharedStream] = {}
         self.format_streams: dict[tuple[int, int, str], Any] = {}
         self.audio_streams: dict[tuple[int, str], SharedStream] = {}
+        self.audio_transport_streams: dict[tuple[int, str, str, int], Any] = {}
         self.rds_decoders: dict[int, RdsDecoder] = {}
         self.power_monitors: dict[tuple[int, int, float, str], IqPowerMonitor] = {}
 
@@ -350,6 +463,7 @@ class StreamGraph:
             root = self.root_stream
             root_dcblock = self.root_dcblock_stream
             audio = list(self.audio_streams.values())
+            audio_transports = list(self.audio_transport_streams.values())
             rds_decoders = list(self.rds_decoders.values())
             power_monitors = list(self.power_monitors.values())
             formats = list(self.format_streams.values())
@@ -358,6 +472,7 @@ class StreamGraph:
             self.root_stream = None
             self.root_dcblock_stream = None
             self.audio_streams = {}
+            self.audio_transport_streams = {}
             self.rds_decoders = {}
             self.power_monitors = {}
             self.format_streams = {}
@@ -367,6 +482,8 @@ class StreamGraph:
             decoder.close(reason)
         for monitor in power_monitors:
             monitor.close(reason)
+        for stream in audio_transports:
+            stream.close(reason, propagate=True)
         for stream in audio:
             stream.close(reason, propagate=True)
         for stream in formats:
@@ -395,6 +512,8 @@ class StreamGraph:
         output_rate: int | None,
         sample_format: str | None,
         modulation: str | None,
+        audio_codec: str = DEFAULT_AUDIO_CODEC,
+        opus_bitrate: int = DEFAULT_OPUS_BITRATE,
     ) -> SharedStream:
         with self.lock:
             stream = self._get_output_stream_locked(
@@ -403,6 +522,8 @@ class StreamGraph:
                 output_rate,
                 sample_format,
                 modulation,
+                audio_codec,
+                opus_bitrate,
             )
         if mode == "audio":
             self._wait_for_audio_stream_handoff(stream, frequency, modulation)
@@ -420,6 +541,7 @@ class StreamGraph:
         old_decimation_streams: list[SharedStream] = []
         old_format_streams: list[Any] = []
         old_audio_streams: list[SharedStream] = []
+        old_audio_transport_streams: list[Any] = []
         old_rds_decoders: list[RdsDecoder] = []
         old_power_monitors: list[IqPowerMonitor] = []
         old_root_dcblock_stream: SharedStream | None = None
@@ -441,6 +563,7 @@ class StreamGraph:
                 old_decimation_streams = list(self.decimation_streams.values())
                 old_format_streams = list(self.format_streams.values())
                 old_audio_streams = list(self.audio_streams.values())
+                old_audio_transport_streams = list(self.audio_transport_streams.values())
                 old_rds_decoders = list(self.rds_decoders.values())
                 old_power_monitors = list(self.power_monitors.values())
                 old_root_dcblock_stream = self.root_dcblock_stream
@@ -448,6 +571,7 @@ class StreamGraph:
                 self.decimation_streams = {}
                 self.format_streams = {}
                 self.audio_streams = {}
+                self.audio_transport_streams = {}
                 self.rds_decoders = {}
                 self.power_monitors = {}
                 self.root_dcblock_stream = None
@@ -455,11 +579,13 @@ class StreamGraph:
                 old_decimation_streams = list(self.decimation_streams.values())
                 old_format_streams = list(self.format_streams.values())
                 old_audio_streams = list(self.audio_streams.values())
+                old_audio_transport_streams = list(self.audio_transport_streams.values())
                 old_rds_decoders = list(self.rds_decoders.values())
                 old_power_monitors = list(self.power_monitors.values())
                 self.decimation_streams = {}
                 self.format_streams = {}
                 self.audio_streams = {}
+                self.audio_transport_streams = {}
                 self.rds_decoders = {}
                 self.power_monitors = {}
             elif rebuild_audio_modulations:
@@ -468,9 +594,19 @@ class StreamGraph:
                     for key, stream in self.audio_streams.items()
                     if key[1] in rebuild_audio_modulations
                 ]
+                old_audio_transport_streams = [
+                    stream
+                    for key, stream in self.audio_transport_streams.items()
+                    if key[1] in rebuild_audio_modulations
+                ]
                 self.audio_streams = {
                     key: stream
                     for key, stream in self.audio_streams.items()
+                    if key[1] not in rebuild_audio_modulations
+                }
+                self.audio_transport_streams = {
+                    key: stream
+                    for key, stream in self.audio_transport_streams.items()
                     if key[1] not in rebuild_audio_modulations
                 }
                 if {"wfm", "wfm_stereo"} & rebuild_audio_modulations:
@@ -485,6 +621,8 @@ class StreamGraph:
                     session.output_rate,
                     session.sample_format,
                     session.modulation,
+                    session.audio_codec,
+                    session.opus_bitrate,
                 )
                 desired_monitor = self._get_audio_power_monitor_locked(
                     session.frequency,
@@ -510,6 +648,8 @@ class StreamGraph:
             monitor.close("reconfigured power monitor")
         for stream in old_audio_streams:
             stream.close("reconfigured audio stream", propagate=False)
+        for stream in old_audio_transport_streams:
+            stream.close("reconfigured audio transport stream", propagate=False)
         for stream in old_format_streams:
             stream.close("reconfigured output format", propagate=False)
         for stream in old_decimation_streams:
@@ -526,7 +666,9 @@ class StreamGraph:
         output_rate: int | None,
         sample_format: str | None,
         modulation: str | None,
-    ) -> SharedStream:
+        audio_codec: str = DEFAULT_AUDIO_CODEC,
+        opus_bitrate: int = DEFAULT_OPUS_BITRATE,
+    ) -> Any:
         _validate_mode(mode)
         required_bandwidth = _get_required_bandwidth(mode, output_rate, modulation)
         _validate_request_frequency(self.config, frequency, required_bandwidth)
@@ -630,11 +772,17 @@ class StreamGraph:
                 frequency,
                 modulation,
             )
-        return audio_stream
+        return self._get_audio_transport_stream_locked(
+            frequency,
+            modulation,
+            audio_codec,
+            opus_bitrate,
+            audio_stream,
+        )
 
     def _wait_for_audio_stream_handoff(
         self,
-        stream: SharedStream,
+        stream: Any,
         frequency: int,
         modulation: str | None,
     ) -> None:
@@ -646,6 +794,49 @@ class StreamGraph:
             modulation,
             DEFAULT_AUDIO_STREAM_WARMUP_TIMEOUT_SECONDS,
         )
+
+    def _get_audio_transport_stream_locked(
+        self,
+        frequency: int,
+        modulation: str,
+        audio_codec: str,
+        opus_bitrate: int,
+        parent: SharedStream,
+    ) -> Any:
+        if audio_codec == DEFAULT_AUDIO_CODEC:
+            return parent
+        if audio_codec != "opus":
+            raise ValueError(f"unsupported audio codec {audio_codec!r}")
+        transport_key = (frequency, modulation, audio_codec, opus_bitrate)
+        transport_stream = self.audio_transport_streams.get(transport_key)
+        if transport_stream is None:
+            transport_stream = OpusSharedStream(
+                config=self.config,
+                name=f"audio-{modulation}-{frequency}-opus-{opus_bitrate}",
+                manager=self,
+                parent=parent,
+                bitrate=opus_bitrate,
+                close_when_unused=True,
+            )
+            transport_stream.start()
+            self.audio_transport_streams[transport_key] = transport_stream
+            LOGGER.debug(
+                "created shared audio transport stream frequency=%s modulation=%s codec=%s bitrate=%s",
+                frequency,
+                modulation,
+                audio_codec,
+                opus_bitrate,
+            )
+        else:
+            transport_stream.config = self.config
+            LOGGER.debug(
+                "reusing shared audio transport stream frequency=%s modulation=%s codec=%s bitrate=%s",
+                frequency,
+                modulation,
+                audio_codec,
+                opus_bitrate,
+            )
+        return transport_stream
 
     def _get_shift_stream_locked(
         self,
@@ -987,6 +1178,9 @@ class StreamGraph:
             for key, candidate in list(self.audio_streams.items()):
                 if candidate is stream:
                     del self.audio_streams[key]
+            for key, candidate in list(self.audio_transport_streams.items()):
+                if candidate is stream:
+                    del self.audio_transport_streams[key]
             for key, candidate in list(self.format_streams.items()):
                 if candidate is stream:
                     del self.format_streams[key]

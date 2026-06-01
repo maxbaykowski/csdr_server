@@ -13,6 +13,13 @@ from .config import ServerConfig
 from .constants import DEFAULT_AUDIO_OUTPUT_FORMAT, EXIT_REQUEST_ERROR, LOGGER
 from .dsp import _get_audio_channels, _get_audio_output_rate
 from .errors import PendingStreamConnection, RequestValidationError
+from .opus_codec import (
+    DEFAULT_AUDIO_CODEC,
+    DEFAULT_OPUS_BITRATE,
+    OPUS_FRAME_MS,
+    OpusCodecError,
+    probe_opus_encoder,
+)
 from .protocol import parse_client_request, parse_stream_token, send_handshake
 from .rtl import CaptureManager
 from .sessions import ClientSession
@@ -130,7 +137,23 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                             sample_format = request["format"]
                             modulation = request["modulation"]
                             squelch_level = int(request["squelch"])
+                            audio_codec = request.get("audio_codec", DEFAULT_AUDIO_CODEC)
+                            opus_bitrate = int(request.get("opus_bitrate", DEFAULT_OPUS_BITRATE))
                             request_warnings = request["warnings"]
+                            if mode == "audio" and audio_codec == "opus":
+                                try:
+                                    probe_opus_encoder(opus_bitrate)
+                                except OpusCodecError as exc:
+                                    LOGGER.warning(
+                                        "client %s:%s requested Opus transport, but Opus is unavailable; using PCM transport instead: %s",
+                                        address[0],
+                                        address[1],
+                                        exc,
+                                    )
+                                    audio_codec = DEFAULT_AUDIO_CODEC
+                                    request_warnings.append(
+                                        f"Opus transport is unavailable on the server; using {DEFAULT_AUDIO_CODEC} audio transport instead"
+                                    )
                             capture.prepare_request(
                                 frequency,
                                 mode,
@@ -143,6 +166,8 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                                 output_rate,
                                 sample_format,
                                 modulation,
+                                audio_codec,
+                                opus_bitrate,
                             )
                             power_monitor = capture.get_audio_power_monitor(
                                 frequency,
@@ -161,6 +186,8 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                                 modulation=modulation,
                                 squelch_level=squelch_level,
                                 power_monitor=power_monitor,
+                                audio_codec=audio_codec,
+                                opus_bitrate=opus_bitrate,
                             )
                             capture.register_client(session)
                             session.start()
@@ -173,6 +200,10 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                                 handshake["sample_rate"] = _get_audio_output_rate(modulation)
                                 handshake["channels"] = _get_audio_channels(modulation)
                                 handshake["squelch"] = squelch_level
+                                handshake["audio_codec"] = audio_codec
+                                if audio_codec == "opus":
+                                    handshake["opus_bitrate"] = opus_bitrate
+                                    handshake["opus_frame_ms"] = OPUS_FRAME_MS
                             if request_warnings:
                                 handshake["warnings"] = request_warnings
                                 for warning in request_warnings:

@@ -23,6 +23,15 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import queue
 
+from csdr_server.opus_codec import (
+    DEFAULT_AUDIO_CODEC,
+    DEFAULT_OPUS_BITRATE,
+    OpusCodecError,
+    OpusPacketDecoder,
+    probe_opus_decoder,
+    validate_opus_bitrate,
+)
+
 EXIT_CONNECT_FAILED = 255
 EXIT_OUT_OF_BAND = 1
 EXIT_BAD_SAMPLE_RATE = 2
@@ -37,6 +46,7 @@ VALID_AUDIO_MODULATIONS = (DEFAULT_MODULATION, "lsb", "nfm", "usb", "wfm", "wfm-
 DEFAULT_SAMPLE_FORMAT = "f32"
 VALID_SAMPLE_FORMATS = (DEFAULT_SAMPLE_FORMAT, "s16")
 DEFAULT_AUDIO_SAMPLE_FORMAT = "s16"
+VALID_AUDIO_CODECS = ("pcm", "opus")
 SERVER_AUDIO_SAMPLE_RATE = 48_000
 SERVER_AUDIO_CHANNELS = 2
 DEFAULT_AUDIO_CHANNELS = SERVER_AUDIO_CHANNELS
@@ -82,6 +92,7 @@ class AudioPlaybackConfig:
     sample_rate: int
     channels: int
     sample_format: str
+    audio_codec: str = DEFAULT_AUDIO_CODEC
 
 
 class AudioPlaybackState:
@@ -384,6 +395,13 @@ def parse_squelch_level(value: str) -> int:
     return level
 
 
+def parse_opus_bitrate(value: str) -> int:
+    try:
+        return validate_opus_bitrate(parse_scaled_integer(value, "Opus bitrate"))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal client for csdr_server.py")
     parser.add_argument("-a", "--address", required=True, help="Server IP address or hostname")
@@ -432,6 +450,20 @@ def parse_args() -> argparse.Namespace:
         type=parse_squelch_level,
         default=0,
         help="Audio squelch level from 0 to 100; 0 disables squelch",
+    )
+    parser.add_argument(
+        "-c",
+        "--audio-codec",
+        choices=VALID_AUDIO_CODECS,
+        default=DEFAULT_AUDIO_CODEC,
+        help="Audio network transport codec; pcm is raw 48 kHz stereo s16, opus is length-framed Opus",
+    )
+    parser.add_argument(
+        "-b",
+        "--opus-bitrate",
+        type=parse_opus_bitrate,
+        default=DEFAULT_OPUS_BITRATE,
+        help="Opus audio bitrate in bits per second, or with K/M/G suffix, when --audio-codec opus is used",
     )
     parser.add_argument(
         "-B",
@@ -633,6 +665,12 @@ def _get_audio_playback_channels(sounddevice, audio_device: int | str | None) ->
 
 
 def _validate_audio_playback_config(audio_config: AudioPlaybackConfig) -> bool:
+    if audio_config.audio_codec not in VALID_AUDIO_CODECS:
+        print(
+            f"error: unsupported audio codec {audio_config.audio_codec!r}; expected one of {', '.join(VALID_AUDIO_CODECS)}",
+            file=sys.stderr,
+        )
+        return False
     if audio_config.sample_format != DEFAULT_AUDIO_SAMPLE_FORMAT:
         print(
             f"error: audio playback only supports {DEFAULT_AUDIO_SAMPLE_FORMAT}; server sent {audio_config.sample_format!r}",
@@ -654,6 +692,53 @@ def _validate_audio_playback_config(audio_config: AudioPlaybackConfig) -> bool:
         )
         return False
     return True
+
+
+class AudioStreamReader:
+    def __init__(self, stream_sock: socket.socket, audio_codec: str) -> None:
+        self.stream_sock = stream_sock
+        self.audio_codec = audio_codec
+        self.decoder = OpusPacketDecoder() if audio_codec == "opus" else None
+
+    def recv_pcm(self) -> bytes:
+        while True:
+            chunk = self.stream_sock.recv(AUDIO_STREAM_READ_SIZE)
+            if not chunk:
+                return b""
+            if self.decoder is None:
+                return chunk
+            decoded = self.decoder.decode(chunk)
+            if decoded:
+                return decoded
+
+    def drain(self) -> bool:
+        previous_timeout = self.stream_sock.gettimeout()
+        drained = 0
+        try:
+            self.stream_sock.setblocking(False)
+            while drained < MAX_AUDIO_RECONFIGURE_DRAIN_BYTES:
+                try:
+                    chunk = self.stream_sock.recv(AUDIO_STREAM_READ_SIZE)
+                except (BlockingIOError, InterruptedError):
+                    break
+                except socket.timeout:
+                    break
+                if chunk is None:
+                    break
+                if not chunk:
+                    return True
+                drained += len(chunk)
+        finally:
+            self.stream_sock.settimeout(previous_timeout)
+            if self.decoder is not None:
+                self.decoder.close()
+                self.decoder = OpusPacketDecoder()
+        return False
+
+    def close(self) -> None:
+        if self.decoder is not None:
+            self.decoder.close()
+            self.decoder = None
 
 
 class AudioPlaybackAdapter:
@@ -733,6 +818,30 @@ def _stream_to_stdout(sock_file) -> int:
     return 0
 
 
+def _stream_audio_to_stdout(stream_sock: socket.socket, audio_config: AudioPlaybackConfig) -> int:
+    if not _validate_audio_playback_config(audio_config):
+        return EXIT_REQUEST_ERROR
+    reader: AudioStreamReader | None = None
+    try:
+        reader = AudioStreamReader(stream_sock, audio_config.audio_codec)
+        while True:
+            chunk = reader.recv_pcm()
+            if not chunk:
+                break
+            if _shutdown_requested:
+                return EXIT_REQUEST_ERROR if _fatal_control_failure else SHUTDOWN_SIGNAL_EXIT
+            _write_stdout_unbuffered(chunk)
+    except OpusCodecError as exc:
+        print(f"error: Opus audio decoding failed: {exc}", file=sys.stderr)
+        return EXIT_REQUEST_ERROR
+    finally:
+        if reader is not None:
+            reader.close()
+    if _shutdown_requested:
+        return EXIT_REQUEST_ERROR if _fatal_control_failure else SHUTDOWN_SIGNAL_EXIT
+    return 0
+
+
 def _stream_audio_to_soundcard(
     stream_sock: socket.socket,
     playback_state: AudioPlaybackState,
@@ -757,12 +866,14 @@ def _stream_audio_to_soundcard(
         print(f"error: audio device selection failed: {exc}.{_audio_platform_hint()}", file=sys.stderr)
         return EXIT_REQUEST_ERROR
 
+    reader: AudioStreamReader | None = None
     try:
         playback_sample_rate = _get_audio_playback_sample_rate(sounddevice, audio_device)
         playback_channels = _get_audio_playback_channels(sounddevice, audio_device)
         audio_config = playback_state.active_config()
         if not _validate_audio_playback_config(audio_config):
             return EXIT_REQUEST_ERROR
+        reader = AudioStreamReader(stream_sock, audio_config.audio_codec)
 
         source_bytes_per_frame = PCM_SAMPLE_WIDTH_BYTES * SERVER_AUDIO_CHANNELS
         source_bytes_per_second = SERVER_AUDIO_SAMPLE_RATE * source_bytes_per_frame
@@ -782,10 +893,10 @@ def _stream_audio_to_soundcard(
                 if not _validate_audio_playback_config(audio_config):
                     return EXIT_REQUEST_ERROR
                 prebuffer.clear()
-                if _drain_audio_stream_after_reconfigure(stream_sock):
+                if reader.drain():
                     return 0
                 continue
-            chunk = stream_sock.recv(AUDIO_STREAM_READ_SIZE)
+            chunk = reader.recv_pcm()
             if not chunk:
                 break
             if _shutdown_requested:
@@ -821,11 +932,11 @@ def _stream_audio_to_soundcard(
                     audio_config = pending_config
                     if not _validate_audio_playback_config(audio_config):
                         return EXIT_REQUEST_ERROR
-                    if _drain_audio_stream_after_reconfigure(stream_sock):
+                    if reader.drain():
                         break
                     continue
 
-                chunk = stream_sock.recv(AUDIO_STREAM_READ_SIZE)
+                chunk = reader.recv_pcm()
                 if not chunk:
                     break
                 if _shutdown_requested:
@@ -840,31 +951,12 @@ def _stream_audio_to_soundcard(
             file=sys.stderr,
         )
         return EXIT_REQUEST_ERROR
+    finally:
+        if reader is not None:
+            reader.close()
     if _shutdown_requested:
         return EXIT_REQUEST_ERROR if _fatal_control_failure else SHUTDOWN_SIGNAL_EXIT
     return 0
-
-
-def _drain_audio_stream_after_reconfigure(stream_sock: socket.socket) -> bool:
-    previous_timeout = stream_sock.gettimeout()
-    drained = 0
-    try:
-        stream_sock.setblocking(False)
-        while drained < MAX_AUDIO_RECONFIGURE_DRAIN_BYTES:
-            try:
-                chunk = stream_sock.recv(AUDIO_STREAM_READ_SIZE)
-            except (BlockingIOError, InterruptedError):
-                break
-            except socket.timeout:
-                break
-            if chunk is None:
-                break
-            if not chunk:
-                return True
-            drained += len(chunk)
-    finally:
-        stream_sock.settimeout(previous_timeout)
-    return False
 
 
 def _print_interactive_prompt() -> None:
@@ -887,7 +979,7 @@ def _start_interactive_control(
     def _interactive_loop() -> None:
         if args.mode == "audio":
             print(
-                "interactive control enabled; use 'frequency <value>', 'demod <mode>', 'squelch <0-100>', and 'rds start|stop'",
+                "interactive control enabled; use 'frequency <value>', 'demod <mode>', 'bitrate <value>', 'squelch <0-100>', and 'rds start|stop'",
                 file=sys.stderr,
             )
         else:
@@ -945,6 +1037,24 @@ def _start_interactive_control(
                         "command": "rds",
                         "action": action,
                     }
+                elif command.lower() == "bitrate":
+                    if args.mode != "audio":
+                        print("error: bitrate command is only supported in audio mode", file=sys.stderr)
+                        continue
+                    if args.audio_codec != "opus":
+                        print("error: bitrate only applies when using the opus codec", file=sys.stderr)
+                        continue
+                    if not remainder.strip():
+                        print("error: bitrate command requires an Opus bitrate", file=sys.stderr)
+                        continue
+                    try:
+                        payload = {
+                            "command": "bitrate",
+                            "bitrate": parse_opus_bitrate(remainder.strip()),
+                        }
+                    except argparse.ArgumentTypeError as exc:
+                        print(f"error: {exc}", file=sys.stderr)
+                        continue
                 elif command.lower() == "squelch":
                     if args.mode != "audio":
                         print("error: squelch command is only supported in audio mode", file=sys.stderr)
@@ -963,7 +1073,7 @@ def _start_interactive_control(
                 else:
                     if args.mode == "audio":
                         print(
-                            "error: unsupported interactive command; use 'frequency <value>', 'demod <mode>', 'squelch <0-100>', or 'rds start|stop'",
+                            "error: unsupported interactive command; use 'frequency <value>', 'demod <mode>', 'bitrate <value>', 'squelch <0-100>', or 'rds start|stop'",
                             file=sys.stderr,
                         )
                     else:
@@ -990,6 +1100,7 @@ def _start_interactive_control(
                                 sample_rate=int(response.get("sample_rate", 0)),
                                 channels=int(response.get("channels", DEFAULT_AUDIO_CHANNELS)),
                                 sample_format=str(response.get("format", "")).lower(),
+                                audio_codec=str(response.get("audio_codec", DEFAULT_AUDIO_CODEC)).lower(),
                             )
                         )
                     if response.get("rds_active") is False:
@@ -1008,6 +1119,11 @@ def _start_interactive_control(
                     elif payload["command"] == "rds":
                         print(
                             f"RDS {'enabled' if response.get('rds_active') else 'disabled'}",
+                            file=sys.stderr,
+                        )
+                    elif payload["command"] == "bitrate":
+                        print(
+                            f"Opus bitrate set to {int(response.get('opus_bitrate', payload['bitrate']))} bps",
                             file=sys.stderr,
                         )
                     else:
@@ -1043,9 +1159,23 @@ def main() -> int:
     if args.mode != "audio" and args.squelch:
         print("error: squelch is only supported in audio mode", file=sys.stderr)
         return EXIT_REQUEST_ERROR
+    if args.mode != "audio" and (
+        _option_was_provided(("--audio-codec",)) or _option_was_provided(("--opus-bitrate",))
+    ):
+        print("error: audio codec options are only supported in audio mode", file=sys.stderr)
+        return EXIT_REQUEST_ERROR
     if args.mode != "audio" and (args.audio_device is not None or args.audio_hostapi != "auto"):
         print("error: audio device options are only supported in audio mode", file=sys.stderr)
         return EXIT_REQUEST_ERROR
+    if args.mode == "audio" and args.audio_codec == "opus":
+        try:
+            probe_opus_decoder()
+        except OpusCodecError as exc:
+            print(
+                f"warning: Opus decoding is unavailable locally; requesting pcm audio transport instead: {exc}",
+                file=sys.stderr,
+            )
+            args.audio_codec = DEFAULT_AUDIO_CODEC
     audio_latency = args.audio_latency if args.audio_latency is not None else _default_audio_latency()
     stream_token = uuid.uuid4().hex
     request = {
@@ -1066,6 +1196,9 @@ def main() -> int:
             request["format"] = args.format
         request["modulation"] = normalize_audio_modulation(args.modulation)
         request["squelch"] = args.squelch
+        request["audio_codec"] = args.audio_codec
+        if args.audio_codec == "opus":
+            request["opus_bitrate"] = args.opus_bitrate
 
     try:
         stream_sock = socket.create_connection((args.address, args.port), timeout=30.0)
@@ -1141,15 +1274,23 @@ def main() -> int:
                 print(f"warning: {warning}", file=sys.stderr)
             control_sock.settimeout(None)
 
+            audio_config: AudioPlaybackConfig | None = None
             playback_state: AudioPlaybackState | None = None
-            if _should_play_audio(args):
-                playback_state = AudioPlaybackState(
-                    AudioPlaybackConfig(
-                        sample_rate=int(handshake.get("sample_rate", 0)),
-                        channels=int(handshake.get("channels", DEFAULT_AUDIO_CHANNELS)),
-                        sample_format=str(handshake.get("format", "")).lower(),
-                    )
+            if args.mode == "audio":
+                audio_config = AudioPlaybackConfig(
+                    sample_rate=int(handshake.get("sample_rate", 0)),
+                    channels=int(handshake.get("channels", DEFAULT_AUDIO_CHANNELS)),
+                    sample_format=str(handshake.get("format", "")).lower(),
+                    audio_codec=str(handshake.get("audio_codec", DEFAULT_AUDIO_CODEC)).lower(),
                 )
+                if audio_config.audio_codec != args.audio_codec:
+                    print(
+                        f"warning: server accepted {audio_config.audio_codec} audio transport instead of requested {args.audio_codec}",
+                        file=sys.stderr,
+                    )
+                args.audio_codec = audio_config.audio_codec
+                if _should_play_audio(args):
+                    playback_state = AudioPlaybackState(audio_config)
 
             rds_output = sys.stdout if _should_play_audio(args) else sys.stderr
             control_channel = ControlChannel(
@@ -1178,6 +1319,7 @@ def main() -> int:
 
             stream_sock.settimeout(None)
             if _should_play_audio(args):
+                assert playback_state is not None
                 return _stream_audio_to_soundcard(
                     stream_sock,
                     playback_state,
@@ -1186,6 +1328,9 @@ def main() -> int:
                     args.audio_device,
                     args.audio_hostapi,
                 )
+            if args.mode == "audio":
+                assert audio_config is not None
+                return _stream_audio_to_stdout(stream_sock, audio_config)
             sock_file = stream_sock.makefile("rb")
             return _stream_to_stdout(sock_file)
         except BrokenPipeError:
