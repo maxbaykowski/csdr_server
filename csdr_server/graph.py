@@ -10,6 +10,7 @@ from typing import Any
 
 from .config import ServerConfig
 from .constants import (
+    DEFAULT_AUDIO_STREAM_WARMUP_TIMEOUT_SECONDS,
     DEFAULT_SAMPLE_FORMAT,
     DEFAULT_STREAM_OUTPUT_READ_SIZE,
     LOGGER,
@@ -69,6 +70,7 @@ class SharedStream:
         self.output_thread: threading.Thread | None = None
         self.stderr_thread: threading.Thread | None = None
         self.control_fifo_fd: int | None = None
+        self.output_ready = threading.Event()
 
     def start(self) -> None:
         self._setup_control_fifo()
@@ -184,6 +186,7 @@ class SharedStream:
                 data = self.process.stdout.read(self.output_read_size)
                 if not data:
                     break
+                self.output_ready.set()
                 with self.subscribers_lock:
                     subscribers = list(self.subscribers)
                 for subscriber in subscribers:
@@ -206,6 +209,9 @@ class SharedStream:
                 self.name,
                 line.decode("utf-8", errors="replace").rstrip(),
             )
+
+    def wait_for_output(self, timeout: float) -> bool:
+        return self.output_ready.wait(timeout)
 
     def _setup_control_fifo(self) -> None:
         if self.control_fifo_value is None:
@@ -391,13 +397,16 @@ class StreamGraph:
         modulation: str | None,
     ) -> SharedStream:
         with self.lock:
-            return self._get_output_stream_locked(
+            stream = self._get_output_stream_locked(
                 frequency,
                 mode,
                 output_rate,
                 sample_format,
                 modulation,
             )
+        if mode == "audio":
+            self._wait_for_audio_stream_handoff(stream, frequency, modulation)
+        return stream
 
     def apply_runtime_config(
         self,
@@ -482,6 +491,14 @@ class StreamGraph:
                     session.modulation,
                 ) if session.mode == "audio" else None
                 stream_switches.append((session, desired_stream, desired_monitor))
+
+        for session, desired_stream, _desired_monitor in stream_switches:
+            if session.mode == "audio":
+                self._wait_for_audio_stream_handoff(
+                    desired_stream,
+                    session.frequency,
+                    session.modulation,
+                )
 
         for session, desired_stream, desired_monitor in stream_switches:
             session.switch_power_monitor(desired_monitor)
@@ -614,6 +631,21 @@ class StreamGraph:
                 modulation,
             )
         return audio_stream
+
+    def _wait_for_audio_stream_handoff(
+        self,
+        stream: SharedStream,
+        frequency: int,
+        modulation: str | None,
+    ) -> None:
+        if stream.wait_for_output(DEFAULT_AUDIO_STREAM_WARMUP_TIMEOUT_SECONDS):
+            return
+        LOGGER.debug(
+            "audio stream frequency=%s modulation=%s did not produce data within %.3fs before handoff",
+            frequency,
+            modulation,
+            DEFAULT_AUDIO_STREAM_WARMUP_TIMEOUT_SECONDS,
+        )
 
     def _get_shift_stream_locked(
         self,

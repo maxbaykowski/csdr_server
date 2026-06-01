@@ -48,7 +48,9 @@ will exit immediately with a clear runtime error.
 
 `csdr_server_client` uses `sounddevice` for local audio playback. That means
 PortAudio support must exist on the system and the PortAudio build must have a
-usable backend for the platform.
+usable backend for the platform. For local sound device playback, the client
+uses `soxr` to adapt the server's fixed 48 kHz stereo PCM stream to the selected
+device's required sample rate and channel count.
 
 ### Install for system-wide use
 
@@ -217,7 +219,8 @@ csdr_server_client -a 127.0.0.1 -p 7355 -f 101.1M -m audio -M wfm-stereo
 
 In IQ mode, `csdr_server_client` writes binary samples to stdout by default.
 In audio mode, it plays audio through the default sound device by default. Use
-`--stdout` in audio mode if you want raw `s16` audio samples on stdout instead.
+`--stdout` in audio mode if you want raw 48 kHz stereo `s16` audio samples on
+stdout instead.
 You can tune playback smoothing with `-B` / `--audio-prebuffer` and `-L` /
 `--audio-latency`, both in seconds.
 If the client is running with an interactive stdin, you can type
@@ -437,7 +440,9 @@ Supported audio modes are:
 
 WFM supports both mono and stereo, though the server needs to be configured for WFM stereo (see above).
 
-AM, SSB, and NFM demodulation modes will send 16 KHZ 16 bit PCM mono samples to the client. WFM uses 32 KHZ 16 bit mono or stereo, depending on whether stereo is being used or not.
+All audio demodulation modes send 48 kHz, 16-bit signed PCM stereo samples to
+the client. When using `--stdout` in audio mode, stdout receives that same raw
+48 kHz stereo PCM stream.
 
 Audio clients can request server-side squelch with `-l` / `--squelch`, using a
 level from `0` to `100`. `0` disables squelch and is the default. The squelch
@@ -603,7 +608,7 @@ IQ success:
 Audio success:
 
 ```json
-{"status": "ok", "mode": "audio", "format": "s16", "modulation": "am", "sample_rate": 16000, "channels": 1, "squelch": 0}
+{"status": "ok", "mode": "audio", "format": "s16", "modulation": "am", "sample_rate": 48000, "channels": 2, "squelch": 0}
 ```
 
 Error:
@@ -658,7 +663,7 @@ Audio clients may also switch demodulators live:
 Example success response:
 
 ```json
-{"status": "ok", "command": "demod", "frequency": 95700000, "mode": "audio", "format": "s16", "modulation": "wfm_stereo", "sample_rate": 32000, "channels": 2}
+{"status": "ok", "command": "demod", "frequency": 95700000, "mode": "audio", "format": "s16", "modulation": "wfm_stereo", "sample_rate": 48000, "channels": 2}
 ```
 
 Audio clients may adjust squelch live:
@@ -670,7 +675,7 @@ Audio clients may adjust squelch live:
 Example success response:
 
 ```json
-{"status": "ok", "command": "squelch", "frequency": 162550000, "mode": "audio", "format": "s16", "modulation": "nfm", "sample_rate": 16000, "channels": 1, "squelch": 25}
+{"status": "ok", "command": "squelch", "frequency": 162550000, "mode": "audio", "format": "s16", "modulation": "nfm", "sample_rate": 48000, "channels": 2, "squelch": 25}
 ```
 
 WFM audio clients may also toggle RDS subscriptions live:
@@ -686,7 +691,7 @@ WFM audio clients may also toggle RDS subscriptions live:
 Example success response:
 
 ```json
-{"status": "ok", "command": "rds", "frequency": 95700000, "mode": "audio", "format": "s16", "modulation": "wfm", "sample_rate": 32000, "channels": 1, "rds_active": true}
+{"status": "ok", "command": "rds", "frequency": 95700000, "mode": "audio", "format": "s16", "modulation": "wfm", "sample_rate": 48000, "channels": 2, "rds_active": true}
 ```
 
 RDS event example:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import sys
 from typing import Any
 
 from .config import ServerConfig
@@ -85,15 +86,11 @@ def _validate_audio_modulation(modulation: str) -> None:
 
 
 def _get_audio_output_rate(modulation: str) -> int:
-    if modulation in {"wfm", "wfm_stereo"}:
-        return WFM_AUDIO_OUTPUT_RATE
-    return AM_AUDIO_OUTPUT_RATE
+    return DEFAULT_AUDIO_OUTPUT_RATE
 
 
 def _get_audio_channels(modulation: str) -> int:
-    if modulation == "wfm_stereo":
-        return 2
-    return 1
+    return DEFAULT_AUDIO_OUTPUT_CHANNELS
 
 
 def _build_session_status_payload(
@@ -165,13 +162,27 @@ def _extract_rds_fields(message: dict[str, Any]) -> dict[str, Any]:
 def _get_audio_iq_rate(modulation: str) -> int:
     if modulation in {"wfm", "wfm_stereo"}:
         return WFM_IQ_RATE
-    return AM_AUDIO_OUTPUT_RATE
+    return NARROW_AUDIO_IQ_RATE
 
 
 def _get_audio_transition_bandwidth(modulation: str) -> float:
     if modulation in {"wfm", "wfm_stereo"}:
         return WFM_AUDIO_TRANSITION_BANDWIDTH
     return AM_AUDIO_TRANSITION_BANDWIDTH
+
+
+def _build_audio_pcm_command(input_rate: int) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "csdr_server.audio_pcm",
+        "--input-rate",
+        str(input_rate),
+        "--output-rate",
+        str(DEFAULT_AUDIO_OUTPUT_RATE),
+        "--output-channels",
+        str(DEFAULT_AUDIO_OUTPUT_CHANNELS),
+    ]
 
 
 def _validate_requested_mode_supported(
@@ -299,7 +310,7 @@ def _build_audio_stream(
         output_stream = SharedStream(
             config=config,
             name=f"audio-{modulation}-{frequency}",
-            command=["csdr", "convert", "-i", "float", "-o", "s16"],
+            command=_build_audio_pcm_command(NARROW_AUDIO_IQ_RATE),
             manager=manager,
             parent=agc_stream,
             close_when_unused=True,
@@ -371,7 +382,7 @@ def _build_audio_stream(
         output_stream = SharedStream(
             config=config,
             name=f"audio-{modulation}-{frequency}",
-            command=["csdr", "convert", "-i", "float", "-o", "s16"],
+            command=_build_audio_pcm_command(NARROW_AUDIO_IQ_RATE),
             manager=manager,
             parent=agc_stream,
             close_when_unused=True,
@@ -411,7 +422,7 @@ def _build_audio_stream(
                     "csdr",
                     "deemphasis",
                     "--wfm",
-                    str(_get_audio_output_rate(modulation)),
+                    str(NARROW_AUDIO_IQ_RATE),
                     f"{config.nfm_deemphasis_tau}e-6",
                 ],
                 manager=manager,
@@ -421,7 +432,7 @@ def _build_audio_stream(
             nfm_parent = deemphasis_stream
         lowpass_stream: SharedStream | None = None
         if config.nfm_lowpass_frequency is not None:
-            lowpass_cutoff = config.nfm_lowpass_frequency / float(_get_audio_output_rate(modulation))
+            lowpass_cutoff = config.nfm_lowpass_frequency / float(NARROW_AUDIO_IQ_RATE)
             lowpass_stream = SharedStream(
                 config=config,
                 name=f"audio-{modulation}-{frequency}-lowpass",
@@ -449,7 +460,7 @@ def _build_audio_stream(
         output_stream = SharedStream(
             config=config,
             name=f"audio-{modulation}-{frequency}",
-            command=["csdr", "convert", "-i", "float", "-o", "s16"],
+            command=_build_audio_pcm_command(NARROW_AUDIO_IQ_RATE),
             manager=manager,
             parent=dcblock_stream,
             close_when_unused=True,
@@ -477,7 +488,7 @@ def _build_audio_stream(
     if modulation == "wfm":
         audio_decimation_ratio = _compute_fractional_decimation_ratio(
             WFM_IQ_RATE,
-            WFM_AUDIO_OUTPUT_RATE,
+            DEFAULT_AUDIO_OUTPUT_RATE,
         )
         audio_resample_stream = SharedStream(
             config=config,
@@ -502,7 +513,7 @@ def _build_audio_stream(
                 "csdr",
                 "deemphasis",
                 "--wfm",
-                str(WFM_AUDIO_OUTPUT_RATE),
+                str(DEFAULT_AUDIO_OUTPUT_RATE),
                 f"{deemphasis_tau}e-6",
             ],
             manager=manager,
@@ -512,7 +523,7 @@ def _build_audio_stream(
         output_stream = SharedStream(
             config=config,
             name=f"audio-{modulation}-{frequency}",
-            command=["csdr", "convert", "-i", "float", "-o", "s16"],
+            command=_build_audio_pcm_command(DEFAULT_AUDIO_OUTPUT_RATE),
             manager=manager,
             parent=deemphasis_stream,
             close_when_unused=True,
@@ -541,7 +552,7 @@ def _build_audio_stream(
                 "-r",
                 str(WFM_IQ_RATE),
                 "-R",
-                str(WFM_AUDIO_OUTPUT_RATE),
+                str(DEFAULT_AUDIO_OUTPUT_RATE),
                 "-d",
                 str(deemphasis_tau),
             ],
