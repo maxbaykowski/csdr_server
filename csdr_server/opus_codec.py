@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 
 
 OPUS_SAMPLE_RATE = 48_000
@@ -19,6 +20,136 @@ DEFAULT_AUDIO_CODEC = "pcm"
 
 class OpusCodecError(RuntimeError):
     pass
+
+
+_OPUS_BINDINGS = None
+
+
+class _DirectOpusBindings:
+    OPUS_OK = 0
+    OPUS_APPLICATION_AUDIO = 2049
+    OPUS_SET_BITRATE_REQUEST = 4002
+    opus_int16 = ctypes.c_int16
+    opus_int32 = ctypes.c_int32
+
+    def __init__(self, libopus) -> None:
+        self.libopus = libopus
+        self._bind_functions()
+
+    def _bind_functions(self) -> None:
+        required = (
+            "opus_encoder_create",
+            "opus_encoder_destroy",
+            "opus_encoder_ctl",
+            "opus_encode",
+            "opus_decoder_create",
+            "opus_decoder_destroy",
+            "opus_decode",
+            "opus_strerror",
+        )
+        missing = [name for name in required if not hasattr(self.libopus, name)]
+        if missing:
+            raise OpusCodecError(
+                "libopus is missing required symbols: " + ", ".join(missing)
+            )
+
+        self.libopus.opus_encoder_create.restype = ctypes.c_void_p
+        self.libopus.opus_encoder_create.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        self.libopus.opus_encoder_destroy.restype = None
+        self.libopus.opus_encoder_destroy.argtypes = [ctypes.c_void_p]
+        self.libopus.opus_encoder_ctl.restype = ctypes.c_int
+        self.libopus.opus_encoder_ctl.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.libopus.opus_encode.restype = ctypes.c_int
+        self.libopus.opus_encode.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int16),
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_ubyte),
+            ctypes.c_int32,
+        ]
+        self.libopus.opus_decoder_create.restype = ctypes.c_void_p
+        self.libopus.opus_decoder_create.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        self.libopus.opus_decoder_destroy.restype = None
+        self.libopus.opus_decoder_destroy.argtypes = [ctypes.c_void_p]
+        self.libopus.opus_decode.restype = ctypes.c_int
+        self.libopus.opus_decode.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_ubyte),
+            ctypes.c_int32,
+            ctypes.POINTER(ctypes.c_int16),
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        self.libopus.opus_strerror.restype = ctypes.c_char_p
+        self.libopus.opus_strerror.argtypes = [ctypes.c_int]
+
+    def opus_encoder_create(self, sample_rate, channels, application, error):
+        return self.libopus.opus_encoder_create(sample_rate, channels, application, error)
+
+    def opus_encoder_destroy(self, encoder) -> None:
+        self.libopus.opus_encoder_destroy(encoder)
+
+    def opus_encoder_ctl(self, encoder, request, value):
+        return self.libopus.opus_encoder_ctl(encoder, request, value)
+
+    def opus_encode(self, encoder, pcm, frame_size, data, max_data_bytes):
+        return self.libopus.opus_encode(encoder, pcm, frame_size, data, max_data_bytes)
+
+    def opus_decoder_create(self, sample_rate, channels, error):
+        return self.libopus.opus_decoder_create(sample_rate, channels, error)
+
+    def opus_decoder_destroy(self, decoder) -> None:
+        self.libopus.opus_decoder_destroy(decoder)
+
+    def opus_decode(self, decoder, data, packet_size, pcm, frame_size, decode_fec):
+        return self.libopus.opus_decode(
+            decoder, data, packet_size, pcm, frame_size, decode_fec
+        )
+
+    def opus_strerror(self, error):
+        return self.libopus.opus_strerror(error) or b"unknown Opus error"
+
+
+def _pyogg_opus_has_low_level_api(opus) -> bool:
+    required = (
+        "OPUS_OK",
+        "OPUS_APPLICATION_AUDIO",
+        "OPUS_SET_BITRATE_REQUEST",
+        "opus_int16",
+        "opus_int32",
+        "opus_encoder_create",
+        "opus_encoder_destroy",
+        "opus_encoder_ctl",
+        "opus_encode",
+        "opus_decoder_create",
+        "opus_decoder_destroy",
+        "opus_decode",
+        "opus_strerror",
+    )
+    return all(hasattr(opus, name) for name in required)
+
+
+def _load_direct_opus_bindings(pyogg_opus=None):
+    libopus = getattr(pyogg_opus, "libopus", None) if pyogg_opus is not None else None
+    if libopus is None:
+        library_path = ctypes.util.find_library("opus")
+        if library_path is None:
+            raise OpusCodecError(
+                "Opus audio transport requires libopus. PyOgg is installed, "
+                "but its low-level Opus decoder symbols are unavailable and "
+                "libopus could not be found by ctypes."
+            )
+        libopus = ctypes.CDLL(library_path)
+    return _DirectOpusBindings(libopus)
 
 
 def validate_audio_codec(codec: str) -> str:
@@ -43,13 +174,22 @@ def validate_opus_bitrate(bitrate: int) -> int:
 
 
 def _load_opus():
+    global _OPUS_BINDINGS
+    if _OPUS_BINDINGS is not None:
+        return _OPUS_BINDINGS
+
     try:
         from pyogg import opus
     except ImportError as exc:
         raise OpusCodecError(
             "Opus audio transport requires the Python package 'PyOgg'"
         ) from exc
-    return opus
+
+    if _pyogg_opus_has_low_level_api(opus):
+        _OPUS_BINDINGS = opus
+    else:
+        _OPUS_BINDINGS = _load_direct_opus_bindings(opus)
+    return _OPUS_BINDINGS
 
 
 def ensure_opus_available() -> None:
