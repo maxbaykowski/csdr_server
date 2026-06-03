@@ -67,7 +67,7 @@ class RdsDecoder:
         self.output_thread.start()
         self.stderr_thread.start()
         self.parent.add_subscriber(self)
-        LOGGER.info("started shared RDS decoder %s", self.name)
+        LOGGER.debug("started shared RDS decoder %s", self.name)
 
     def _build_command(self) -> list[str]:
         command = [
@@ -115,14 +115,14 @@ class RdsDecoder:
             self.input_queue.put(chunk, timeout=self.config.enqueue_timeout_seconds)
             return True
         except queue.Full:
-            LOGGER.warning("%s fell behind upstream input; closing branch", self.name)
+            LOGGER.debug("%s fell behind upstream input; closing branch", self.name)
             self.close("stream backlog")
             return False
 
     def close(self, reason: str) -> None:
         if self.closed.is_set():
             return
-        LOGGER.info("closing shared RDS decoder %s: %s", self.name, reason)
+        LOGGER.debug("closing shared RDS decoder %s: %s", self.name, reason)
         self.closed.set()
         self.parent.remove_subscriber(self)
         self.manager.on_rds_decoder_closed(self)
@@ -143,7 +143,7 @@ class RdsDecoder:
                     break
                 self.process.stdin.write(chunk)
         except BrokenPipeError:
-            LOGGER.info("%s stdin closed", self.name)
+            LOGGER.debug("%s stdin closed", self.name)
         except Exception:
             LOGGER.exception("%s input loop failed", self.name)
         finally:
@@ -192,7 +192,7 @@ class RdsDecoder:
         for line in iter(self.process.stderr.readline, b""):
             if not line:
                 break
-            LOGGER.info(
+            LOGGER.debug(
                 "%s: %s",
                 self.name,
                 line.decode("utf-8", errors="replace").rstrip(),

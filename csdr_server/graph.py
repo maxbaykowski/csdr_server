@@ -108,7 +108,7 @@ class SharedStream:
         self.stderr_thread.start()
         if self.parent is not None:
             self.parent.add_subscriber(self)
-        LOGGER.info("started shared stream %s: %s", self.name, " ".join(self.command))
+        LOGGER.debug("started shared stream %s: %s", self.name, " ".join(self.command))
 
     def add_subscriber(self, subscriber: Any) -> None:
         with self.subscribers_lock:
@@ -133,14 +133,14 @@ class SharedStream:
             self.input_queue.put(chunk, timeout=self.config.enqueue_timeout_seconds)
             return True
         except queue.Full:
-            LOGGER.warning("%s fell behind upstream input; closing branch", self.name)
+            LOGGER.debug("%s fell behind upstream input; closing branch", self.name)
             self.close("stream backlog")
             return False
 
     def close(self, reason: str, propagate: bool = True) -> None:
         if self.closed.is_set():
             return
-        LOGGER.info("closing shared stream %s: %s", self.name, reason)
+        LOGGER.debug("closing shared stream %s: %s", self.name, reason)
         self.closed.set()
         if self.parent is not None:
             self.parent.remove_subscriber(self)
@@ -169,7 +169,7 @@ class SharedStream:
                     break
                 self.process.stdin.write(chunk)
         except BrokenPipeError:
-            LOGGER.info("%s stdin closed", self.name)
+            LOGGER.debug("%s stdin closed", self.name)
         except Exception:
             LOGGER.exception("%s input loop failed", self.name)
         finally:
@@ -205,7 +205,7 @@ class SharedStream:
         for line in iter(self.process.stderr.readline, b""):
             if not line:
                 break
-            LOGGER.info(
+            LOGGER.debug(
                 "%s: %s",
                 self.name,
                 line.decode("utf-8", errors="replace").rstrip(),
@@ -280,7 +280,7 @@ class IqPowerMonitor:
         )
         self.thread.start()
         self.parent.add_subscriber(self)
-        LOGGER.info("started IQ power monitor %s", self.name)
+        LOGGER.debug("started IQ power monitor %s", self.name)
 
     def add_client(self, client: "ClientSession") -> None:
         with self.clients_lock:
@@ -307,7 +307,7 @@ class IqPowerMonitor:
     def close(self, reason: str) -> None:
         if self.closed.is_set():
             return
-        LOGGER.info("closing IQ power monitor %s: %s", self.name, reason)
+        LOGGER.debug("closing IQ power monitor %s: %s", self.name, reason)
         self.closed.set()
         self.parent.remove_subscriber(self)
         self.manager.on_power_monitor_closed(self)
@@ -364,7 +364,7 @@ class OpusSharedStream:
         )
         self.thread.start()
         self.parent.add_subscriber(self)
-        LOGGER.info("started shared Opus stream %s bitrate=%s", self.name, self.bitrate)
+        LOGGER.debug("started shared Opus stream %s bitrate=%s", self.name, self.bitrate)
 
     def add_subscriber(self, subscriber: Any) -> None:
         with self.subscribers_lock:
@@ -389,14 +389,14 @@ class OpusSharedStream:
             self.input_queue.put(chunk, timeout=self.config.enqueue_timeout_seconds)
             return True
         except queue.Full:
-            LOGGER.warning("%s fell behind upstream input; closing branch", self.name)
+            LOGGER.debug("%s fell behind upstream input; closing branch", self.name)
             self.close("Opus stream backlog")
             return False
 
     def close(self, reason: str, propagate: bool = True) -> None:
         if self.closed.is_set():
             return
-        LOGGER.info("closing shared Opus stream %s: %s", self.name, reason)
+        LOGGER.debug("closing shared Opus stream %s: %s", self.name, reason)
         self.closed.set()
         self.parent.remove_subscriber(self)
         self.manager.on_stream_closed(self)

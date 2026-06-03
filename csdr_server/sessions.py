@@ -42,6 +42,7 @@ class ClientSession:
         output_rate: int,
         sample_format: str | None,
         modulation: str | None,
+        client_number: int = 0,
         squelch_level: int = 0,
         power_monitor: IqPowerMonitor | None = None,
         audio_codec: str = DEFAULT_AUDIO_CODEC,
@@ -57,6 +58,7 @@ class ClientSession:
         self.output_rate = output_rate
         self.sample_format = sample_format
         self.modulation = modulation
+        self.client_number = client_number
         self.squelch_level = squelch_level
         self.power_monitor = power_monitor
         self.audio_codec = audio_codec
@@ -88,17 +90,7 @@ class ClientSession:
             daemon=True,
         )
         self.output_thread.start()
-        LOGGER.info(
-            "client %s:%s started mode=%s freq=%s sample_rate=%s format=%s modulation=%s audio_codec=%s",
-            self.address[0],
-            self.address[1],
-            self.mode,
-            self.frequency,
-            self.output_rate,
-            self.sample_format,
-            self.modulation,
-            self.audio_codec,
-        )
+        LOGGER.info(self._format_client_connected_log())
 
     def attach_control(self, conn: socket.socket, reader: Any) -> None:
         self.control_conn = conn
@@ -119,16 +111,16 @@ class ClientSession:
             self.chunk_queue.put(chunk, timeout=self.config.enqueue_timeout_seconds)
         except queue.Full:
             LOGGER.warning(
-                "client %s:%s fell behind capture rate; dropping connection",
-                self.address[0],
-                self.address[1],
+                "Client %s couldn't keep up and was dropped",
+                self.client_number,
             )
             self.close("client backlog")
 
     def close(self, reason: str) -> None:
         if self.closed.is_set():
             return
-        LOGGER.info("closing client %s:%s: %s", self.address[0], self.address[1], reason)
+        LOGGER.info("Client %s has disconnected", self.client_number)
+        LOGGER.debug("closing client %s:%s: %s", self.address[0], self.address[1], reason)
         self.closed.set()
         self.manager.unregister_client(self)
         if self.rds_decoder is not None:
@@ -166,7 +158,7 @@ class ClientSession:
                     break
                 self.conn.sendall(data)
         except (BrokenPipeError, ConnectionResetError, OSError):
-            LOGGER.info(
+            LOGGER.debug(
                 "client %s:%s disconnected during output",
                 self.address[0],
                 self.address[1],
@@ -184,7 +176,7 @@ class ClientSession:
         new_stream.add_subscriber(self)
         self.source_stream = new_stream
         old_stream.remove_subscriber(self)
-        LOGGER.info(
+        LOGGER.debug(
             "client %s:%s switched to stream %s",
             self.address[0],
             self.address[1],
@@ -262,6 +254,7 @@ class ClientSession:
                     if command == "retune":
                         frequency = _parse_request_frequency(message)
                         self.manager.reconfigure_client(self, frequency=frequency)
+                        LOGGER.info("Client %s retuned to %s Hz", self.client_number, self.frequency)
                         self.send_control(_build_session_status_payload(self, command="retune"))
                     elif command == "demod":
                         modulation = message.get("modulation")
@@ -274,6 +267,11 @@ class ClientSession:
                             self,
                             modulation=_normalize_audio_modulation(modulation),
                         )
+                        LOGGER.info(
+                            "Client %s changed demodulation mode to %s",
+                            self.client_number,
+                            str(self.modulation).upper(),
+                        )
                         self.send_control(_build_session_status_payload(self, command="demod"))
                     elif command == "rds":
                         action = str(message.get("action", "")).strip().lower()
@@ -283,6 +281,11 @@ class ClientSession:
                                 "rds command must include action 'start' or 'stop'",
                             )
                         self.manager.set_rds_subscription(self, enabled=(action == "start"))
+                        LOGGER.info(
+                            "Client %s has %s RDS decoding",
+                            self.client_number,
+                            "started" if action == "start" else "stopped",
+                        )
                         self.send_control(_build_session_status_payload(self, command="rds"))
                     elif command == "squelch":
                         if self.mode != "audio":
@@ -292,6 +295,11 @@ class ClientSession:
                             )
                         level = _parse_squelch_level(message.get("level", 0))
                         self.set_squelch_level(level)
+                        LOGGER.info(
+                            "Client %s set squelch level to %s",
+                            self.client_number,
+                            self.squelch_level,
+                        )
                         self.send_control(_build_session_status_payload(self, command="squelch"))
                     elif command == "bitrate":
                         if self.mode != "audio":
@@ -309,6 +317,11 @@ class ClientSession:
                         except ValueError as exc:
                             raise RequestValidationError(EXIT_REQUEST_ERROR, str(exc)) from exc
                         self.manager.reconfigure_client(self, opus_bitrate=bitrate)
+                        LOGGER.info(
+                            "Client %s set opus bitrate to %s bps",
+                            self.client_number,
+                            self.opus_bitrate,
+                        )
                         self.send_control(_build_session_status_payload(self, command="bitrate"))
                     else:
                         raise RequestValidationError(
@@ -316,7 +329,7 @@ class ClientSession:
                             f"unsupported control command {command!r}",
                         )
                 except RequestValidationError as exc:
-                    LOGGER.warning(
+                    LOGGER.debug(
                         "rejecting control command from client %s:%s: %s",
                         self.address[0],
                         self.address[1],
@@ -331,7 +344,7 @@ class ClientSession:
                     )
         except OSError:
             if not self.closed.is_set():
-                LOGGER.info(
+                LOGGER.debug(
                     "control connection closed for client %s:%s",
                     self.address[0],
                     self.address[1],
@@ -350,3 +363,37 @@ class ClientSession:
             raise OSError("control connection is not attached")
         with self.control_send_lock:
             send_handshake(self.control_conn, payload)
+
+    def _format_client_connected_log(self) -> str:
+        lines = [
+            "A client has connected:",
+            f"Client number: {self.client_number}",
+            f"IP address: {self.address[0]}",
+            f"Mode: {'raw' if self.mode == 'iq' else 'audio'}",
+            f"Frequency: {self.frequency} Hz",
+        ]
+        if self.mode == "audio":
+            lines.extend(
+                [
+                    f"Demodulation mode: {str(self.modulation).replace('_', '-')}",
+                    f"squelch: {self.squelch_level}",
+                    f"Codec: {self.audio_codec}",
+                ]
+            )
+            if self.audio_codec == "opus":
+                lines.append(f"Bitrate: {self.opus_bitrate} bps")
+        else:
+            lines.extend(
+                [
+                    f"Sample rate: {self.output_rate} s/s",
+                    f"IQ format: {self._display_iq_format()}",
+                ]
+            )
+        return "\n".join(lines)
+
+    def _display_iq_format(self) -> str:
+        if self.sample_format == "f32":
+            return "float"
+        if self.sample_format == "s16":
+            return "S16"
+        return str(self.sample_format)

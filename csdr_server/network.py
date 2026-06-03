@@ -1,18 +1,21 @@
 from __future__ import annotations
 
+import errno
 import json
+import os
 import select
 import signal
 import socket
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .config import ServerConfig
 from .constants import DEFAULT_AUDIO_OUTPUT_FORMAT, EXIT_REQUEST_ERROR, LOGGER
 from .dsp import _get_audio_channels, _get_audio_output_rate
-from .errors import PendingStreamConnection, RequestValidationError
+from .errors import NetworkBindError, PendingStreamConnection, RequestValidationError
 from .opus_codec import (
     DEFAULT_AUDIO_CODEC,
     DEFAULT_OPUS_BITRATE,
@@ -24,9 +27,15 @@ from .protocol import parse_client_request, parse_stream_token, send_handshake
 from .rtl import CaptureManager
 from .sessions import ClientSession
 
+
+@dataclass(frozen=True)
+class PortOwner:
+    pid: int
+    name: str
+
+
 def serve(config_path: Path, config: ServerConfig) -> int:
     capture = CaptureManager(config)
-    capture.start()
 
     shutdown_event = threading.Event()
     reload_event = threading.Event()
@@ -34,11 +43,11 @@ def serve(config_path: Path, config: ServerConfig) -> int:
     pending_stream_timeout_seconds = 30.0
 
     def _handle_signal(signum: int, _frame: Any) -> None:
-        LOGGER.info("received signal %s, shutting down", signum)
+        LOGGER.info("Shutdown signal received; stopping server")
         shutdown_event.set()
 
     def _handle_reload(_signum: int, _frame: Any) -> None:
-        LOGGER.info("received SIGHUP, reloading config from %s", config_path)
+        LOGGER.info("Reloading configuration from %s", config_path)
         reload_event.set()
 
     signal.signal(signal.SIGINT, _handle_signal)
@@ -46,6 +55,8 @@ def serve(config_path: Path, config: ServerConfig) -> int:
     signal.signal(signal.SIGHUP, _handle_reload)
     stream_port = config.listen_port
     control_port = config.listen_port + 1
+    _ensure_port_available(config.listen_host, stream_port)
+    _ensure_port_available(config.listen_host, control_port)
 
     def _cleanup_expired_pending_streams() -> None:
         now = time.time()
@@ -60,7 +71,7 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                 pending.conn.close()
             except OSError:
                 pass
-            LOGGER.info(
+            LOGGER.debug(
                 "dropped pending stream connection %s:%s after timeout",
                 pending.address[0],
                 pending.address[1],
@@ -69,18 +80,16 @@ def serve(config_path: Path, config: ServerConfig) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as stream_server, socket.socket(socket.AF_INET, socket.SOCK_STREAM) as control_server:
         stream_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         control_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        stream_server.bind((config.listen_host, stream_port))
-        control_server.bind((config.listen_host, control_port))
+        _bind_server_socket(stream_server, config.listen_host, stream_port)
+        _bind_server_socket(control_server, config.listen_host, control_port)
         stream_server.listen()
         control_server.listen()
+        capture.start()
         LOGGER.info(
-            "listening on stream %s:%s and control %s:%s, center_frequency=%s rtl_sample_rate=%s",
+            "csdr_server is listening on %s:%s (control port %s)",
             config.listen_host,
             stream_port,
-            config.listen_host,
             control_port,
-            config.center_frequency,
-            config.rtl_sample_rate,
         )
 
         try:
@@ -145,9 +154,7 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                                     probe_opus_encoder(opus_bitrate)
                                 except OpusCodecError as exc:
                                     LOGGER.warning(
-                                        "client %s:%s requested Opus transport, but Opus is unavailable; using PCM transport instead: %s",
-                                        address[0],
-                                        address[1],
+                                        "A client requested Opus audio, but Opus is unavailable on the server. PCM audio will be used instead. Details: %s",
                                         exc,
                                     )
                                     audio_codec = DEFAULT_AUDIO_CODEC
@@ -207,23 +214,13 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                             if request_warnings:
                                 handshake["warnings"] = request_warnings
                                 for warning in request_warnings:
-                                    LOGGER.warning(
-                                        "client %s:%s: %s",
-                                        address[0],
-                                        address[1],
-                                        warning,
-                                    )
+                                    LOGGER.warning("Client %s: %s", session.client_number, warning)
                             send_handshake(conn, handshake)
                             session.activate()
                             session.attach_control(conn, control_reader)
                             keep_control_open = True
                         except RequestValidationError as exc:
-                            LOGGER.warning(
-                                "rejecting control client %s:%s: %s",
-                                address[0],
-                                address[1],
-                                exc,
-                            )
+                            LOGGER.warning("A client request from %s was rejected: %s", address[0], exc)
                             if pending is not None:
                                 try:
                                     pending.conn.close()
@@ -241,12 +238,7 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                             except OSError:
                                 pass
                         except Exception as exc:
-                            LOGGER.warning(
-                                "rejecting control client %s:%s: %s",
-                                address[0],
-                                address[1],
-                                exc,
-                            )
+                            LOGGER.warning("A client request from %s was rejected: %s", address[0], exc)
                             if pending is not None:
                                 try:
                                     pending.conn.close()
@@ -281,3 +273,125 @@ def serve(config_path: Path, config: ServerConfig) -> int:
         raise capture.fatal_error
 
     return 0
+
+
+def _bind_server_socket(sock: socket.socket, host: str, port: int) -> None:
+    try:
+        sock.bind((host, port))
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            raise NetworkBindError(_format_port_in_use_message(host, port)) from exc
+        raise
+
+
+def _ensure_port_available(host: str, port: int) -> None:
+    owner = _find_port_owner(host, port)
+    if owner is not None:
+        raise NetworkBindError(_format_port_in_use_message(host, port, owner))
+
+
+def _format_port_in_use_message(
+    host: str,
+    port: int,
+    owner: PortOwner | None = None,
+) -> str:
+    if owner is None:
+        return (
+            f"Port {port} is already in use on {host}. "
+            "Please either kill the process using it or select a different port."
+        )
+    return (
+        f"Port {port} is bound by {owner.name} (PID {owner.pid}) on {host}. "
+        "Please either kill the process or select a different port."
+    )
+
+
+def _find_port_owner(host: str, port: int) -> PortOwner | None:
+    listening_inodes = _find_listening_socket_inodes(host, port)
+    if not listening_inodes:
+        return None
+    return _find_process_for_socket_inode(listening_inodes)
+
+
+def _find_listening_socket_inodes(host: str, port: int) -> set[str]:
+    inodes: set[str] = set()
+    for path in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 10:
+                continue
+            local_address = fields[1]
+            state = fields[3]
+            inode = fields[9]
+            if state != "0A":
+                continue
+            address_hex, port_hex = local_address.rsplit(":", 1)
+            try:
+                local_port = int(port_hex, 16)
+            except ValueError:
+                continue
+            if local_port != port:
+                continue
+            if _socket_address_conflicts(host, address_hex, path.name == "tcp6"):
+                inodes.add(inode)
+    return inodes
+
+
+def _socket_address_conflicts(host: str, address_hex: str, is_ipv6: bool) -> bool:
+    if host in {"", "0.0.0.0", "::"}:
+        return True
+    if is_ipv6:
+        if address_hex == "0" * 32:
+            return True
+        try:
+            host_ip = socket.getaddrinfo(host, None, socket.AF_INET6)[0][4][0]
+            return socket.inet_pton(socket.AF_INET6, host_ip) == bytes.fromhex(address_hex)
+        except (OSError, ValueError, IndexError):
+            return True
+    try:
+        packed = bytes.fromhex(address_hex)
+        local_ip = socket.inet_ntop(socket.AF_INET, packed[::-1])
+        return local_ip == "0.0.0.0" or local_ip == socket.gethostbyname(host)
+    except (OSError, ValueError):
+        return True
+
+
+def _find_process_for_socket_inode(inodes: set[str]) -> PortOwner | None:
+    socket_targets = {f"socket:[{inode}]" for inode in inodes}
+    for proc_entry in Path("/proc").iterdir():
+        if not proc_entry.name.isdigit():
+            continue
+        fd_dir = proc_entry / "fd"
+        try:
+            fd_entries = list(fd_dir.iterdir())
+        except OSError:
+            continue
+        for fd_entry in fd_entries:
+            try:
+                if os.readlink(fd_entry) not in socket_targets:
+                    continue
+            except OSError:
+                continue
+            pid = int(proc_entry.name)
+            return PortOwner(pid=pid, name=_read_process_name(proc_entry))
+    return None
+
+
+def _read_process_name(proc_entry: Path) -> str:
+    try:
+        cmdline = (proc_entry / "cmdline").read_bytes().replace(b"\x00", b" ").strip()
+        if cmdline:
+            return cmdline.decode("utf-8", errors="replace")
+    except OSError:
+        pass
+    try:
+        comm = (proc_entry / "comm").read_text(encoding="utf-8").strip()
+        if comm:
+            return comm
+    except OSError:
+        pass
+    return "unknown process"

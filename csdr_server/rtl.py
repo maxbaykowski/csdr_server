@@ -56,6 +56,7 @@ class CaptureManager:
         self.device_busy_logged = False
         self.graph = StreamGraph(config)
         self.clients: set[ClientSession] = set()
+        self.client_numbers_in_use: set[int] = set()
         self.clients_lock = threading.Lock()
         self.reconfigure_lock = threading.Lock()
 
@@ -73,6 +74,7 @@ class CaptureManager:
         with self.clients_lock:
             clients = list(self.clients)
             self.clients.clear()
+            self.client_numbers_in_use.clear()
         for client in clients:
             client.close("server shutdown")
         self._close_sdr()
@@ -163,14 +165,14 @@ class CaptureManager:
                 break
 
             if data_timeout:
-                LOGGER.info("Re-entering USB and device-index discovery after pyrtlsdr data timeout.")
+                LOGGER.info("RTL-SDR stopped producing data; checking whether the device is still connected")
             elif got_data:
                 LOGGER.warning(
-                    "pyrtlsdr stopped after streaming data; re-entering device discovery"
+                    "RTL-SDR stopped after streaming data; checking whether the device is still connected"
                 )
             else:
                 LOGGER.warning(
-                    "pyrtlsdr stopped before producing data; re-entering device discovery"
+                    "RTL-SDR stopped before producing data; checking whether the device is still connected"
                 )
             self.stop_event.wait(0.5)
 
@@ -247,13 +249,24 @@ class CaptureManager:
 
     def register_client(self, client: "ClientSession") -> None:
         with self.clients_lock:
+            if client.client_number <= 0:
+                client.client_number = self._allocate_client_number_locked()
             self.clients.add(client)
 
     def unregister_client(self, client: "ClientSession") -> None:
         with self.clients_lock:
             self.clients.discard(client)
+            if client.client_number > 0:
+                self.client_numbers_in_use.discard(client.client_number)
         if self.config.automatic_tuning and not self.stop_event.is_set():
             self._retune_for_active_clients()
+
+    def _allocate_client_number_locked(self) -> int:
+        client_number = 1
+        while client_number in self.client_numbers_in_use:
+            client_number += 1
+        self.client_numbers_in_use.add(client_number)
+        return client_number
 
     def _retune_for_active_clients(self) -> None:
         with self.reconfigure_lock:
@@ -373,7 +386,8 @@ class CaptureManager:
             self.config = next_config
             for session in client_requests:
                 self._refresh_rds_subscription_locked(session)
-            LOGGER.info(
+            LOGGER.info("Configuration reload applied")
+            LOGGER.debug(
                 "config reload applied: center_frequency=%s rtl_sample_rate=%s automatic_gain_control=%s rtl_gain=%s ppm_correction=%s bias_tee=%s dc_block=%s transition_bandwidth=%s nfm_deemphasis_tau=%s wfm_region=%s",
                 next_config.center_frequency,
                 next_config.rtl_sample_rate,
@@ -476,7 +490,7 @@ class CaptureManager:
                 session.switch_power_monitor(power_monitor)
                 session.switch_source_stream(source_stream)
                 self._refresh_rds_subscription_locked(session)
-                LOGGER.info(
+                LOGGER.debug(
                     "reconfigured client %s:%s to frequency=%s modulation=%s audio_codec=%s opus_bitrate=%s",
                     session.address[0],
                     session.address[1],
@@ -534,7 +548,7 @@ class CaptureManager:
                         rebuild_audio_modulations=set(),
                     )
                     self.config = next_config
-                    LOGGER.info(
+                    LOGGER.debug(
                         "automatic tuning retuned center_frequency=%s after client %s:%s requested frequency=%s modulation=%s",
                         desired_center,
                         session.address[0],
@@ -555,7 +569,7 @@ class CaptureManager:
                 session.audio_codec = old_audio_codec
                 session.opus_bitrate = old_opus_bitrate
                 raise
-            LOGGER.info(
+            LOGGER.debug(
                 "reconfigured client %s:%s to frequency=%s modulation=%s audio_codec=%s opus_bitrate=%s",
                 session.address[0],
                 session.address[1],
@@ -659,7 +673,7 @@ class CaptureManager:
     def _open_sdr(self, device_index: int) -> BaseRtlSdr:
         assert BaseRtlSdr is not None
         assert rtlsdr_lib is not None
-        LOGGER.info("starting pyrtlsdr capture on device index %s", device_index)
+        LOGGER.info("Starting RTL-SDR capture on device index %s", device_index)
         try:
             sdr = BaseRtlSdr(device_index=device_index, dithering_enabled=False)
         except LibUSBError as exc:

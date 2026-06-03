@@ -11,6 +11,10 @@ class RequestValidationError(Exception):
         self.message = message
 
 
+class NetworkBindError(Exception):
+    pass
+
+
 class DeviceResolutionRetryableError(Exception):
     pass
 

@@ -47,20 +47,48 @@ class ServerConfig:
         rtl_settings = _get_config_section(data, "rtl")
         server_settings = _get_config_section(data, "server")
         audio_settings = _get_config_section(data, "audio")
+        audio_section_present = "audio" in data and data["audio"] is not None
+        explicit_demodulators = {
+            name
+            for name in ("am", "lsb", "usb", "nfm", "wfm")
+            if name in audio_settings
+        }
         am_settings = _get_config_section(audio_settings, "am")
         lsb_settings = _get_config_section(audio_settings, "lsb")
         usb_settings = _get_config_section(audio_settings, "usb")
         nfm_settings = _get_config_section(audio_settings, "nfm")
         wfm_settings = _get_config_section(audio_settings, "wfm")
+        if audio_section_present and "audio_support" not in audio_settings:
+            raise ValueError("audio.audio_support is required when the audio section is defined")
         audio_support = _parse_bool(
             audio_settings.get("audio_support", True),
             "audio.audio_support",
         )
-        am_enabled = _parse_bool(am_settings.get("enabled", True), "audio.am.enabled")
-        lsb_enabled = _parse_bool(lsb_settings.get("enabled", True), "audio.lsb.enabled")
-        usb_enabled = _parse_bool(usb_settings.get("enabled", True), "audio.usb.enabled")
-        nfm_enabled = _parse_bool(nfm_settings.get("enabled", True), "audio.nfm.enabled")
-        wfm_enabled = _parse_bool(wfm_settings.get("enabled", True), "audio.wfm.enabled")
+        am_enabled = _parse_demodulator_enabled(
+            "am",
+            am_settings,
+            explicit_demodulators,
+        )
+        lsb_enabled = _parse_demodulator_enabled(
+            "lsb",
+            lsb_settings,
+            explicit_demodulators,
+        )
+        usb_enabled = _parse_demodulator_enabled(
+            "usb",
+            usb_settings,
+            explicit_demodulators,
+        )
+        nfm_enabled = _parse_demodulator_enabled(
+            "nfm",
+            nfm_settings,
+            explicit_demodulators,
+        )
+        wfm_enabled = _parse_demodulator_enabled(
+            "wfm",
+            wfm_settings,
+            explicit_demodulators,
+        )
         nfm_lowpass_frequency = (
             _optional_int(
                 _config_value(
@@ -264,6 +292,20 @@ def _parse_bool(value: Any, name: str) -> bool:
     if isinstance(value, bool):
         return value
     raise ValueError(f"{name} must be true or false")
+
+
+def _parse_demodulator_enabled(
+    name: str,
+    settings: dict[str, Any],
+    explicit_demodulators: set[str],
+) -> bool:
+    if not explicit_demodulators:
+        return _parse_bool(settings.get("enabled", True), f"audio.{name}.enabled")
+    if name not in explicit_demodulators:
+        return False
+    if "enabled" not in settings:
+        raise ValueError(f"audio.{name}.enabled is required when audio.{name} is defined")
+    return _parse_bool(settings.get("enabled", True), f"audio.{name}.enabled")
 
 
 def _normalize_wfm_region(value: Any) -> str:

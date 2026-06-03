@@ -204,6 +204,13 @@ Start the server:
 csdr_server --config config.json5
 ```
 
+Normal server logging focuses on client activity and RTL-SDR hardware status.
+For detailed DSP graph and subprocess logging, start the server with `--debug`:
+
+```bash
+csdr_server --config config.json5 --debug
+```
+
 Connect a client:
 
 ```bash
@@ -258,8 +265,16 @@ The config is grouped into three sections:
   - hardware device selection and radio settings
 - `audio`
   - audio-mode-specific demodulator settings
+  - optional; if omitted, audio mode is enabled and all demodulators use defaults
 - `server`
   - listener and buffering behavior
+
+The `audio` section can be kept compact. If `audio` is present, it must include
+`audio_support`. If no individual demodulator subsections are present, all
+demodulators are enabled with default settings. If one or more demodulator
+subsections are present, omitted demodulators are disabled. Any demodulator
+subsection that is present must include `enabled`; additional NFM and WFM
+settings are optional and default to the values shown in `config.example.json5`.
 
 ### Important settings
 
@@ -295,26 +310,31 @@ The config is grouped into three sections:
 
 - `audio_support`
   - enables or disables audio mode entirely
+  - required only when the `audio` section is present
 
 ##### AM
 
 - `enabled`
   - enables or disables AM support
+  - required only when the `audio.am` section is present
 
 ##### LSB
 
 - `enabled`
   - enables or disables LSB support
+  - required only when the `audio.lsb` section is present
 
 ##### USB
 
 - `enabled`
   - enables or disables USB support
+  - required only when the `audio.usb` section is present
 
 ##### NFM
 
 - `enabled`
   - enables or disables NFM support
+  - required only when the `audio.nfm` section is present
 - `deemphasis_tau`
   - NFM deemphasis time constant in microseconds, or `null` to disable NFM deemphasis
 - `lowpass_frequency`
@@ -326,6 +346,7 @@ The config is grouped into three sections:
 
 - `enabled`
   - enables or disables WFM support
+  - required only when the `audio.wfm` section is present
 - `stereo_support`
   - enables or disables WFM stereo support
 - `rds_support`
