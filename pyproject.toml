@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "csdr-server"
-version = "0.5.0"
+version = "1.0.0"
 description = "Minimal RTL-SDR network server in Python using pyrtlsdr and csdr"
 readme = "README.md"
 license = {file = "LICENSE"}
