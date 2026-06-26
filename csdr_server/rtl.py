@@ -261,6 +261,10 @@ class CaptureManager:
         if self.config.automatic_tuning and not self.stop_event.is_set():
             self._retune_for_active_clients()
 
+    def active_client_count(self) -> int:
+        with self.clients_lock:
+            return sum(1 for client in self.clients if not client.closed.is_set())
+
     def _allocate_client_number_locked(self) -> int:
         client_number = 1
         while client_number in self.client_numbers_in_use:
@@ -299,7 +303,7 @@ class CaptureManager:
                 len(sessions),
             )
 
-    def reload_config(self, path: Path) -> bool:
+    def reload_config(self, path: Path) -> ServerConfig:
         with self.reconfigure_lock:
             loaded_config = load_config(path)
             current_config = self.config
@@ -316,10 +320,15 @@ class CaptureManager:
                 "nfm_lowpass_frequency",
                 "nfm_lowpass_curve",
             }
+            network_live_fields = {
+                "listen_host",
+                "listen_port",
+            }
             ignored_fields = [
                 field_name
                 for field_name in current_config.__dataclass_fields__
                 if field_name not in reloadable_fields
+                and field_name not in network_live_fields
                 and getattr(loaded_config, field_name) != getattr(current_config, field_name)
             ]
             if ignored_fields:
@@ -400,7 +409,7 @@ class CaptureManager:
                 next_config.nfm_deemphasis_tau,
                 next_config.wfm_region,
             )
-            return True
+            return loaded_config
 
     def _snapshot_client_requests(
         self,

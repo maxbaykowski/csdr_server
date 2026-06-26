@@ -34,6 +34,16 @@ class PortOwner:
     name: str
 
 
+@dataclass(frozen=True)
+class ListenerEndpoint:
+    host: str
+    port: int
+
+    @property
+    def control_port(self) -> int:
+        return self.port + 1
+
+
 def serve(config_path: Path, config: ServerConfig) -> int:
     capture = CaptureManager(config)
 
@@ -41,6 +51,9 @@ def serve(config_path: Path, config: ServerConfig) -> int:
     reload_event = threading.Event()
     pending_streams: dict[str, PendingStreamConnection] = {}
     pending_stream_timeout_seconds = 30.0
+    active_endpoint = ListenerEndpoint(config.listen_host, config.listen_port)
+    pending_endpoint: ListenerEndpoint | None = None
+    pending_endpoint_attempted = False
 
     def _handle_signal(signum: int, _frame: Any) -> None:
         LOGGER.info("Shutdown signal received; stopping server")
@@ -53,11 +66,6 @@ def serve(config_path: Path, config: ServerConfig) -> int:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGHUP, _handle_reload)
-    stream_port = config.listen_port
-    control_port = config.listen_port + 1
-    _ensure_port_available(config.listen_host, stream_port)
-    _ensure_port_available(config.listen_host, control_port)
-
     def _cleanup_expired_pending_streams() -> None:
         now = time.time()
         expired_tokens = [
@@ -77,19 +85,14 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                 pending.address[1],
             )
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as stream_server, socket.socket(socket.AF_INET, socket.SOCK_STREAM) as control_server:
-        stream_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        control_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        _bind_server_socket(stream_server, config.listen_host, stream_port)
-        _bind_server_socket(control_server, config.listen_host, control_port)
-        stream_server.listen()
-        control_server.listen()
+    stream_server, control_server = _create_listener_pair(active_endpoint)
+    try:
         capture.start()
         LOGGER.info(
             "csdr_server is listening on %s:%s (control port %s)",
-            config.listen_host,
-            stream_port,
-            control_port,
+            active_endpoint.host,
+            active_endpoint.port,
+            active_endpoint.control_port,
         )
 
         try:
@@ -98,9 +101,58 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                 if reload_event.is_set():
                     reload_event.clear()
                     try:
-                        capture.reload_config(config_path)
+                        loaded_config = capture.reload_config(config_path)
+                        loaded_endpoint = ListenerEndpoint(
+                            loaded_config.listen_host,
+                            loaded_config.listen_port,
+                        )
+                        if loaded_endpoint != active_endpoint:
+                            pending_endpoint = loaded_endpoint
+                            pending_endpoint_attempted = False
+                            LOGGER.info(
+                                "listener change queued for %s:%s (control port %s); it will be applied when all clients disconnect",
+                                pending_endpoint.host,
+                                pending_endpoint.port,
+                                pending_endpoint.control_port,
+                            )
+                        else:
+                            pending_endpoint = None
+                            pending_endpoint_attempted = False
                     except Exception:
                         LOGGER.exception("config reload failed")
+                if (
+                    pending_endpoint is not None
+                    and not pending_endpoint_attempted
+                    and capture.active_client_count() == 0
+                ):
+                    for pending in pending_streams.values():
+                        try:
+                            pending.conn.close()
+                        except OSError:
+                            pass
+                    pending_streams.clear()
+                    pending_endpoint_attempted = True
+                    try:
+                        (
+                            stream_server,
+                            control_server,
+                            active_endpoint,
+                        ) = _try_apply_listener_endpoint(
+                            stream_server,
+                            control_server,
+                            active_endpoint,
+                            pending_endpoint,
+                        )
+                    except Exception:
+                        LOGGER.exception(
+                            "failed to apply queued listener change; continuing on %s:%s",
+                            active_endpoint.host,
+                            active_endpoint.port,
+                        )
+                    else:
+                        if active_endpoint == pending_endpoint:
+                            pending_endpoint = None
+                            pending_endpoint_attempted = False
                 ready_sockets, _, _ = select.select([stream_server, control_server], [], [], 1.0)
                 for ready_socket in ready_sockets:
                     if ready_socket is stream_server:
@@ -268,11 +320,111 @@ def serve(config_path: Path, config: ServerConfig) -> int:
                 except OSError:
                     pass
             capture.stop()
+            _close_server_socket(stream_server)
+            _close_server_socket(control_server)
+    finally:
+        _close_server_socket(stream_server)
+        _close_server_socket(control_server)
 
     if capture.fatal_error is not None:
         raise capture.fatal_error
 
     return 0
+
+
+def _create_listener_pair(endpoint: ListenerEndpoint) -> tuple[socket.socket, socket.socket]:
+    _ensure_port_available(endpoint.host, endpoint.port)
+    _ensure_port_available(endpoint.host, endpoint.control_port)
+    stream_server: socket.socket | None = None
+    control_server: socket.socket | None = None
+    try:
+        stream_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        control_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        stream_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        control_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _bind_server_socket(stream_server, endpoint.host, endpoint.port)
+        _bind_server_socket(control_server, endpoint.host, endpoint.control_port)
+        stream_server.listen()
+        control_server.listen()
+        return stream_server, control_server
+    except Exception:
+        if stream_server is not None:
+            _close_server_socket(stream_server)
+        if control_server is not None:
+            _close_server_socket(control_server)
+        raise
+
+
+def _try_apply_listener_endpoint(
+    stream_server: socket.socket,
+    control_server: socket.socket,
+    active_endpoint: ListenerEndpoint,
+    target_endpoint: ListenerEndpoint,
+) -> tuple[socket.socket, socket.socket, ListenerEndpoint]:
+    if target_endpoint == active_endpoint:
+        return stream_server, control_server, active_endpoint
+
+    LOGGER.info(
+        "attempting listener change to %s:%s (control port %s)",
+        target_endpoint.host,
+        target_endpoint.port,
+        target_endpoint.control_port,
+    )
+    active_ports = {active_endpoint.port, active_endpoint.control_port}
+    target_ports = {target_endpoint.port, target_endpoint.control_port}
+    must_close_first = bool(active_ports & target_ports)
+
+    if not must_close_first:
+        try:
+            next_stream_server, next_control_server = _create_listener_pair(target_endpoint)
+        except Exception as exc:
+            LOGGER.error("%s", exc)
+            LOGGER.warning(
+                "continuing on existing listener %s:%s (control port %s)",
+                active_endpoint.host,
+                active_endpoint.port,
+                active_endpoint.control_port,
+            )
+            return stream_server, control_server, active_endpoint
+        _close_server_socket(stream_server)
+        _close_server_socket(control_server)
+        LOGGER.info(
+            "listener changed to %s:%s (control port %s)",
+            target_endpoint.host,
+            target_endpoint.port,
+            target_endpoint.control_port,
+        )
+        return next_stream_server, next_control_server, target_endpoint
+
+    _close_server_socket(stream_server)
+    _close_server_socket(control_server)
+    try:
+        next_stream_server, next_control_server = _create_listener_pair(target_endpoint)
+    except Exception as exc:
+        LOGGER.error("%s", exc)
+        LOGGER.warning(
+            "listener change failed; restoring previous listener %s:%s (control port %s)",
+            active_endpoint.host,
+            active_endpoint.port,
+            active_endpoint.control_port,
+        )
+        restored_stream_server, restored_control_server = _create_listener_pair(active_endpoint)
+        return restored_stream_server, restored_control_server, active_endpoint
+
+    LOGGER.info(
+        "listener changed to %s:%s (control port %s)",
+        target_endpoint.host,
+        target_endpoint.port,
+        target_endpoint.control_port,
+    )
+    return next_stream_server, next_control_server, target_endpoint
+
+
+def _close_server_socket(sock: socket.socket) -> None:
+    try:
+        sock.close()
+    except OSError:
+        pass
 
 
 def _bind_server_socket(sock: socket.socket, host: str, port: int) -> None:
