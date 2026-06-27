@@ -44,6 +44,11 @@ except Exception as exc:
     LibUSBError = IOError  # type: ignore[assignment]
     PYRTLSDR_IMPORT_ERROR = exc
 
+
+class _RestartCapture(Exception):
+    pass
+
+
 class CaptureManager:
     def __init__(self, config: ServerConfig) -> None:
         self.config = config
@@ -59,6 +64,12 @@ class CaptureManager:
         self.client_numbers_in_use: set[int] = set()
         self.clients_lock = threading.Lock()
         self.reconfigure_lock = threading.Lock()
+        self.pending_device_config: ServerConfig | None = None
+        self.pending_device_lock = threading.Lock()
+        self.replacement_queue: queue.Queue[
+            tuple[ServerConfig, int, BaseRtlSdr, bytes] | Exception
+        ] = queue.Queue(maxsize=1)
+        self.hotswap_thread: threading.Thread | None = None
 
     def start(self) -> None:
         self.supervisor_thread = threading.Thread(
@@ -83,62 +94,70 @@ class CaptureManager:
 
     def _supervise_capture(self) -> None:
         while not self.stop_event.is_set():
-            try:
-                device_index = self._resolve_device()
-            except DeviceResolutionRetryableError as exc:
-                if not self.device_wait_logged:
-                    LOGGER.warning("%s", exc)
-                    self.device_wait_logged = True
-                self.stop_event.wait(0.5)
-                continue
-            except DeviceResolutionFatalError as exc:
-                LOGGER.error("%s", exc)
-                self.fatal_error = exc
-                self.stop_event.set()
-                break
-            except DeviceAccessFatalError as exc:
-                LOGGER.error("%s", exc)
-                self.fatal_error = exc
-                self.stop_event.set()
-                break
-
-            if self.device_wait_logged:
-                LOGGER.info("Configured device is now available.")
-                self.device_wait_logged = False
-            if self.device_busy_logged:
-                LOGGER.info("Configured device is no longer busy.")
-                self.device_busy_logged = False
-
-            try:
-                sdr = self._open_sdr(device_index)
-            except DeviceBusyRetryableError as exc:
-                if not self.device_busy_logged:
-                    LOGGER.warning("%s", exc)
-                    self.device_busy_logged = True
-                self.stop_event.wait(0.5)
-                continue
-            except Exception:
-                LOGGER.exception("failed to start pyrtlsdr capture")
-                if not self.stop_event.wait(0.5):
+            config = self._capture_config()
+            with self.sdr_lock:
+                sdr = self.sdr
+            if sdr is None:
+                try:
+                    device_index = self._resolve_device(config)
+                except DeviceResolutionRetryableError as exc:
+                    if not self.device_wait_logged:
+                        LOGGER.warning("%s", exc)
+                        self.device_wait_logged = True
+                    self.stop_event.wait(0.5)
                     continue
-                break
+                except DeviceResolutionFatalError as exc:
+                    LOGGER.error("%s", exc)
+                    self.fatal_error = exc
+                    self.stop_event.set()
+                    break
+                except DeviceAccessFatalError as exc:
+                    LOGGER.error("%s", exc)
+                    self.fatal_error = exc
+                    self.stop_event.set()
+                    break
+
+                if self.device_wait_logged:
+                    LOGGER.info("Configured device is now available.")
+                    self.device_wait_logged = False
+                if self.device_busy_logged:
+                    LOGGER.info("Configured device is no longer busy.")
+                    self.device_busy_logged = False
+
+                try:
+                    sdr = self._open_sdr(config, device_index, activate=True)
+                except DeviceBusyRetryableError as exc:
+                    if not self.device_busy_logged:
+                        LOGGER.warning("%s", exc)
+                        self.device_busy_logged = True
+                    self.stop_event.wait(0.5)
+                    continue
+                except Exception:
+                    LOGGER.exception("failed to start pyrtlsdr capture")
+                    if not self.stop_event.wait(0.5):
+                        continue
+                    break
 
             got_data = False
             data_timeout = False
+            switched_capture = False
             capture_queue: queue.Queue[bytes | Exception | None] = queue.Queue(maxsize=4)
             reader_stop = threading.Event()
             reader_thread = threading.Thread(
                 target=self._sdr_reader_loop,
-                args=(sdr, capture_queue, reader_stop),
+                args=(sdr, config, capture_queue, reader_stop),
                 name="rtl-reader",
                 daemon=True,
             )
             reader_thread.start()
             try:
                 while not self.stop_event.is_set():
+                    self._start_hotswap_worker_if_needed()
+                    self._raise_if_replacement_ready(reader_stop, reader_thread, sdr)
                     try:
                         item = capture_queue.get(timeout=self.config.rtl_read_timeout_seconds)
                     except queue.Empty:
+                        self._raise_if_replacement_ready(reader_stop, reader_thread, sdr)
                         data_timeout = True
                         LOGGER.warning(
                             "pyrtlsdr produced no data for %.3f seconds; restarting from device discovery",
@@ -152,17 +171,23 @@ class CaptureManager:
                     chunk = item
                     got_data = True
                     self.graph.feed_raw(chunk)
+                    self._raise_if_replacement_ready(reader_stop, reader_thread, sdr)
+            except _RestartCapture:
+                got_data = True
+                switched_capture = True
             except (LibUSBError, IOError, OSError):
                 LOGGER.exception("pyrtlsdr reader loop failed")
             except Exception:
                 LOGGER.exception("pyrtlsdr reader loop failed")
             finally:
                 reader_stop.set()
-                self._close_sdr()
+                self._close_sdr_if_current(sdr)
                 reader_thread.join(timeout=2.0)
 
             if self.stop_event.is_set():
                 break
+            if switched_capture:
+                continue
 
             if data_timeout:
                 LOGGER.info("RTL-SDR stopped producing data; checking whether the device is still connected")
@@ -175,6 +200,207 @@ class CaptureManager:
                     "RTL-SDR stopped before producing data; checking whether the device is still connected"
                 )
             self.stop_event.wait(0.5)
+
+    def _capture_config(self) -> ServerConfig:
+        with self.pending_device_lock:
+            return self.pending_device_config or self.config
+
+    def _device_identity_changed(
+        self,
+        current_config: ServerConfig,
+        loaded_config: ServerConfig,
+    ) -> bool:
+        return (
+            current_config.rtl_serial != loaded_config.rtl_serial
+            or (
+                not current_config.rtl_serial
+                and not loaded_config.rtl_serial
+                and current_config.rtl_device_index != loaded_config.rtl_device_index
+            )
+        )
+
+    def _queue_device_hotswap(self, loaded_config: ServerConfig) -> None:
+        with self.pending_device_lock:
+            self.pending_device_config = loaded_config
+        LOGGER.info(
+            "RTL-SDR device change queued; capture will switch to %s after the replacement starts producing data",
+            (
+                f"serial {loaded_config.rtl_serial}"
+                if loaded_config.rtl_serial
+                else f"device index {loaded_config.rtl_device_index}"
+            ),
+        )
+        self._start_hotswap_worker_if_needed()
+
+    def _start_hotswap_worker_if_needed(self) -> None:
+        with self.pending_device_lock:
+            if self.pending_device_config is None:
+                return
+            if self.hotswap_thread is not None and self.hotswap_thread.is_alive():
+                return
+            self.hotswap_thread = threading.Thread(
+                target=self._hotswap_worker,
+                name="rtl-hotswap",
+                daemon=True,
+            )
+            self.hotswap_thread.start()
+
+    def _hotswap_worker(self) -> None:
+        wait_logged = False
+        busy_logged = False
+        while not self.stop_event.is_set():
+            with self.pending_device_lock:
+                config = self.pending_device_config
+            if config is None:
+                return
+            try:
+                device_index = self._resolve_device(config, validate_index_exists=False)
+                sdr = self._open_sdr(config, device_index, activate=False)
+                try:
+                    chunk = self._read_probe_chunk(sdr, config)
+                except Exception:
+                    self._close_specific_sdr(sdr)
+                    raise
+            except DeviceResolutionRetryableError as exc:
+                if not wait_logged:
+                    LOGGER.warning("%s", exc)
+                    wait_logged = True
+                self.stop_event.wait(0.5)
+                continue
+            except DeviceBusyRetryableError as exc:
+                if not busy_logged:
+                    LOGGER.warning("%s", exc)
+                    busy_logged = True
+                self.stop_event.wait(0.5)
+                continue
+            except (DeviceResolutionFatalError, DeviceAccessFatalError) as exc:
+                LOGGER.error("RTL-SDR hot-swap refused: %s", exc)
+                with self.pending_device_lock:
+                    if self.pending_device_config is config:
+                        self.pending_device_config = None
+                return
+            except Exception:
+                LOGGER.exception("RTL-SDR hot-swap failed while opening replacement device")
+                self.stop_event.wait(0.5)
+                continue
+            with self.pending_device_lock:
+                if self.pending_device_config is not config:
+                    self._close_specific_sdr(sdr)
+                    return
+            self._put_replacement(config, device_index, sdr, chunk)
+            return
+
+    def _validate_device_hotswap_request(self, config: ServerConfig) -> None:
+        if not config.rtl_serial:
+            return
+        try:
+            usb_devices = self._probe_usb_rtl_devices()
+        except OSError as exc:
+            LOGGER.warning(
+                "USB probe failed during RTL-SDR hot-swap validation (%s); falling back to librtlsdr duplicate checks",
+                exc,
+            )
+        else:
+            usb_matches = [device for device in usb_devices if device.serial == config.rtl_serial]
+            if len(usb_matches) > 1:
+                raise DeviceResolutionFatalError(
+                    f"Multiple USB RTL-SDR devices were found with serial {config.rtl_serial}. "
+                    "Set rtl_serial to null to use rtl_device_index instead, or assign unique serial numbers "
+                    "to each device using rtl_eeprom."
+                )
+        devices = self._probe_rtl_devices()
+        matches = [device for device in devices if device.serial == config.rtl_serial]
+        if len(matches) > 1:
+            raise DeviceResolutionFatalError(
+                f"Multiple RTL-SDR devices were found by pyrtlsdr with serial {config.rtl_serial}. "
+                "Set rtl_serial to null to use rtl_device_index instead, or assign unique serial numbers "
+                "to each device using rtl_eeprom."
+            )
+
+    def _read_probe_chunk(self, sdr: BaseRtlSdr, config: ServerConfig) -> bytes:
+        output_queue: queue.Queue[bytes | Exception] = queue.Queue(maxsize=1)
+
+        def _read_once() -> None:
+            try:
+                output_queue.put_nowait(sdr.read_bytes(config.read_chunk_size))
+            except Exception as exc:
+                try:
+                    output_queue.put_nowait(exc)
+                except queue.Full:
+                    pass
+
+        reader = threading.Thread(
+            target=_read_once,
+            name="rtl-hotswap-probe",
+            daemon=True,
+        )
+        reader.start()
+        try:
+            item = output_queue.get(timeout=config.rtl_read_timeout_seconds)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        except queue.Empty as exc:
+            raise DeviceResolutionRetryableError(
+                "Replacement RTL-SDR produced no data yet. Waiting for it to start streaming."
+            ) from exc
+        finally:
+            reader.join(timeout=2.0)
+
+    def _put_replacement(
+        self,
+        config: ServerConfig,
+        device_index: int,
+        sdr: BaseRtlSdr,
+        chunk: bytes,
+    ) -> None:
+        replacement = (config, device_index, sdr, chunk)
+        try:
+            self.replacement_queue.put_nowait(replacement)
+        except queue.Full:
+            old = self.replacement_queue.get_nowait()
+            if not isinstance(old, Exception):
+                self._close_specific_sdr(old[2])
+            self.replacement_queue.put_nowait(replacement)
+
+    def _raise_if_replacement_ready(
+        self,
+        reader_stop: threading.Event,
+        reader_thread: threading.Thread,
+        old_sdr: BaseRtlSdr,
+    ) -> None:
+        try:
+            replacement = self.replacement_queue.get_nowait()
+        except queue.Empty:
+            return
+        if isinstance(replacement, Exception):
+            raise replacement
+        config, device_index, new_sdr, first_chunk = replacement
+        with self.pending_device_lock:
+            if self.pending_device_config is not config:
+                self._close_specific_sdr(new_sdr)
+                return
+        reader_stop.set()
+        with self.sdr_lock:
+            if self.sdr is old_sdr:
+                self.sdr = new_sdr
+        self._close_specific_sdr(old_sdr)
+        reader_thread.join(timeout=2.0)
+        with self.reconfigure_lock:
+            self.config = config
+            self.graph.apply_runtime_config(
+                new_config=config,
+                sessions=self._snapshot_client_requests(),
+                rebuild_shift_path=True,
+                rebuild_decimators=True,
+                rebuild_audio_modulations=set(),
+            )
+        with self.pending_device_lock:
+            if self.pending_device_config is config:
+                self.pending_device_config = None
+        self.graph.feed_raw(first_chunk)
+        LOGGER.info("RTL-SDR hot-swap complete on device index %s", device_index)
+        raise _RestartCapture
 
     def get_output_stream(
         self,
@@ -307,6 +533,13 @@ class CaptureManager:
         with self.reconfigure_lock:
             loaded_config = load_config(path)
             current_config = self.config
+            device_changed = self._device_identity_changed(current_config, loaded_config)
+            if device_changed:
+                try:
+                    self._validate_device_hotswap_request(loaded_config)
+                except (DeviceResolutionFatalError, DeviceAccessFatalError) as exc:
+                    LOGGER.error("RTL-SDR hot-swap refused: %s", exc)
+                    return loaded_config
             reloadable_fields = {
                 "automatic_gain_control",
                 "rtl_gain",
@@ -324,11 +557,16 @@ class CaptureManager:
                 "listen_host",
                 "listen_port",
             }
+            device_live_fields = {
+                "rtl_device_index",
+                "rtl_serial",
+            }
             ignored_fields = [
                 field_name
                 for field_name in current_config.__dataclass_fields__
                 if field_name not in reloadable_fields
                 and field_name not in network_live_fields
+                and field_name not in device_live_fields
                 and getattr(loaded_config, field_name) != getattr(current_config, field_name)
             ]
             if ignored_fields:
@@ -347,6 +585,13 @@ class CaptureManager:
                 next_config = replace(
                     next_config,
                     center_frequency=current_config.center_frequency,
+                )
+
+            if device_changed:
+                next_config = replace(
+                    next_config,
+                    rtl_device_index=loaded_config.rtl_device_index,
+                    rtl_serial=loaded_config.rtl_serial,
                 )
 
             center_or_rate_changed = (
@@ -395,6 +640,20 @@ class CaptureManager:
             self.config = next_config
             for session in client_requests:
                 self._refresh_rds_subscription_locked(session)
+            if device_changed:
+                try:
+                    self._queue_device_hotswap(next_config)
+                except (DeviceResolutionFatalError, DeviceAccessFatalError) as exc:
+                    LOGGER.error("RTL-SDR hot-swap refused: %s", exc)
+                    self.config = current_config
+                    self.graph.apply_runtime_config(
+                        new_config=current_config,
+                        sessions=client_requests,
+                        rebuild_shift_path=center_or_rate_changed or dc_block_changed,
+                        rebuild_decimators=center_or_rate_changed or transition_changed or dc_block_changed,
+                        rebuild_audio_modulations=rebuild_audio_modulations,
+                    )
+                    return loaded_config
             LOGGER.info("Configuration reload applied")
             LOGGER.debug(
                 "config reload applied: center_frequency=%s rtl_sample_rate=%s automatic_gain_control=%s rtl_gain=%s ppm_correction=%s bias_tee=%s dc_block=%s transition_bandwidth=%s nfm_deemphasis_tau=%s wfm_region=%s",
@@ -679,7 +938,13 @@ class CaptureManager:
                 if result < 0:
                     raise LibUSBError(result, "Could not reset buffer after sample-rate change")
 
-    def _open_sdr(self, device_index: int) -> BaseRtlSdr:
+    def _open_sdr(
+        self,
+        config: ServerConfig,
+        device_index: int,
+        *,
+        activate: bool,
+    ) -> BaseRtlSdr:
         assert BaseRtlSdr is not None
         assert rtlsdr_lib is not None
         LOGGER.info("Starting RTL-SDR capture on device index %s", device_index)
@@ -696,18 +961,19 @@ class CaptureManager:
                     f"Configured device index {device_index} is busy. Waiting for it to become available."
                 ) from exc
             raise
-        sdr.sample_rate = self.config.rtl_sample_rate
-        sdr.center_freq = self.config.center_frequency
-        if self.config.ppm_correction != 0:
-            sdr.freq_correction = self.config.ppm_correction
-        self._set_bias_tee(sdr, self.config.bias_tee)
-        sdr.gain = "auto" if self.config.automatic_gain_control else self.config.rtl_gain
+        sdr.sample_rate = config.rtl_sample_rate
+        sdr.center_freq = config.center_frequency
+        if config.ppm_correction != 0:
+            sdr.freq_correction = config.ppm_correction
+        self._set_bias_tee(sdr, config.bias_tee)
+        sdr.gain = "auto" if config.automatic_gain_control else config.rtl_gain
         result = rtlsdr_lib.rtlsdr_reset_buffer(sdr.dev_p)
         if result < 0:
             sdr.close()
             raise LibUSBError(result, "Could not reset buffer")
-        with self.sdr_lock:
-            self.sdr = sdr
+        if activate:
+            with self.sdr_lock:
+                self.sdr = sdr
         return sdr
 
     @staticmethod
@@ -727,6 +993,19 @@ class CaptureManager:
             sdr = self.sdr
             self.sdr = None
         if sdr is not None:
+            self._close_specific_sdr(sdr)
+
+    def _close_sdr_if_current(self, sdr: BaseRtlSdr) -> None:
+        should_close = False
+        with self.sdr_lock:
+            if self.sdr is sdr:
+                self.sdr = None
+                should_close = True
+        if should_close:
+            self._close_specific_sdr(sdr)
+
+    def _close_specific_sdr(self, sdr: BaseRtlSdr) -> None:
+        if sdr is not None:
             try:
                 sdr.close()
             except Exception:
@@ -735,13 +1014,13 @@ class CaptureManager:
     def _sdr_reader_loop(
         self,
         sdr: BaseRtlSdr,
+        config: ServerConfig,
         output_queue: queue.Queue[bytes | Exception | None],
         stop_event: threading.Event,
     ) -> None:
         try:
             while not self.stop_event.is_set() and not stop_event.is_set():
-                with self.sdr_lock:
-                    chunk = sdr.read_bytes(self.config.read_chunk_size)
+                chunk = sdr.read_bytes(config.read_chunk_size)
                 output_queue.put(chunk)
         except Exception as exc:
             try:
@@ -754,34 +1033,41 @@ class CaptureManager:
             except queue.Full:
                 pass
 
-    def _resolve_device(self) -> int:
-        if not self.config.rtl_serial:
+    def _resolve_device(
+        self,
+        config: ServerConfig,
+        *,
+        validate_index_exists: bool = True,
+    ) -> int:
+        if not config.rtl_serial:
+            if not validate_index_exists:
+                return config.rtl_device_index
             devices = self._probe_rtl_devices()
-            if not any(device.index == self.config.rtl_device_index for device in devices):
+            if not any(device.index == config.rtl_device_index for device in devices):
                 raise DeviceResolutionFatalError(
-                    f"Configured rtl_device_index {self.config.rtl_device_index} does not exist. "
+                    f"Configured rtl_device_index {config.rtl_device_index} does not exist. "
                     "Set rtl_serial to a valid device serial number, or choose an existing device index."
                 )
-            return self.config.rtl_device_index
+            return config.rtl_device_index
 
-        self._wait_for_unique_usb_serial(self.config.rtl_serial)
+        self._wait_for_unique_usb_serial(config.rtl_serial)
         devices = self._probe_rtl_devices()
-        matches = [device for device in devices if device.serial == self.config.rtl_serial]
+        matches = [device for device in devices if device.serial == config.rtl_serial]
         if not matches:
             raise DeviceResolutionRetryableError(
-                f"Configured serial {self.config.rtl_serial} is present on USB but was not yet visible to pyrtlsdr. "
+                f"Configured serial {config.rtl_serial} is present on USB but was not yet visible to pyrtlsdr. "
                 "Waiting for librtlsdr to detect that device."
             )
         if len(matches) > 1:
             raise DeviceResolutionFatalError(
-                f"Multiple RTL-SDR devices were found by pyrtlsdr with serial {self.config.rtl_serial}. "
+                f"Multiple RTL-SDR devices were found by pyrtlsdr with serial {config.rtl_serial}. "
                 "Set rtl_serial to null to use rtl_device_index instead, or assign unique serial numbers "
                 "to each device using rtl_eeprom."
             )
 
         LOGGER.info(
             "resolved serial %s to rtl_sdr device index %s",
-            self.config.rtl_serial,
+            config.rtl_serial,
             matches[0].index,
         )
         return matches[0].index
