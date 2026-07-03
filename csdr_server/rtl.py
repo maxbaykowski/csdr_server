@@ -37,6 +37,14 @@ from .graph import StreamGraph
 from .utils import _read_sysfs_text
 
 
+RTLSDR_READ_ASYNC_CALLBACK = ctypes.CFUNCTYPE(
+    None,
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_uint32,
+    ctypes.c_void_p,
+)
+
+
 class CompatLibUSBError(IOError):
     _errno_map = {
         -1: ("LIBUSB_ERROR_IO", "Input/output error"),
@@ -141,6 +149,17 @@ def _configure_librtlsdr_functions(library: ctypes.CDLL) -> None:
         "rtlsdr_set_dithering": (ctypes.c_int, [p_rtlsdr_dev, ctypes.c_int]),
         "rtlsdr_set_agc_mode": (ctypes.c_int, [p_rtlsdr_dev, ctypes.c_int]),
         "rtlsdr_set_bias_tee": (ctypes.c_int, [p_rtlsdr_dev, ctypes.c_int]),
+        "rtlsdr_read_async": (
+            ctypes.c_int,
+            [
+                p_rtlsdr_dev,
+                RTLSDR_READ_ASYNC_CALLBACK,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+            ],
+        ),
+        "rtlsdr_cancel_async": (ctypes.c_int, [p_rtlsdr_dev]),
     }
     for name, (restype, argtypes) in optional_signatures.items():
         function = getattr(library, name, None)
@@ -165,6 +184,14 @@ class CompatBaseRtlSdr:
         self.buffer = None
         self.buffer_size = 0
         self.num_bytes_read = ctypes.c_int32(0)
+        self.async_condition = threading.Condition()
+        self.async_buffer = bytearray()
+        self.async_error: Exception | None = None
+        self.async_closed = False
+        self.async_start_attempted = False
+        self.async_thread: threading.Thread | None = None
+        self.async_callback = None
+        self.async_max_buffer = 8 * 1024 * 1024
         result = rtlsdr_lib.rtlsdr_open(ctypes.byref(self.dev_p), int(device_index))
         if result < 0:
             raise CompatLibUSBError(result, f"Could not open SDR (device index = {device_index})")
@@ -186,8 +213,72 @@ class CompatBaseRtlSdr:
         if not self.device_opened:
             return
         assert rtlsdr_lib is not None
+        self.async_closed = True
+        cancel_async = getattr(rtlsdr_lib, "rtlsdr_cancel_async", None)
+        if cancel_async is not None and self.async_thread is not None:
+            try:
+                cancel_async(self.dev_p)
+            except Exception:
+                pass
+        with self.async_condition:
+            self.async_condition.notify_all()
+        if (
+            self.async_thread is not None
+            and self.async_thread.is_alive()
+            and self.async_thread is not threading.current_thread()
+        ):
+            self.async_thread.join(timeout=2.0)
         rtlsdr_lib.rtlsdr_close(self.dev_p)
         self.device_opened = False
+
+    def _start_async_streaming(self) -> None:
+        if self.async_start_attempted:
+            return
+        self.async_start_attempted = True
+        if not hasattr(rtlsdr_lib, "rtlsdr_read_async") or not hasattr(rtlsdr_lib, "rtlsdr_cancel_async"):
+            LOGGER.debug("librtlsdr async reading is unavailable; using synchronous reads")
+            return
+        self.async_callback = RTLSDR_READ_ASYNC_CALLBACK(self._async_read_callback)
+        self.async_thread = threading.Thread(
+            target=self._async_read_loop,
+            name="rtl-compat-async",
+            daemon=True,
+        )
+        self.async_thread.start()
+
+    def _async_read_loop(self) -> None:
+        assert rtlsdr_lib is not None
+        assert self.async_callback is not None
+        try:
+            result = rtlsdr_lib.rtlsdr_read_async(
+                self.dev_p,
+                self.async_callback,
+                None,
+                0,
+                0,
+            )
+            if result < 0 and not self.async_closed:
+                raise CompatLibUSBError(result, "RTL-SDR async read failed")
+        except Exception as exc:
+            with self.async_condition:
+                self.async_error = exc
+                self.async_condition.notify_all()
+        finally:
+            with self.async_condition:
+                self.async_closed = True
+                self.async_condition.notify_all()
+
+    def _async_read_callback(self, buffer, length: int, _context) -> None:
+        if self.async_closed:
+            return
+        chunk = ctypes.string_at(buffer, int(length))
+        with self.async_condition:
+            self.async_buffer.extend(chunk)
+            if len(self.async_buffer) > self.async_max_buffer:
+                self.async_error = IOError(
+                    "RTL-SDR async read buffer overflowed; capture could not keep up"
+                )
+            self.async_condition.notify_all()
 
     def _set_optional_int(self, name: str, value: int, message: str) -> None:
         function = getattr(rtlsdr_lib, name, None)
@@ -291,6 +382,10 @@ class CompatBaseRtlSdr:
             raise CompatLibUSBError(result, "Could not set bias tee")
 
     def read_bytes(self, num_bytes: int) -> bytes:
+        if self.async_thread is None:
+            self._start_async_streaming()
+        if self.async_thread is not None:
+            return self._read_async_bytes(num_bytes)
         assert rtlsdr_lib is not None
         num_bytes = int(num_bytes)
         if self.buffer is None or self.buffer_size != num_bytes:
@@ -310,6 +405,19 @@ class CompatBaseRtlSdr:
             self.close()
             raise IOError(f"Short read, requested {num_bytes} bytes, received {num_read.value}")
         return ctypes.string_at(self.buffer, num_bytes)
+
+    def _read_async_bytes(self, num_bytes: int) -> bytes:
+        num_bytes = int(num_bytes)
+        with self.async_condition:
+            while len(self.async_buffer) < num_bytes:
+                if self.async_error is not None:
+                    raise self.async_error
+                if self.async_closed:
+                    raise IOError("RTL-SDR async reader stopped")
+                self.async_condition.wait(timeout=0.25)
+            chunk = bytes(self.async_buffer[:num_bytes])
+            del self.async_buffer[:num_bytes]
+            return chunk
 
 
 try:
