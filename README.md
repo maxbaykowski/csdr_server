@@ -24,10 +24,16 @@ I thoroughly tested this program and made the design choices for it, but I was a
 
 To install this project you will need to make sure you have `pip` installed on your system. The project pulls in python dependencies automatically, but the server component has the following external dependencies:
 - My fork of [csdr](https://github.com/maxbaykowski/csdr)
+- `librtlsdr`
 - `libopus` (optional, for `opus` encoding/decoding)
 - [stereodemux](https://github.com/windytan/stereodemux) (optional, for server-side stereo FM)
 - [redsea](https://github.com/windytan/redsea) (optional, for server-side RDS decoding)
 Refer to each project's respective GitHub README for instructions on installing them. It's a bit of a tedious process, but it's not as hard as you might think.
+
+On most x86 Linux systems, pip will also install `pyrtlsdrlib`, which bundles
+`librtlsdr`. On Linux AArch64 systems, `pyrtlsdrlib` may not be available, so
+install your distro's RTL-SDR library package instead. Common package names are
+`rtl-sdr`, `librtlsdr0`, or `rtl-sdr-libs`, depending on the distro.
 
 ### Install using pip
 
@@ -412,5 +418,3 @@ frequency 118M; demod am; squelch 55
 ```
 
 Changes the frequency to `118 Mhz`, demodulation mode to AM (amplitude modulation), and the squelch level to `55`.
-
-

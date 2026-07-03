@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "csdr-server"
-version = "1.0.0"
+version = "1.0.1"
 description = "Minimal RTL-SDR network server in Python using pyrtlsdr and csdr"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -18,7 +18,7 @@ dependencies = [
   "sounddevice",
   "soxr",
   "pyrtlsdr; sys_platform == 'linux'",
-  "pyrtlsdrlib; sys_platform == 'linux'",
+  "pyrtlsdrlib; sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64'",
 ]
 keywords = ["rtl-sdr", "sdr", "csdr", "radio", "iq"]
 classifiers = [

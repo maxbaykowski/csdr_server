@@ -544,7 +544,10 @@ def _check_dependencies(config: ServerConfig) -> None:
     from .rtl import PYRTLSDR_IMPORT_ERROR
 
     if PYRTLSDR_IMPORT_ERROR is not None:
-        raise ImportError(f"pyrtlsdr compatibility layer could not load librtlsdr: {PYRTLSDR_IMPORT_ERROR}")
+        raise ImportError(
+            "could not load librtlsdr. Install your distribution's librtlsdr package "
+            f"or install pyrtlsdrlib on supported architectures: {PYRTLSDR_IMPORT_ERROR}"
+        )
     if shutil.which("csdr") is None:
         raise FileNotFoundError("required command(s) not found in PATH: csdr")
     if config.audio_support and config.wfm_enabled and config.enable_wfm_stereo and shutil.which("demux") is None:

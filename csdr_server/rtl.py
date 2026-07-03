@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 from ctypes import c_ubyte
+import importlib
 import queue
 import threading
 import time
@@ -34,15 +36,299 @@ from .errors import (
 from .graph import StreamGraph
 from .utils import _read_sysfs_text
 
+
+class CompatLibUSBError(IOError):
+    _errno_map = {
+        -1: ("LIBUSB_ERROR_IO", "Input/output error"),
+        -2: ("LIBUSB_ERROR_INVALID_PARAM", "Invalid parameter"),
+        -3: ("LIBUSB_ERROR_ACCESS", "Access denied (insufficient permissions)"),
+        -4: ("LIBUSB_ERROR_NO_DEVICE", "No such device (it may have been disconnected)"),
+        -5: ("LIBUSB_ERROR_NOT_FOUND", "Entity not found"),
+        -6: ("LIBUSB_ERROR_BUSY", "Resource busy"),
+        -7: ("LIBUSB_ERROR_TIMEOUT", "Operation timed out"),
+        -8: ("LIBUSB_ERROR_OVERFLOW", "Overflow"),
+        -9: ("LIBUSB_ERROR_PIPE", "Pipe error"),
+        -10: ("LIBUSB_ERROR_INTERRUPTED", "System call interrupted"),
+        -11: ("LIBUSB_ERROR_NO_MEM", "Insufficient memory"),
+        -12: ("LIBUSB_ERROR_NOT_SUPPORTED", "Operation not supported"),
+        -99: ("LIBUSB_ERROR_OTHER", "Other error"),
+    }
+
+    def __init__(self, errno: int, msg: str = "") -> None:
+        super().__init__(errno, msg)
+        self.errno = errno
+        self.msg = msg
+
+    def __str__(self) -> str:
+        mapped = self._errno_map.get(self.errno)
+        if mapped is None:
+            return f'Error code {self.errno}: "{self.msg}"'
+        error_id, error_message = mapped
+        return f'<{error_id} ({self.errno}): {error_message}> "{self.msg}"'
+
+
+def _load_system_librtlsdr() -> ctypes.CDLL:
+    candidates = [
+        ctypes.util.find_library("rtlsdr"),
+        ctypes.util.find_library("librtlsdr"),
+        "librtlsdr.so",
+        "librtlsdr.so.0",
+    ]
+    errors: list[str] = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            library = ctypes.CDLL(candidate)
+            _configure_librtlsdr_functions(library)
+            return library
+        except OSError as exc:
+            errors.append(f"{candidate}: {exc}")
+    detail = "; ".join(errors) if errors else "ctypes could not locate librtlsdr"
+    raise ImportError(
+        "could not load librtlsdr. Install your distribution's librtlsdr package "
+        f"or install pyrtlsdrlib on supported architectures. Details: {detail}"
+    )
+
+
+def _required_librtlsdr_symbol(library: ctypes.CDLL, name: str):
+    try:
+        return getattr(library, name)
+    except AttributeError as exc:
+        raise ImportError(
+            f"librtlsdr is missing required symbol {name}; install a complete librtlsdr package"
+        ) from exc
+
+
+def _configure_librtlsdr_functions(library: ctypes.CDLL) -> None:
+    p_rtlsdr_dev = ctypes.c_void_p
+    required_signatures = {
+        "rtlsdr_get_device_count": (ctypes.c_uint, []),
+        "rtlsdr_get_device_name": (ctypes.c_char_p, [ctypes.c_uint]),
+        "rtlsdr_get_device_usb_strings": (
+            ctypes.c_int,
+            [
+                ctypes.c_uint,
+                ctypes.POINTER(ctypes.c_ubyte),
+                ctypes.POINTER(ctypes.c_ubyte),
+                ctypes.POINTER(ctypes.c_ubyte),
+            ],
+        ),
+        "rtlsdr_open": (ctypes.c_int, [ctypes.POINTER(p_rtlsdr_dev), ctypes.c_uint]),
+        "rtlsdr_close": (ctypes.c_int, [p_rtlsdr_dev]),
+        "rtlsdr_set_center_freq": (ctypes.c_int, [p_rtlsdr_dev, ctypes.c_uint]),
+        "rtlsdr_set_freq_correction": (ctypes.c_int, [p_rtlsdr_dev, ctypes.c_int]),
+        "rtlsdr_set_tuner_gain": (ctypes.c_int, [p_rtlsdr_dev, ctypes.c_int]),
+        "rtlsdr_get_tuner_gains": (
+            ctypes.c_int,
+            [p_rtlsdr_dev, ctypes.POINTER(ctypes.c_int)],
+        ),
+        "rtlsdr_set_tuner_gain_mode": (ctypes.c_int, [p_rtlsdr_dev, ctypes.c_int]),
+        "rtlsdr_set_sample_rate": (ctypes.c_int, [p_rtlsdr_dev, ctypes.c_uint]),
+        "rtlsdr_reset_buffer": (ctypes.c_int, [p_rtlsdr_dev]),
+        "rtlsdr_read_sync": (
+            ctypes.c_int,
+            [p_rtlsdr_dev, ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int32)],
+        ),
+    }
+    for name, (restype, argtypes) in required_signatures.items():
+        function = _required_librtlsdr_symbol(library, name)
+        function.restype = restype
+        function.argtypes = argtypes
+
+    optional_signatures = {
+        "rtlsdr_set_testmode": (ctypes.c_int, [p_rtlsdr_dev, ctypes.c_int]),
+        "rtlsdr_set_dithering": (ctypes.c_int, [p_rtlsdr_dev, ctypes.c_int]),
+        "rtlsdr_set_agc_mode": (ctypes.c_int, [p_rtlsdr_dev, ctypes.c_int]),
+        "rtlsdr_set_bias_tee": (ctypes.c_int, [p_rtlsdr_dev, ctypes.c_int]),
+    }
+    for name, (restype, argtypes) in optional_signatures.items():
+        function = getattr(library, name, None)
+        if function is not None:
+            function.restype = restype
+            function.argtypes = argtypes
+
+
+class CompatBaseRtlSdr:
+    def __init__(
+        self,
+        device_index: int = 0,
+        test_mode_enabled: bool = False,
+        serial_number: str | None = None,
+        dithering_enabled: bool = True,
+    ) -> None:
+        if serial_number is not None:
+            raise NotImplementedError("serial_number is not supported by the compatibility RTL-SDR wrapper")
+        assert rtlsdr_lib is not None
+        self.dev_p = ctypes.c_void_p(None)
+        self.device_opened = False
+        self.buffer = None
+        self.num_bytes_read = ctypes.c_int32(0)
+        result = rtlsdr_lib.rtlsdr_open(ctypes.byref(self.dev_p), int(device_index))
+        if result < 0:
+            raise CompatLibUSBError(result, f"Could not open SDR (device index = {device_index})")
+        self.device_opened = True
+        try:
+            self._set_optional_int("rtlsdr_set_testmode", int(test_mode_enabled), "Could not set test mode")
+            self._set_optional_int(
+                "rtlsdr_set_dithering",
+                int(dithering_enabled),
+                "Could not set PLL dithering mode",
+            )
+            self._reset_buffer()
+            self.gain_values = self.get_gains()
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if not self.device_opened:
+            return
+        assert rtlsdr_lib is not None
+        rtlsdr_lib.rtlsdr_close(self.dev_p)
+        self.device_opened = False
+
+    def _set_optional_int(self, name: str, value: int, message: str) -> None:
+        function = getattr(rtlsdr_lib, name, None)
+        if function is None:
+            LOGGER.debug("librtlsdr does not expose %s; skipping", name)
+            return
+        result = function(self.dev_p, value)
+        if result < 0:
+            raise CompatLibUSBError(result, message)
+
+    def _reset_buffer(self) -> None:
+        assert rtlsdr_lib is not None
+        result = rtlsdr_lib.rtlsdr_reset_buffer(self.dev_p)
+        if result < 0:
+            raise CompatLibUSBError(result, "Could not reset buffer")
+
+    @property
+    def sample_rate(self) -> int:
+        raise AttributeError("sample_rate is write-only in compatibility mode")
+
+    @sample_rate.setter
+    def sample_rate(self, rate: int) -> None:
+        assert rtlsdr_lib is not None
+        result = rtlsdr_lib.rtlsdr_set_sample_rate(self.dev_p, int(rate))
+        if result < 0:
+            self.close()
+            raise CompatLibUSBError(result, f"Could not set sample rate to {int(rate)} Hz")
+
+    @property
+    def center_freq(self) -> int:
+        raise AttributeError("center_freq is write-only in compatibility mode")
+
+    @center_freq.setter
+    def center_freq(self, freq: int) -> None:
+        assert rtlsdr_lib is not None
+        result = rtlsdr_lib.rtlsdr_set_center_freq(self.dev_p, int(freq))
+        if result < 0:
+            self.close()
+            raise CompatLibUSBError(result, f"Could not set center_freq to {int(freq)} Hz")
+
+    @property
+    def freq_correction(self) -> int:
+        raise AttributeError("freq_correction is write-only in compatibility mode")
+
+    @freq_correction.setter
+    def freq_correction(self, ppm: int) -> None:
+        assert rtlsdr_lib is not None
+        result = rtlsdr_lib.rtlsdr_set_freq_correction(self.dev_p, int(ppm))
+        if result < 0:
+            self.close()
+            raise CompatLibUSBError(result, f"Could not set freq. offset to {int(ppm)} ppm")
+
+    @property
+    def gain(self) -> float | str:
+        raise AttributeError("gain is write-only in compatibility mode")
+
+    @gain.setter
+    def gain(self, gain: float | str) -> None:
+        assert rtlsdr_lib is not None
+        if isinstance(gain, str) and gain == "auto":
+            result = rtlsdr_lib.rtlsdr_set_tuner_gain_mode(self.dev_p, 0)
+            if result < 0:
+                raise CompatLibUSBError(result, "Could not set tuner gain mode")
+            agc = getattr(rtlsdr_lib, "rtlsdr_set_agc_mode", None)
+            if agc is not None:
+                result = agc(self.dev_p, 1)
+                if result < 0:
+                    raise CompatLibUSBError(result, "Could not set AGC mode")
+            return
+
+        requested_tenths = int(round(float(gain) * 10))
+        selected_gain = requested_tenths
+        if self.gain_values:
+            selected_gain = min(self.gain_values, key=lambda value: abs(value - requested_tenths))
+        result = rtlsdr_lib.rtlsdr_set_tuner_gain_mode(self.dev_p, 1)
+        if result < 0:
+            raise CompatLibUSBError(result, "Could not set tuner gain mode")
+        result = rtlsdr_lib.rtlsdr_set_tuner_gain(self.dev_p, selected_gain)
+        if result < 0:
+            self.close()
+            raise CompatLibUSBError(result, f"Could not set gain to {gain}")
+
+    def get_gains(self) -> list[int]:
+        assert rtlsdr_lib is not None
+        buffer = (ctypes.c_int * 50)()
+        result = rtlsdr_lib.rtlsdr_get_tuner_gains(self.dev_p, buffer)
+        if result <= 0:
+            return []
+        return [buffer[index] for index in range(result)]
+
+    def set_bias_tee(self, enabled: bool) -> None:
+        function = getattr(rtlsdr_lib, "rtlsdr_set_bias_tee", None)
+        if function is None:
+            if enabled:
+                raise RuntimeError(
+                    "rtl.bias_tee is true, but this librtlsdr does not support rtlsdr_set_bias_tee"
+                )
+            return
+        result = function(self.dev_p, int(enabled))
+        if result < 0:
+            raise CompatLibUSBError(result, "Could not set bias tee")
+
+    def read_bytes(self, num_bytes: int) -> bytes:
+        assert rtlsdr_lib is not None
+        num_bytes = int(num_bytes)
+        buffer = (ctypes.c_ubyte * num_bytes)()
+        num_read = ctypes.c_int32(0)
+        result = rtlsdr_lib.rtlsdr_read_sync(
+            self.dev_p,
+            buffer,
+            num_bytes,
+            ctypes.byref(num_read),
+        )
+        if result < 0:
+            self.close()
+            raise CompatLibUSBError(result, f"Could not read {num_bytes} bytes")
+        if num_read.value != num_bytes:
+            self.close()
+            raise IOError(f"Short read, requested {num_bytes} bytes, received {num_read.value}")
+        return bytes(buffer)
+
+
 try:
-    import rtlsdr.librtlsdr as rtlsdr_lib
+    rtlsdr_librtlsdr_module = importlib.import_module("rtlsdr.librtlsdr")
+    rtlsdr_lib = rtlsdr_librtlsdr_module.librtlsdr
     from rtlsdr.rtlsdr import BaseRtlSdr, LibUSBError
     PYRTLSDR_IMPORT_ERROR: Exception | None = None
 except Exception as exc:
-    rtlsdr_lib = None  # type: ignore[assignment]
-    BaseRtlSdr = None  # type: ignore[assignment]
-    LibUSBError = IOError  # type: ignore[assignment]
-    PYRTLSDR_IMPORT_ERROR = exc
+    try:
+        rtlsdr_lib = _load_system_librtlsdr()
+        BaseRtlSdr = CompatBaseRtlSdr
+        LibUSBError = CompatLibUSBError
+        PYRTLSDR_IMPORT_ERROR: Exception | None = None
+        LOGGER.warning(
+            "PyRTLSDR could not initialize its native wrapper (%s); using direct librtlsdr compatibility mode",
+            exc,
+        )
+    except Exception as fallback_exc:
+        rtlsdr_lib = None  # type: ignore[assignment]
+        BaseRtlSdr = None  # type: ignore[assignment]
+        LibUSBError = IOError  # type: ignore[assignment]
+        PYRTLSDR_IMPORT_ERROR = fallback_exc
 
 class CaptureManager:
     def __init__(self, config: ServerConfig) -> None:
