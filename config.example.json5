@@ -107,8 +107,9 @@
     // The port csdr_server listens on
     listen_port: 7355,
 
-        // The number of bytes read from the RTL SDR at a time. Leave this value alone!
-    read_chunk_size: 262144,
+        // The number of bytes read from the RTL SDR at a time.
+        // Must be a multiple of 512 bytes. Leave this value alone unless debugging capture behavior.
+        read_chunk_size: 262144,
 
     // The maximum amount of time allowed to receive data from the RTL SDR before declaring there's a hardware failure
     rtl_read_timeout_seconds: 2.0,

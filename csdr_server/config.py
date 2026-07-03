@@ -511,6 +511,10 @@ def _validate_listen_port(value: int) -> None:
 def _validate_read_chunk_size(value: int) -> None:
     if value <= 0:
         raise ValueError("read_chunk_size must be positive")
+    if value % 512 != 0:
+        raise ValueError("read_chunk_size must be a multiple of 512 bytes for RTL-SDR USB alignment")
+    if value % 2 != 0:
+        raise ValueError("read_chunk_size must be an even number of bytes to preserve I/Q sample pairs")
 
 
 def _validate_rtl_read_timeout_seconds(value: float) -> None:

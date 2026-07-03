@@ -163,6 +163,7 @@ class CompatBaseRtlSdr:
         self.dev_p = ctypes.c_void_p(None)
         self.device_opened = False
         self.buffer = None
+        self.buffer_size = 0
         self.num_bytes_read = ctypes.c_int32(0)
         result = rtlsdr_lib.rtlsdr_open(ctypes.byref(self.dev_p), int(device_index))
         if result < 0:
@@ -292,11 +293,13 @@ class CompatBaseRtlSdr:
     def read_bytes(self, num_bytes: int) -> bytes:
         assert rtlsdr_lib is not None
         num_bytes = int(num_bytes)
-        buffer = (ctypes.c_ubyte * num_bytes)()
+        if self.buffer is None or self.buffer_size != num_bytes:
+            self.buffer = (ctypes.c_ubyte * num_bytes)()
+            self.buffer_size = num_bytes
         num_read = ctypes.c_int32(0)
         result = rtlsdr_lib.rtlsdr_read_sync(
             self.dev_p,
-            buffer,
+            self.buffer,
             num_bytes,
             ctypes.byref(num_read),
         )
@@ -306,7 +309,7 @@ class CompatBaseRtlSdr:
         if num_read.value != num_bytes:
             self.close()
             raise IOError(f"Short read, requested {num_bytes} bytes, received {num_read.value}")
-        return bytes(buffer)
+        return ctypes.string_at(self.buffer, num_bytes)
 
 
 try:
