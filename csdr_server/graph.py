@@ -72,6 +72,7 @@ class SharedStream:
         self.stderr_thread: threading.Thread | None = None
         self.control_fifo_fd: int | None = None
         self.output_ready = threading.Event()
+        self.startup_backlog_logged = False
 
     def start(self) -> None:
         self._setup_control_fifo()
@@ -133,6 +134,26 @@ class SharedStream:
             self.input_queue.put(chunk, timeout=self.config.enqueue_timeout_seconds)
             return True
         except queue.Full:
+            if self.process is not None and self.process.poll() is not None:
+                LOGGER.debug("%s exited before accepting upstream input; closing branch", self.name)
+                self.close("process exited")
+                return False
+            if not self.output_ready.is_set():
+                if not self.startup_backlog_logged:
+                    LOGGER.debug(
+                        "%s is still warming up; dropping stale startup input instead of closing branch",
+                        self.name,
+                    )
+                    self.startup_backlog_logged = True
+                try:
+                    self.input_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self.input_queue.put_nowait(chunk)
+                except queue.Full:
+                    pass
+                return True
             LOGGER.debug("%s fell behind upstream input; closing branch", self.name)
             self.close("stream backlog")
             return False

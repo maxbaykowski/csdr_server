@@ -18,7 +18,7 @@ dependencies = [
   "sounddevice",
   "soxr",
   "pyrtlsdr; sys_platform == 'linux'",
-  "pyrtlsdrlib; sys_platform == 'linux'",
+  "pyrtlsdrlib; sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64'",
 ]
 keywords = ["rtl-sdr", "sdr", "csdr", "radio", "iq"]
 classifiers = [
