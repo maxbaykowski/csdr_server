@@ -330,6 +330,9 @@ class _RestartCapture(Exception):
     pass
 
 
+_NO_CAPTURE_ITEM = object()
+
+
 class CaptureManager:
     def __init__(self, config: ServerConfig) -> None:
         self.config = config
@@ -373,6 +376,7 @@ class CaptureManager:
         if self.supervisor_thread is not None:
             self.supervisor_thread.join(timeout=2.0)
         self._close_sdr()
+        self._close_queued_replacement()
 
     def _supervise_capture(self) -> None:
         while not self.stop_event.is_set():
@@ -611,7 +615,23 @@ class CaptureManager:
         )
         reader.start()
         try:
-            item = output_queue.get(timeout=config.rtl_read_timeout_seconds)
+            item: bytes | Exception | None | object = _NO_CAPTURE_ITEM
+            deadline = time.monotonic() + config.rtl_read_timeout_seconds
+            while not self.stop_event.is_set():
+                timeout = min(0.25, max(0.0, deadline - time.monotonic()))
+                if timeout <= 0:
+                    break
+                try:
+                    item = output_queue.get(timeout=timeout)
+                    break
+                except queue.Empty:
+                    continue
+            else:
+                raise DeviceResolutionRetryableError(
+                    "Server is stopping before the replacement RTL-SDR produced data."
+                )
+            if item is _NO_CAPTURE_ITEM:
+                raise queue.Empty
             if isinstance(item, Exception):
                 raise item
             if item is None:
@@ -1289,9 +1309,19 @@ class CaptureManager:
     def _close_specific_sdr(self, sdr: BaseRtlSdr) -> None:
         if sdr is not None:
             try:
+                self._cancel_specific_sdr_async(sdr)
                 sdr.close()
             except Exception:
                 LOGGER.exception("failed to close pyrtlsdr device")
+
+    def _close_queued_replacement(self) -> None:
+        while True:
+            try:
+                replacement = self.replacement_queue.get_nowait()
+            except queue.Empty:
+                return
+            if not isinstance(replacement, Exception):
+                self._close_specific_sdr(replacement[2])
 
     def _cancel_sdr_async(self) -> None:
         if rtlsdr_lib is None:
