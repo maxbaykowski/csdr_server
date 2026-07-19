@@ -354,6 +354,7 @@ class CaptureManager:
             tuple[ServerConfig, int, BaseRtlSdr, bytes] | Exception
         ] = queue.Queue(maxsize=1)
         self.hotswap_thread: threading.Thread | None = None
+        self.deferred_rtl_tuning_config: ServerConfig | None = None
 
     def start(self) -> None:
         self.supervisor_thread = threading.Thread(
@@ -786,7 +787,14 @@ class CaptureManager:
             self.clients.discard(client)
             if client.client_number > 0:
                 self.client_numbers_in_use.discard(client.client_number)
-        if self.config.automatic_tuning and not self.stop_event.is_set():
+        if self.stop_event.is_set():
+            return
+        if self.deferred_rtl_tuning_config is not None:
+            with self.reconfigure_lock:
+                applied_deferred = self._try_apply_deferred_rtl_tuning_locked("client disconnected")
+            if applied_deferred:
+                return
+        if self.config.automatic_tuning:
             self._retune_for_active_clients()
 
     def active_client_count(self) -> int:
@@ -848,12 +856,15 @@ class CaptureManager:
                 "ppm_correction",
                 "bias_tee",
                 "dc_block",
-                "rtl_sample_rate",
-                "center_frequency",
                 "transition_bandwidth",
                 "nfm_deemphasis_tau",
                 "nfm_lowpass_frequency",
                 "nfm_lowpass_curve",
+            }
+            rtl_tuning_live_fields = {
+                "automatic_tuning",
+                "center_frequency",
+                "rtl_sample_rate",
             }
             network_live_fields = {
                 "listen_host",
@@ -867,6 +878,7 @@ class CaptureManager:
                 field_name
                 for field_name in current_config.__dataclass_fields__
                 if field_name not in reloadable_fields
+                and field_name not in rtl_tuning_live_fields
                 and field_name not in network_live_fields
                 and field_name not in device_live_fields
                 and getattr(loaded_config, field_name) != getattr(current_config, field_name)
@@ -876,99 +888,96 @@ class CaptureManager:
                     "config reload ignored non-live settings that still require a restart: %s",
                     ", ".join(sorted(ignored_fields)),
                 )
-            next_config = current_config
+            immediate_config = current_config
             for field_name in reloadable_fields:
-                next_config = replace(
-                    next_config,
+                immediate_config = replace(
+                    immediate_config,
                     **{field_name: getattr(loaded_config, field_name)},
                 )
 
-            if current_config.automatic_tuning:
-                next_config = replace(
-                    next_config,
-                    center_frequency=current_config.center_frequency,
-                )
-
             if device_changed:
-                next_config = replace(
-                    next_config,
+                immediate_config = replace(
+                    immediate_config,
                     rtl_device_index=loaded_config.rtl_device_index,
                     rtl_serial=loaded_config.rtl_serial,
                 )
 
-            center_or_rate_changed = (
-                next_config.center_frequency != current_config.center_frequency
-                or next_config.rtl_sample_rate != current_config.rtl_sample_rate
-            )
             transition_changed = (
-                next_config.transition_bandwidth != current_config.transition_bandwidth
+                immediate_config.transition_bandwidth != current_config.transition_bandwidth
             )
-            dc_block_changed = next_config.dc_block != current_config.dc_block
+            dc_block_changed = immediate_config.dc_block != current_config.dc_block
             rebuild_audio_modulations: set[str] = set()
             if (
-                next_config.nfm_deemphasis_tau != current_config.nfm_deemphasis_tau
-                or next_config.nfm_lowpass_frequency != current_config.nfm_lowpass_frequency
-                or next_config.nfm_lowpass_curve != current_config.nfm_lowpass_curve
+                immediate_config.nfm_deemphasis_tau != current_config.nfm_deemphasis_tau
+                or immediate_config.nfm_lowpass_frequency != current_config.nfm_lowpass_frequency
+                or immediate_config.nfm_lowpass_curve != current_config.nfm_lowpass_curve
             ):
                 rebuild_audio_modulations.add("nfm")
             client_requests = self._snapshot_client_requests()
-            if center_or_rate_changed:
-                incompatible_errors = self._find_incompatible_requests(next_config, client_requests)
-                if incompatible_errors:
-                    LOGGER.error(
-                        "config reload requires a server restart: %s",
-                        incompatible_errors[0],
-                    )
-                    if len(incompatible_errors) > 1:
-                        LOGGER.error(
-                            "additional incompatible client requests: %s",
-                            "; ".join(incompatible_errors[1:]),
-                        )
-                    next_config = replace(
-                        next_config,
-                        center_frequency=current_config.center_frequency,
-                        rtl_sample_rate=current_config.rtl_sample_rate,
-                    )
-                    center_or_rate_changed = False
 
-            self._apply_runtime_radio_config(current_config, next_config)
+            self._apply_runtime_radio_config(current_config, immediate_config)
             self.graph.apply_runtime_config(
-                new_config=next_config,
+                new_config=immediate_config,
                 sessions=client_requests,
-                rebuild_shift_path=center_or_rate_changed or dc_block_changed,
-                rebuild_decimators=center_or_rate_changed or transition_changed or dc_block_changed,
+                rebuild_shift_path=dc_block_changed,
+                rebuild_decimators=transition_changed or dc_block_changed,
                 rebuild_audio_modulations=rebuild_audio_modulations,
             )
-            self.config = next_config
+            self.config = immediate_config
+            tuning_config, tuning_errors = self._build_rtl_tuning_config(
+                immediate_config,
+                loaded_config,
+                client_requests,
+            )
+            if tuning_config is None:
+                self.deferred_rtl_tuning_config = loaded_config
+                self._log_deferred_rtl_tuning(tuning_errors)
+            else:
+                tuning_changed = self._rtl_tuning_changed(immediate_config, tuning_config)
+                if tuning_changed:
+                    tuning_errors = self._find_incompatible_requests(tuning_config, client_requests)
+                    if tuning_errors:
+                        self.deferred_rtl_tuning_config = loaded_config
+                        self._log_deferred_rtl_tuning(tuning_errors)
+                    else:
+                        self._apply_rtl_tuning_config_locked(
+                            tuning_config,
+                            client_requests,
+                            "config reload",
+                        )
+                        self.deferred_rtl_tuning_config = None
+                else:
+                    self.config = tuning_config
+                    self.deferred_rtl_tuning_config = None
             for session in client_requests:
                 self._refresh_rds_subscription_locked(session)
             if device_changed:
                 try:
-                    self._queue_device_hotswap(next_config)
+                    self._queue_device_hotswap(self.config)
                 except (DeviceResolutionFatalError, DeviceAccessFatalError) as exc:
                     LOGGER.error("RTL-SDR hot-swap refused: %s", exc)
                     self.config = current_config
                     self.graph.apply_runtime_config(
                         new_config=current_config,
                         sessions=client_requests,
-                        rebuild_shift_path=center_or_rate_changed or dc_block_changed,
-                        rebuild_decimators=center_or_rate_changed or transition_changed or dc_block_changed,
+                        rebuild_shift_path=dc_block_changed,
+                        rebuild_decimators=transition_changed or dc_block_changed,
                         rebuild_audio_modulations=rebuild_audio_modulations,
                     )
                     return loaded_config
             LOGGER.info("Configuration reload applied")
             LOGGER.debug(
                 "config reload applied: center_frequency=%s rtl_sample_rate=%s automatic_gain_control=%s rtl_gain=%s ppm_correction=%s bias_tee=%s dc_block=%s transition_bandwidth=%s nfm_deemphasis_tau=%s wfm_region=%s",
-                next_config.center_frequency,
-                next_config.rtl_sample_rate,
-                next_config.automatic_gain_control,
-                next_config.rtl_gain,
-                next_config.ppm_correction,
-                next_config.bias_tee,
-                next_config.dc_block,
-                next_config.transition_bandwidth,
-                next_config.nfm_deemphasis_tau,
-                next_config.wfm_region,
+                self.config.center_frequency,
+                self.config.rtl_sample_rate,
+                self.config.automatic_gain_control,
+                self.config.rtl_gain,
+                self.config.ppm_correction,
+                self.config.bias_tee,
+                self.config.dc_block,
+                self.config.transition_bandwidth,
+                self.config.nfm_deemphasis_tau,
+                self.config.wfm_region,
             )
             return loaded_config
 
@@ -1069,6 +1078,7 @@ class CaptureManager:
                     next_audio_codec,
                     next_opus_bitrate,
                 )
+                self._try_apply_deferred_rtl_tuning_locked("client reconfigured")
                 return
 
             remaining_sessions = self._snapshot_client_requests(exclude_session=session)
@@ -1148,6 +1158,7 @@ class CaptureManager:
                 next_audio_codec,
                 next_opus_bitrate,
             )
+            self._try_apply_deferred_rtl_tuning_locked("client reconfigured")
 
     def set_rds_subscription(self, session: "ClientSession", enabled: bool) -> None:
         with self.reconfigure_lock:
@@ -1208,6 +1219,126 @@ class CaptureManager:
                     f"modulation={session.modulation}: {exc.message}"
                 )
         return errors
+
+    def _build_rtl_tuning_config(
+        self,
+        base_config: ServerConfig,
+        desired_config: ServerConfig,
+        sessions: list["ClientSession"],
+    ) -> tuple[ServerConfig | None, list[str]]:
+        candidate = replace(
+            base_config,
+            automatic_tuning=desired_config.automatic_tuning,
+            rtl_sample_rate=desired_config.rtl_sample_rate,
+            center_frequency=desired_config.center_frequency,
+        )
+        if desired_config.automatic_tuning:
+            if sessions:
+                try:
+                    center_frequency = _compute_automatic_center_frequency(
+                        desired_config.rtl_sample_rate,
+                        [
+                            (
+                                session.frequency,
+                                _get_required_bandwidth(
+                                    session.mode,
+                                    session.output_rate,
+                                    session.modulation,
+                                ),
+                            )
+                            for session in sessions
+                        ],
+                    )
+                except RequestValidationError as exc:
+                    return None, [exc.message]
+                except ValueError as exc:
+                    return None, [str(exc)]
+            else:
+                center_frequency = base_config.center_frequency
+            candidate = replace(candidate, center_frequency=center_frequency)
+
+        errors = self._find_incompatible_requests(candidate, sessions)
+        if errors:
+            return None, errors
+        return candidate, []
+
+    @staticmethod
+    def _rtl_tuning_changed(
+        current_config: ServerConfig,
+        next_config: ServerConfig,
+    ) -> bool:
+        return (
+            next_config.automatic_tuning != current_config.automatic_tuning
+            or next_config.center_frequency != current_config.center_frequency
+            or next_config.rtl_sample_rate != current_config.rtl_sample_rate
+        )
+
+    def _apply_rtl_tuning_config_locked(
+        self,
+        next_config: ServerConfig,
+        sessions: list["ClientSession"],
+        reason: str,
+    ) -> None:
+        current_config = self.config
+        tuning_changed = self._rtl_tuning_changed(current_config, next_config)
+        center_or_rate_changed = (
+            next_config.center_frequency != current_config.center_frequency
+            or next_config.rtl_sample_rate != current_config.rtl_sample_rate
+        )
+        if not tuning_changed:
+            self.config = next_config
+            return
+        self._apply_runtime_radio_config(current_config, next_config)
+        self.graph.apply_runtime_config(
+            new_config=next_config,
+            sessions=sessions,
+            rebuild_shift_path=center_or_rate_changed,
+            rebuild_decimators=center_or_rate_changed,
+            rebuild_audio_modulations=set(),
+        )
+        self.config = next_config
+        LOGGER.info(
+            "RTL tuning change applied after %s: automatic_tuning=%s center_frequency=%s rtl_sample_rate=%s",
+            reason,
+            next_config.automatic_tuning,
+            next_config.center_frequency,
+            next_config.rtl_sample_rate,
+        )
+
+    def _try_apply_deferred_rtl_tuning_locked(self, reason: str) -> bool:
+        if self.deferred_rtl_tuning_config is None:
+            return False
+        sessions = self._snapshot_client_requests()
+        candidate, errors = self._build_rtl_tuning_config(
+            self.config,
+            self.deferred_rtl_tuning_config,
+            sessions,
+        )
+        if candidate is None:
+            LOGGER.debug(
+                "deferred RTL tuning still cannot be applied after %s: %s",
+                reason,
+                errors[0] if errors else "active clients are incompatible",
+            )
+            return False
+        self._apply_rtl_tuning_config_locked(candidate, sessions, reason)
+        self.deferred_rtl_tuning_config = None
+        return True
+
+    @staticmethod
+    def _log_deferred_rtl_tuning(errors: list[str]) -> None:
+        if errors:
+            LOGGER.warning(
+                "RTL tuning change deferred until connected clients are compatible: %s",
+                errors[0],
+            )
+            if len(errors) > 1:
+                LOGGER.debug(
+                    "additional deferred RTL tuning incompatibilities: %s",
+                    "; ".join(errors[1:]),
+                )
+            return
+        LOGGER.warning("RTL tuning change deferred until connected clients are compatible")
 
     def _apply_runtime_radio_config(
         self,

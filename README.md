@@ -251,13 +251,18 @@ If you're using systemd, your life becomes so much easier:
 sudo systemctl reload csdr_server
 ```
 
-Most configuration options can be reloaded in place, except for a few. The following settings require a restart if adjusted:
-- Changing the configured SDR dongle
+Most RTL settings can be reloaded in place. Changes to `automatic_tuning`,
+`center_frequency`, and `rtl_sample_rate` are applied immediately when connected
+clients still fit inside the new capture window. If the new tuning settings
+would put active clients out of band, the server keeps the current RTL tuning,
+remembers the latest requested settings, and applies them once clients retune or
+disconnect.
+
+Some configuration options still require a restart if adjusted:
 - Enabling/disabling audio support
 - Enabling/disabling individual audio demodulators
 - Enabling/disabling FM stereo support
 - Enabling/disabling FM RDS support
-- All server related settings -- IP address, port, etc
 If a setting is adjusted that requires a restart, the server will log it to stdout. If you're running the server as a systemd service you can check the log with:
 
 ```bash
