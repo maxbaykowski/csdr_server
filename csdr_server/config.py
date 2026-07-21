@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json5
+import re
 import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .constants import *
+
+
+MINIMUM_CSDR_VERSION = (0, 19, 3)
 
 @dataclass(frozen=True)
 class ServerConfig:
@@ -544,6 +549,54 @@ def _is_valid_rtl_sample_rate(sample_rate: int) -> bool:
     )
 
 
+def _format_version(version: tuple[int, ...]) -> str:
+    return ".".join(str(part) for part in version)
+
+
+def _parse_version_text(text: str) -> tuple[int, ...] | None:
+    match = re.search(r"(\d+(?:\.\d+)*)(?:-[A-Za-z0-9_.-]+)?", text)
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def _version_at_least(version: tuple[int, ...], minimum: tuple[int, ...]) -> bool:
+    width = max(len(version), len(minimum))
+    padded_version = version + (0,) * (width - len(version))
+    padded_minimum = minimum + (0,) * (width - len(minimum))
+    return padded_version >= padded_minimum
+
+
+def _check_csdr_version(csdr_path: str) -> None:
+    try:
+        result = subprocess.run(
+            [csdr_path, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            text=True,
+            timeout=5.0,
+        )
+    except OSError as exc:
+        raise FileNotFoundError(f"could not run csdr --version: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("csdr --version timed out") from exc
+
+    output = result.stdout.strip()
+    version = _parse_version_text(output)
+    if version is None:
+        raise RuntimeError(
+            "could not determine CSDR version from `csdr --version` output"
+            + (f": {output}" if output else "")
+        )
+    if not _version_at_least(version, MINIMUM_CSDR_VERSION):
+        raise RuntimeError(
+            "CSDR "
+            f"{_format_version(MINIMUM_CSDR_VERSION)} or later is required; "
+            f"found {_format_version(version)}"
+        )
+
+
 def _check_dependencies(config: ServerConfig) -> None:
     from .rtl import PYRTLSDR_IMPORT_ERROR
 
@@ -552,8 +605,10 @@ def _check_dependencies(config: ServerConfig) -> None:
             "could not load librtlsdr. Install your distribution's librtlsdr package "
             f"or install pyrtlsdrlib on supported architectures: {PYRTLSDR_IMPORT_ERROR}"
         )
-    if shutil.which("csdr") is None:
+    csdr_path = shutil.which("csdr")
+    if csdr_path is None:
         raise FileNotFoundError("required command(s) not found in PATH: csdr")
+    _check_csdr_version(csdr_path)
     if config.audio_support and config.wfm_enabled and config.enable_wfm_stereo and shutil.which("demux") is None:
         raise FileNotFoundError(
             "Please install Stereo Demux for WFM stereo support"

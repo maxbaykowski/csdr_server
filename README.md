@@ -23,7 +23,7 @@ I thoroughly tested this program and made the design choices for it, but I was a
 ### Prerequisites
 
 To install this project you will need to make sure you have `pip` installed on your system. The project pulls in python dependencies automatically, but the server component has the following external dependencies:
-- My fork of [csdr](https://github.com/maxbaykowski/csdr)
+- My fork of [csdr](https://github.com/maxbaykowski/csdr), version `0.19.3` or newer
 - `librtlsdr`
 - `libopus` (optional, for `opus` encoding/decoding)
 - [stereodemux](https://github.com/windytan/stereodemux) (optional, for server-side stereo FM)
