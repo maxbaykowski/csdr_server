@@ -180,6 +180,8 @@ class ServerConfig:
                 else 0.5
             ),
             wfm_enabled=wfm_enabled,
+            # Legacy audio.wfm.stereo_support is intentionally ignored. WFM
+            # stereo is built into CSDR and is available whenever WFM is enabled.
             enable_wfm_rds=_parse_bool(
                 _config_value(
                     audio_settings,
