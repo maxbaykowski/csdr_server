@@ -771,8 +771,6 @@ class StreamGraph:
         audio_stream = self.audio_streams.get(audio_key)
         if audio_stream is None:
             audio_parent = self._get_audio_demod_parent_locked(frequency, modulation, base_stream)
-            if modulation == "wfm_stereo":
-                audio_parent = self._get_wfm_shared_s16_mpx_locked(frequency, audio_parent)
             audio_stream = _build_audio_stream(
                 config=self.config,
                 frequency=frequency,

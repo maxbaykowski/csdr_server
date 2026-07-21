@@ -35,7 +35,6 @@ class ServerConfig:
     nfm_lowpass_frequency: int | None = 3200
     nfm_lowpass_curve: float = 0.5
     wfm_enabled: bool = True
-    enable_wfm_stereo: bool = False
     enable_wfm_rds: bool = False
     wfm_region: str = WFM_DEEMPHASIS_REGION
     listen_host: str = "0.0.0.0"
@@ -181,15 +180,6 @@ class ServerConfig:
                 else 0.5
             ),
             wfm_enabled=wfm_enabled,
-            enable_wfm_stereo=_parse_bool(
-                _config_value(
-                    audio_settings,
-                    wfm_settings,
-                    "stereo_support",
-                    audio_settings.get("enable_wfm_stereo", False),
-                ),
-                "audio.wfm.stereo_support",
-            ),
             enable_wfm_rds=_parse_bool(
                 _config_value(
                     audio_settings,
@@ -368,7 +358,6 @@ def _validate_config(config: ServerConfig) -> None:
     _validate_demodulator_enabled("audio.usb.enabled", config.usb_enabled)
     _validate_demodulator_enabled("audio.nfm.enabled", config.nfm_enabled)
     _validate_demodulator_enabled("audio.wfm.enabled", config.wfm_enabled)
-    _validate_enable_wfm_stereo(config.enable_wfm_stereo)
     _validate_enable_wfm_rds(config.enable_wfm_rds)
     if not config.audio_support:
         return
@@ -475,11 +464,6 @@ def _validate_nfm_lowpass_frequency(value: int | None) -> None:
 def _validate_nfm_lowpass_curve(value: float) -> None:
     if not (0.005 <= value <= 0.5):
         raise ValueError("audio.nfm.lowpass_curve must be between 0.005 and 0.5")
-
-
-def _validate_enable_wfm_stereo(value: bool) -> None:
-    if not isinstance(value, bool):
-        raise ValueError("audio.wfm.stereo_support must be true or false")
 
 
 def _validate_enable_wfm_rds(value: bool) -> None:
@@ -609,10 +593,6 @@ def _check_dependencies(config: ServerConfig) -> None:
     if csdr_path is None:
         raise FileNotFoundError("required command(s) not found in PATH: csdr")
     _check_csdr_version(csdr_path)
-    if config.audio_support and config.wfm_enabled and config.enable_wfm_stereo and shutil.which("demux") is None:
-        raise FileNotFoundError(
-            "Please install Stereo Demux for WFM stereo support"
-        )
     if config.audio_support and config.wfm_enabled and config.enable_wfm_rds and shutil.which("redsea") is None:
         raise FileNotFoundError(
             "Please install redsea for WFM RDS support"

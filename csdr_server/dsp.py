@@ -230,11 +230,6 @@ def _validate_audio_modulation_supported(config: ServerConfig, modulation: str) 
             EXIT_REQUEST_ERROR,
             f"{modulation.upper()} support is disabled on this server",
         )
-    if modulation == "wfm_stereo" and not config.enable_wfm_stereo:
-        raise RequestValidationError(
-            EXIT_REQUEST_ERROR,
-            "Server does not support WFM stereo",
-        )
 
 
 def _get_wfm_deemphasis_tau(region: str) -> int:
@@ -543,25 +538,72 @@ def _build_audio_stream(
         return output_stream
 
     if modulation == "wfm_stereo":
-        deemphasis_tau = _get_wfm_deemphasis_tau(config.wfm_region)
-        output_stream = SharedStream(
+        stereo_stream = SharedStream(
             config=config,
-            name=f"audio-{modulation}-{frequency}",
+            name=f"audio-{modulation}-{frequency}-stereofm",
             command=[
-                "demux",
-                "-r",
+                "csdr",
+                "stereofm",
                 str(WFM_IQ_RATE),
-                "-R",
-                str(DEFAULT_AUDIO_OUTPUT_RATE),
-                "-d",
-                str(deemphasis_tau),
             ],
             manager=manager,
             parent=parent,
             close_when_unused=True,
+        )
+        audio_decimation_ratio = _compute_fractional_decimation_ratio(
+            WFM_IQ_RATE,
+            DEFAULT_AUDIO_OUTPUT_RATE,
+        )
+        audio_resample_stream = SharedStream(
+            config=config,
+            name=f"audio-{modulation}-{frequency}-fractionaldecimator",
+            command=[
+                "csdr",
+                "fractionaldecimator",
+                _format_csdr_float(audio_decimation_ratio),
+                "--format",
+                "float",
+                "--channels",
+                "2",
+                "--prefilter",
+            ],
+            manager=manager,
+            parent=stereo_stream,
+            close_when_unused=True,
+        )
+        deemphasis_tau = _get_wfm_deemphasis_tau(config.wfm_region)
+        deemphasis_stream = SharedStream(
+            config=config,
+            name=f"audio-{modulation}-{frequency}-deemphasis",
+            command=[
+                "csdr",
+                "deemphasis",
+                "--wfm",
+                str(DEFAULT_AUDIO_OUTPUT_RATE),
+                f"{deemphasis_tau}e-6",
+                "--channels",
+                "2",
+            ],
+            manager=manager,
+            parent=audio_resample_stream,
+            close_when_unused=True,
+        )
+        output_stream = SharedStream(
+            config=config,
+            name=f"audio-{modulation}-{frequency}",
+            command=["csdr", "convert", "-i", "float", "-o", "s16"],
+            manager=manager,
+            parent=deemphasis_stream,
+            close_when_unused=True,
             output_read_size=_compute_output_read_size("s16", _get_audio_output_rate(modulation)),
         )
         try:
+            stereo_stream.start()
+            started_streams.append(stereo_stream)
+            audio_resample_stream.start()
+            started_streams.append(audio_resample_stream)
+            deemphasis_stream.start()
+            started_streams.append(deemphasis_stream)
             output_stream.start()
             started_streams.append(output_stream)
         except Exception:

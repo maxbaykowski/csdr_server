@@ -26,7 +26,6 @@ To install this project you will need to make sure you have `pip` installed on y
 - My fork of [csdr](https://github.com/maxbaykowski/csdr), version `0.19.3` or newer
 - `librtlsdr`
 - `libopus` (optional, for `opus` encoding/decoding)
-- [stereodemux](https://github.com/windytan/stereodemux) (optional, for server-side stereo FM)
 - [redsea](https://github.com/windytan/redsea) (optional, for server-side RDS decoding)
 Refer to each project's respective GitHub README for instructions on installing them. It's a bit of a tedious process, but it's not as hard as you might think.
 
@@ -229,7 +228,7 @@ As you can see, the serial number has been successfully changed from its default
 
 The `wfm` section of the configuration file has some additional options besides just the on/off switch, I suggest you have a look at them in the example config if you haven't already. The most important setting is the region. Supported regions are `us` and `europe`. By default, the setting is set to `us`. You must make sure this is set correctly as this option will affect FM deemphasis and RDS decoding.
 
-This server supports regular, plain old mono WFM, but it can also decode stereo and RDS data. These are controlled by the `stereo_support` and `rds_support` configuration options under the wfm section of the config. Note that you need additional dependencies for clients to use these features (see above). It is also worth noting that RDS and stereo decoding will consume resources on the server. In my testing on my Intel Core I7-1185G7, 3 clients, each on their own frequency, with stereo and RDS enabled, brought my CPU from 3% up to 12%, so don't enable this unless you know your machine can handle it. If you're running the server on your Raspberry Pi that's been sitting in a bin in your garage since 2017, it's probably best to keep stereo and RDS disabled.
+This server supports regular mono WFM, stereo WFM, and RDS data. Stereo WFM is handled by CSDR directly and is always available when WFM is enabled. RDS is controlled by the `rds_support` configuration option under the wfm section of the config and requires `redsea`. It is also worth noting that RDS and stereo decoding will consume resources on the server. In my testing on my Intel Core I7-1185G7, 3 clients, each on their own frequency, with stereo and RDS enabled, brought my CPU from 3% up to 12%, so don't enable RDS unless you know your machine can handle it. If you're running the server on your Raspberry Pi that's been sitting in a bin in your garage since 2017, it's probably best to keep RDS disabled.
 
 ## Reloading the configuration in place
 
@@ -261,7 +260,6 @@ disconnect.
 Some configuration options still require a restart if adjusted:
 - Enabling/disabling audio support
 - Enabling/disabling individual audio demodulators
-- Enabling/disabling FM stereo support
 - Enabling/disabling FM RDS support
 If a setting is adjusted that requires a restart, the server will log it to stdout. If you're running the server as a systemd service you can check the log with:
 
@@ -348,7 +346,7 @@ Listen in stereo with RDS decoding enabled:
 csdr_server_client -a localhost -p 7355 -f 88.1M -m audio -M wfm-stereo --rds
 ```
 
-Same thing as above, except the demodulation type is `wfm-stereo` and RDS decoding by specifying `--rds`. You'll need FM stereo and RDS enabled on the server for this to work.
+Same thing as above, except the demodulation type is `wfm-stereo` and RDS decoding is requested by specifying `--rds`. You'll need RDS enabled on the server for this to work.
 
 Record the entire broadcast AM band and save it to an IQ file:
 
