@@ -257,11 +257,14 @@ would put active clients out of band, the server keeps the current RTL tuning,
 remembers the latest requested settings, and applies them once clients retune or
 disconnect.
 
-Some configuration options still require a restart if adjusted:
-- Enabling/disabling audio support
-- Enabling/disabling individual audio demodulators
-- Enabling/disabling FM RDS support
-If a setting is adjusted that requires a restart, the server will log it to stdout. If you're running the server as a systemd service you can check the log with:
+Audio support, individual demodulators, and demodulator settings can also be
+reloaded in place. If audio support or a demodulator is disabled, existing
+clients using that audio path keep their current DSP settings and can continue
+listening. New clients cannot request disabled audio modes, and existing clients
+that switch away from a disabled demodulator cannot switch back until it is
+enabled again.
+
+If you're running the server as a systemd service you can check the log with:
 
 ```bash
 sudo journalctl -u csdr_server.service

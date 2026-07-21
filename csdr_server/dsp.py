@@ -723,7 +723,11 @@ def _validate_request_frequency(
         )
 
 
-def _validate_session_request(config: ServerConfig, session: "ClientSession") -> None:
+def _validate_session_request(
+    config: ServerConfig,
+    session: "ClientSession",
+    validate_audio_support: bool = True,
+) -> None:
     required_bandwidth = _get_required_bandwidth(
         session.mode,
         session.output_rate,
@@ -746,7 +750,8 @@ def _validate_session_request(config: ServerConfig, session: "ClientSession") ->
                 "audio session is missing modulation",
             )
         _validate_audio_modulation(session.modulation)
-        _validate_audio_modulation_supported(config, session.modulation)
+        if validate_audio_support:
+            _validate_audio_modulation_supported(config, session.modulation)
         _validate_output_rate(config.rtl_sample_rate, _get_audio_iq_rate(session.modulation))
         return
     raise RequestValidationError(

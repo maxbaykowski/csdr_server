@@ -52,6 +52,7 @@ class ClientSession:
         self.address = address
         self.manager = manager
         self.config = config
+        self.dsp_config = config
         self.source_stream = source_stream
         self.frequency = frequency
         self.mode = mode

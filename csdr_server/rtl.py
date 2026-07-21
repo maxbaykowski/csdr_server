@@ -714,6 +714,8 @@ class CaptureManager:
         modulation: str | None,
         audio_codec: str = "pcm",
         opus_bitrate: int = 24_000,
+        dsp_config: ServerConfig | None = None,
+        validate_audio_support: bool = True,
     ) -> "SharedStream":
         return self.graph.get_output_stream(
             frequency,
@@ -723,6 +725,8 @@ class CaptureManager:
             modulation,
             audio_codec,
             opus_bitrate,
+            dsp_config,
+            validate_audio_support,
         )
 
     def get_audio_power_monitor(
@@ -841,8 +845,15 @@ class CaptureManager:
 
     def reload_config(self, path: Path) -> ServerConfig:
         with self.reconfigure_lock:
-            loaded_config = load_config(path)
             current_config = self.config
+            try:
+                loaded_config = load_config(path)
+            except ValueError as exc:
+                LOGGER.error(
+                    "config reload rejected; keeping previous live settings: %s",
+                    exc,
+                )
+                return current_config
             device_changed = self._device_identity_changed(current_config, loaded_config)
             if device_changed:
                 try:
@@ -860,6 +871,14 @@ class CaptureManager:
                 "nfm_deemphasis_tau",
                 "nfm_lowpass_frequency",
                 "nfm_lowpass_curve",
+                "audio_support",
+                "am_enabled",
+                "lsb_enabled",
+                "usb_enabled",
+                "nfm_enabled",
+                "wfm_enabled",
+                "enable_wfm_rds",
+                "wfm_region",
             }
             rtl_tuning_live_fields = {
                 "automatic_tuning",
@@ -908,12 +927,23 @@ class CaptureManager:
             dc_block_changed = immediate_config.dc_block != current_config.dc_block
             rebuild_audio_modulations: set[str] = set()
             if (
-                immediate_config.nfm_deemphasis_tau != current_config.nfm_deemphasis_tau
-                or immediate_config.nfm_lowpass_frequency != current_config.nfm_lowpass_frequency
-                or immediate_config.nfm_lowpass_curve != current_config.nfm_lowpass_curve
+                immediate_config.audio_support
+                and immediate_config.nfm_enabled
+                and (
+                    immediate_config.nfm_deemphasis_tau != current_config.nfm_deemphasis_tau
+                    or immediate_config.nfm_lowpass_frequency != current_config.nfm_lowpass_frequency
+                    or immediate_config.nfm_lowpass_curve != current_config.nfm_lowpass_curve
+                )
             ):
                 rebuild_audio_modulations.add("nfm")
+            if (
+                immediate_config.audio_support
+                and immediate_config.wfm_enabled
+                and immediate_config.wfm_region != current_config.wfm_region
+            ):
+                rebuild_audio_modulations.update({"wfm", "wfm_stereo"})
             client_requests = self._snapshot_client_requests()
+            self._apply_audio_session_config_snapshots(client_requests, immediate_config)
 
             self._apply_runtime_radio_config(current_config, immediate_config)
             self.graph.apply_runtime_config(
@@ -992,6 +1022,40 @@ class CaptureManager:
                 if not client.closed.is_set() and client is not exclude_session
             ]
 
+    @staticmethod
+    def _apply_audio_session_config_snapshots(
+        sessions: list["ClientSession"],
+        loaded_config: ServerConfig,
+    ) -> None:
+        for session in sessions:
+            if session.mode != "audio" or session.modulation is None:
+                session.dsp_config = loaded_config
+                continue
+            if CaptureManager._audio_modulation_enabled_for_existing_session(
+                loaded_config,
+                session.modulation,
+            ):
+                session.dsp_config = loaded_config
+
+    @staticmethod
+    def _audio_modulation_enabled_for_existing_session(
+        config: ServerConfig,
+        modulation: str,
+    ) -> bool:
+        if not config.audio_support:
+            return False
+        if modulation == "am":
+            return config.am_enabled
+        if modulation == "lsb":
+            return config.lsb_enabled
+        if modulation == "usb":
+            return config.usb_enabled
+        if modulation == "nfm":
+            return config.nfm_enabled
+        if modulation in {"wfm", "wfm_stereo"}:
+            return config.wfm_enabled
+        return False
+
     def reconfigure_client(
         self,
         session: "ClientSession",
@@ -1007,6 +1071,7 @@ class CaptureManager:
             next_sample_format = session.sample_format
             next_audio_codec = session.audio_codec
             next_opus_bitrate = session.opus_bitrate
+            next_dsp_config = session.dsp_config
 
             if opus_bitrate is not None:
                 if session.mode != "audio":
@@ -1039,6 +1104,7 @@ class CaptureManager:
                 next_modulation = modulation
                 next_output_rate = _get_audio_output_rate(modulation)
                 next_sample_format = None
+                next_dsp_config = self.config
 
             required_bandwidth = _get_required_bandwidth(
                 session.mode,
@@ -1055,6 +1121,8 @@ class CaptureManager:
                     next_modulation,
                     next_audio_codec,
                     next_opus_bitrate,
+                    next_dsp_config,
+                    False,
                 )
                 power_monitor = self.graph.get_audio_power_monitor(
                     next_frequency,
@@ -1066,6 +1134,7 @@ class CaptureManager:
                 session.sample_format = next_sample_format
                 session.audio_codec = next_audio_codec
                 session.opus_bitrate = next_opus_bitrate
+                session.dsp_config = next_dsp_config
                 session.switch_power_monitor(power_monitor)
                 session.switch_source_stream(source_stream)
                 self._refresh_rds_subscription_locked(session)
@@ -1099,6 +1168,8 @@ class CaptureManager:
                 next_modulation,
                 next_audio_codec,
                 next_opus_bitrate,
+                next_dsp_config,
+                False,
             ) if desired_center == current_config.center_frequency else None
             power_monitor = self.graph.get_audio_power_monitor(
                 next_frequency,
@@ -1111,12 +1182,14 @@ class CaptureManager:
             old_sample_format = session.sample_format
             old_audio_codec = session.audio_codec
             old_opus_bitrate = session.opus_bitrate
+            old_dsp_config = session.dsp_config
             session.frequency = next_frequency
             session.modulation = next_modulation
             session.output_rate = next_output_rate
             session.sample_format = next_sample_format
             session.audio_codec = next_audio_codec
             session.opus_bitrate = next_opus_bitrate
+            session.dsp_config = next_dsp_config
             try:
                 if desired_center != current_config.center_frequency:
                     self._apply_runtime_radio_config(current_config, next_config)
@@ -1148,6 +1221,7 @@ class CaptureManager:
                 session.sample_format = old_sample_format
                 session.audio_codec = old_audio_codec
                 session.opus_bitrate = old_opus_bitrate
+                session.dsp_config = old_dsp_config
                 raise
             LOGGER.debug(
                 "reconfigured client %s:%s to frequency=%s modulation=%s audio_codec=%s opus_bitrate=%s",
@@ -1210,7 +1284,11 @@ class CaptureManager:
         errors: list[str] = []
         for session in sessions:
             try:
-                _validate_session_request(config, session)
+                _validate_session_request(
+                    config,
+                    session,
+                    validate_audio_support=session.mode != "audio",
+                )
             except RequestValidationError as exc:
                 errors.append(
                     f"client {session.address[0]}:{session.address[1]} "

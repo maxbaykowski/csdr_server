@@ -38,6 +38,20 @@ from .dsp import (
 )
 from .utils import _get_runtime_dir, terminate_process
 
+
+def _audio_config_key(config: ServerConfig, modulation: str) -> tuple[Any, ...]:
+    if modulation == "nfm":
+        return (
+            modulation,
+            config.nfm_deemphasis_tau,
+            config.nfm_lowpass_frequency,
+            config.nfm_lowpass_curve,
+        )
+    if modulation in {"wfm", "wfm_stereo"}:
+        return (modulation, config.wfm_region)
+    return (modulation,)
+
+
 class SharedStream:
     def __init__(
         self,
@@ -474,8 +488,8 @@ class StreamGraph:
         self.shift_streams: dict[int, SharedStream] = {}
         self.decimation_streams: dict[tuple[int, int, float, str], SharedStream] = {}
         self.format_streams: dict[tuple[int, int, str], Any] = {}
-        self.audio_streams: dict[tuple[int, str], SharedStream] = {}
-        self.audio_transport_streams: dict[tuple[int, str, str, int], Any] = {}
+        self.audio_streams: dict[tuple[int, Any], SharedStream] = {}
+        self.audio_transport_streams: dict[tuple[int, tuple[Any, ...], str, int], Any] = {}
         self.rds_decoders: dict[int, RdsDecoder] = {}
         self.power_monitors: dict[tuple[int, int, float, str], IqPowerMonitor] = {}
 
@@ -535,6 +549,8 @@ class StreamGraph:
         modulation: str | None,
         audio_codec: str = DEFAULT_AUDIO_CODEC,
         opus_bitrate: int = DEFAULT_OPUS_BITRATE,
+        dsp_config: ServerConfig | None = None,
+        validate_audio_support: bool = True,
     ) -> SharedStream:
         with self.lock:
             stream = self._get_output_stream_locked(
@@ -545,6 +561,8 @@ class StreamGraph:
                 modulation,
                 audio_codec,
                 opus_bitrate,
+                dsp_config,
+                validate_audio_support,
             )
         if mode == "audio":
             self._wait_for_audio_stream_handoff(stream, frequency, modulation)
@@ -613,22 +631,22 @@ class StreamGraph:
                 old_audio_streams = [
                     stream
                     for key, stream in self.audio_streams.items()
-                    if key[1] in rebuild_audio_modulations
+                    if key[1][0] in rebuild_audio_modulations
                 ]
                 old_audio_transport_streams = [
                     stream
                     for key, stream in self.audio_transport_streams.items()
-                    if key[1] in rebuild_audio_modulations
+                    if key[1][0] in rebuild_audio_modulations
                 ]
                 self.audio_streams = {
                     key: stream
                     for key, stream in self.audio_streams.items()
-                    if key[1] not in rebuild_audio_modulations
+                    if key[1][0] not in rebuild_audio_modulations
                 }
                 self.audio_transport_streams = {
                     key: stream
                     for key, stream in self.audio_transport_streams.items()
-                    if key[1] not in rebuild_audio_modulations
+                    if key[1][0] not in rebuild_audio_modulations
                 }
                 if {"wfm", "wfm_stereo"} & rebuild_audio_modulations:
                     old_rds_decoders = list(self.rds_decoders.values())
@@ -644,6 +662,8 @@ class StreamGraph:
                     session.modulation,
                     session.audio_codec,
                     session.opus_bitrate,
+                    session.dsp_config,
+                    False,
                 )
                 desired_monitor = self._get_audio_power_monitor_locked(
                     session.frequency,
@@ -689,10 +709,13 @@ class StreamGraph:
         modulation: str | None,
         audio_codec: str = DEFAULT_AUDIO_CODEC,
         opus_bitrate: int = DEFAULT_OPUS_BITRATE,
+        dsp_config: ServerConfig | None = None,
+        validate_audio_support: bool = True,
     ) -> Any:
         _validate_mode(mode)
         required_bandwidth = _get_required_bandwidth(mode, output_rate, modulation)
         _validate_request_frequency(self.config, frequency, required_bandwidth)
+        stream_config = self.config if dsp_config is None else dsp_config
 
         root = self.root_stream
         if root is None:
@@ -758,7 +781,8 @@ class StreamGraph:
 
         assert modulation is not None
         _validate_audio_modulation(modulation)
-        _validate_audio_modulation_supported(self.config, modulation)
+        if validate_audio_support:
+            _validate_audio_modulation_supported(self.config, modulation)
         audio_iq_rate = _get_audio_iq_rate(modulation)
         audio_transition_bandwidth = _get_audio_transition_bandwidth(modulation)
         base_stream = self._get_decimation_stream_locked(
@@ -767,12 +791,12 @@ class StreamGraph:
             audio_transition_bandwidth,
             shift_stream,
         )
-        audio_key = (frequency, modulation)
+        audio_key = (frequency, _audio_config_key(stream_config, modulation))
         audio_stream = self.audio_streams.get(audio_key)
         if audio_stream is None:
             audio_parent = self._get_audio_demod_parent_locked(frequency, modulation, base_stream)
             audio_stream = _build_audio_stream(
-                config=self.config,
+                config=stream_config,
                 frequency=frequency,
                 modulation=modulation,
                 manager=self,
@@ -785,7 +809,7 @@ class StreamGraph:
                 modulation,
             )
         else:
-            audio_stream.config = self.config
+            audio_stream.config = stream_config
             LOGGER.debug(
                 "reusing shared audio stream frequency=%s modulation=%s",
                 frequency,
@@ -794,6 +818,7 @@ class StreamGraph:
         return self._get_audio_transport_stream_locked(
             frequency,
             modulation,
+            _audio_config_key(stream_config, modulation),
             audio_codec,
             opus_bitrate,
             audio_stream,
@@ -818,6 +843,7 @@ class StreamGraph:
         self,
         frequency: int,
         modulation: str,
+        audio_config_key: tuple[Any, ...],
         audio_codec: str,
         opus_bitrate: int,
         parent: SharedStream,
@@ -826,7 +852,7 @@ class StreamGraph:
             return parent
         if audio_codec != "opus":
             raise ValueError(f"unsupported audio codec {audio_codec!r}")
-        transport_key = (frequency, modulation, audio_codec, opus_bitrate)
+        transport_key = (frequency, audio_config_key, audio_codec, opus_bitrate)
         transport_stream = self.audio_transport_streams.get(transport_key)
         if transport_stream is None:
             transport_stream = OpusSharedStream(

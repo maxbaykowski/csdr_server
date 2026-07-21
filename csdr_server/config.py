@@ -68,31 +68,38 @@ class ServerConfig:
             audio_settings.get("audio_support", True),
             "audio.audio_support",
         )
-        am_enabled = _parse_demodulator_enabled(
-            "am",
-            am_settings,
-            explicit_demodulators,
-        )
-        lsb_enabled = _parse_demodulator_enabled(
-            "lsb",
-            lsb_settings,
-            explicit_demodulators,
-        )
-        usb_enabled = _parse_demodulator_enabled(
-            "usb",
-            usb_settings,
-            explicit_demodulators,
-        )
-        nfm_enabled = _parse_demodulator_enabled(
-            "nfm",
-            nfm_settings,
-            explicit_demodulators,
-        )
-        wfm_enabled = _parse_demodulator_enabled(
-            "wfm",
-            wfm_settings,
-            explicit_demodulators,
-        )
+        if audio_support:
+            am_enabled = _parse_demodulator_enabled(
+                "am",
+                am_settings,
+                explicit_demodulators,
+            )
+            lsb_enabled = _parse_demodulator_enabled(
+                "lsb",
+                lsb_settings,
+                explicit_demodulators,
+            )
+            usb_enabled = _parse_demodulator_enabled(
+                "usb",
+                usb_settings,
+                explicit_demodulators,
+            )
+            nfm_enabled = _parse_demodulator_enabled(
+                "nfm",
+                nfm_settings,
+                explicit_demodulators,
+            )
+            wfm_enabled = _parse_demodulator_enabled(
+                "wfm",
+                wfm_settings,
+                explicit_demodulators,
+            )
+        else:
+            am_enabled = False
+            lsb_enabled = False
+            usb_enabled = False
+            nfm_enabled = False
+            wfm_enabled = False
         nfm_lowpass_frequency = (
             _optional_int(
                 _config_value(
@@ -180,16 +187,18 @@ class ServerConfig:
                 else 0.5
             ),
             wfm_enabled=wfm_enabled,
-            # Legacy audio.wfm.stereo_support is intentionally ignored. WFM
-            # stereo is built into CSDR and is available whenever WFM is enabled.
-            enable_wfm_rds=_parse_bool(
-                _config_value(
-                    audio_settings,
-                    wfm_settings,
-                    "rds_support",
-                    False,
-                ),
-                "audio.wfm.rds_support",
+            enable_wfm_rds=(
+                _parse_bool(
+                    _config_value(
+                        audio_settings,
+                        wfm_settings,
+                        "rds_support",
+                        False,
+                    ),
+                    "audio.wfm.rds_support",
+                )
+                if audio_support and wfm_enabled
+                else False
             ),
             wfm_region=(
                 _normalize_wfm_region(
@@ -355,14 +364,14 @@ def _validate_config(config: ServerConfig) -> None:
     _validate_client_queue_chunks(config.client_queue_chunks)
     _validate_enqueue_timeout_seconds(config.enqueue_timeout_seconds)
     _validate_audio_support(config.audio_support)
+    if not config.audio_support:
+        return
     _validate_demodulator_enabled("audio.am.enabled", config.am_enabled)
     _validate_demodulator_enabled("audio.lsb.enabled", config.lsb_enabled)
     _validate_demodulator_enabled("audio.usb.enabled", config.usb_enabled)
     _validate_demodulator_enabled("audio.nfm.enabled", config.nfm_enabled)
     _validate_demodulator_enabled("audio.wfm.enabled", config.wfm_enabled)
     _validate_enable_wfm_rds(config.enable_wfm_rds)
-    if not config.audio_support:
-        return
     if not any(
         (
             config.am_enabled,
